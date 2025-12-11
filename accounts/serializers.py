@@ -1,6 +1,8 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.db.models import Q
 from rest_framework import serializers
+from rest_framework_simplejwt.tokens import RefreshToken
 
 User = get_user_model()
 
@@ -79,3 +81,56 @@ class UserSerializer(serializers.ModelSerializer):
             "date_joined",
         ]
         read_only_fields = ["id", "email", "date_joined"]
+
+
+class UserLoginSerializer(serializers.Serializer):
+    """
+    Serializer for user login.
+    Accepts email or matric number with password.
+    """
+
+    email_or_matric = serializers.CharField(
+        required=True,
+        help_text="Email address or matric number",
+    )
+    password = serializers.CharField(
+        required=True,
+        write_only=True,
+        style={"input_type": "password"},
+    )
+
+    def validate(self, attrs):
+        """
+        Validate credentials and authenticate user.
+        """
+        email_or_matric = attrs.get("email_or_matric")
+        password = attrs.get("password")
+
+        user = User.objects.filter(
+            Q(email__iexact=email_or_matric) | Q(matric_number__iexact=email_or_matric)
+        ).first()
+
+        if not user:
+            raise serializers.ValidationError(
+                {"email_or_matric": "No account found with this email or matric number."}
+            )
+
+        if not user.is_active:
+            raise serializers.ValidationError(
+                {"email_or_matric": "This account has been deactivated."}
+            )
+
+        if not user.check_password(password):
+            raise serializers.ValidationError(
+                {"password": "Incorrect password."}
+            )
+
+        refresh = RefreshToken.for_user(user)
+
+        attrs["user"] = user
+        attrs["tokens"] = {
+            "refresh": str(refresh),
+            "access": str(refresh.access_token),
+        }
+
+        return attrs
