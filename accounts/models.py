@@ -11,6 +11,10 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     Custom user model.
     """
 
+    class Role(models.TextChoices):
+        STUDENT = "student", _("Student")
+        ADMIN = "admin", _("Admin")
+
     LEVEL_CHOICES = [
         ("100", "100 Level"),
         ("200", "200 Level"),
@@ -28,6 +32,13 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     department = models.CharField(_("department"), max_length=100, blank=True)
     level = models.CharField(
         _("level"), max_length=3, choices=LEVEL_CHOICES, blank=True
+    )
+    role = models.CharField(
+        _("role"),
+        max_length=10,
+        choices=Role.choices,
+        default=Role.STUDENT,
+        help_text=_("User role for access control."),
     )
     is_staff = models.BooleanField(
         _("staff status"),
@@ -68,3 +79,13 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
         Return the short name for the user.
         """
         return self.first_name
+
+    @property
+    def is_admin(self):
+        """Check if user has admin role."""
+        return self.role == self.Role.ADMIN
+
+    @property
+    def is_student(self):
+        """Check if user has student role."""
+        return self.role == self.Role.STUDENT

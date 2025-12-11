@@ -78,9 +78,10 @@ class UserSerializer(serializers.ModelSerializer):
             "matric_number",
             "department",
             "level",
+            "role",
             "date_joined",
         ]
-        read_only_fields = ["id", "email", "date_joined"]
+        read_only_fields = ["id", "email", "date_joined", "role"]
 
 
 class UserLoginSerializer(serializers.Serializer):
