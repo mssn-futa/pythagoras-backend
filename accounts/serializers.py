@@ -4,6 +4,8 @@ from django.db.models import Q
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from .services import EmailService
+
 User = get_user_model()
 
 
@@ -60,6 +62,9 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         validated_data.pop("password_confirm")
         password = validated_data.pop("password")
         user = User.objects.create_user(password=password, **validated_data)
+
+        EmailService.send_welcome_email(user)
+
         return user
 
 

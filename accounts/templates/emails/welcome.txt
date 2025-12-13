@@ -1,0 +1,28 @@
+Assalaamu Alaykum, {{ first_name }}!
+
+Welcome to Pythagoras - your gateway to Islamic knowledge and community at FUTA.
+
+Your account has been successfully created with the following details:
+
+Name: {{ first_name }} {{ last_name }}
+Email: {{ email }}
+{% if matric_number %}Matric Number: {{ matric_number }}
+{% endif %}{% if department %}Department: {{ department }}
+{% endif %}{% if level %}Level: {{ level }}
+{% endif %}
+
+With Pythagoras, you can:
+- Access Khutbah recordings and Islamic content
+- Stay updated with MSSN events and announcements
+- Take quizzes and track your learning progress
+- Connect with the Muslim community at FUTA
+
+May Allah bless your journey of knowledge, Aameen.
+
+Jazakallahu Khayran,
+The Pythagoras Team
+
+---
+MSSN FUTA - Muslim Students' Society of Nigeria
+Federal University of Technology, Akure
+© 2025 Pythagoras. All rights reserved.
