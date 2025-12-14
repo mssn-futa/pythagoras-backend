@@ -38,51 +38,66 @@ Ensure you have the following installed:
 
 ### **2. Setup**
 
-1. **Fork** the backend repository to your GitHub account.  
-2. **Clone** your fork:
+1. **Clone** the repository:
 
-```nginx
-git clone [https://github.com/mssn-futa/pythagoras-backend.git](https://github.com/mssn-futa/pythagoras-backend.git)
-
+```bash
+git clone https://github.com/mssn-futa/pythagoras-backend.git
 cd pythagoras-backend
 ```
 
-3. **Virtual Environment**:
+2. **Create Virtual Environment**:
 
-```nginx
+```bash
 python3 -m venv venv
 ```
 
-Then;
+Then activate it:
 
 **Windows:**
 
-```nginx
+```bash
 venv\Scripts\activate
 ```
 
 **Mac/Linux:**
 
-```nginx
+```bash
 source venv/bin/activate
 ```
 
-4. **Install Dependencies**:
+3. **Install Dependencies**:
 
-```nginx
-pip install -r requirements/local.txt
+```bash
+pip install -r requirements.txt
 ```
 
-5. **Environment Variables**:  
-   * Copy .env.example to .env.  
-   * Update DB credentials: DATABASE_URL=postgres://user:pass@localhost:5432/pythagoras
+4. **Environment Variables**:
+   * Copy `.env.example` to `.env`
+   * Update the values as needed (email credentials, etc.)
 
-6. **Migrate Database**:
+```bash
+cp .env.example .env
+```
 
-```nginx
+5. **Run Database Migrations**:
+
+```bash
 python manage.py migrate
+```
+
+6. **Create a Superuser** (for admin access):
+
+```bash
 python manage.py createsuperuser
 ```
+
+7. **Start the Development Server**:
+
+```bash
+python manage.py runserver
+```
+
+The API will be available at `http://127.0.0.1:8000/`
 
 
 ## **The Workflow (Clickup -> Git -> PR)**
@@ -98,14 +113,35 @@ We follow a strict **Feature Branch Workflow**.
 
 ### **Step 2: Create a Branch**
 
-Naming Convention: `type/feature-name`
+Before creating a new branch, make sure you have the latest code from the `dev` branch:
 
-* **Types:** feat, fix, chore (maintenance), docs.
-* **Example:** `feat/khutbah-model`
+```bash
+# Fetch all remote branches
+git fetch origin
 
-```nginx
+# Switch to the dev branch
+git checkout dev
+
+# Pull the latest changes
+git pull origin dev
+
+# Create your new feature branch
+git branch feat/khutbah-model
+
+# Switch to your new branch
+git checkout feat/khutbah-model
+```
+
+Or you can combine the last two steps:
+
+```bash
 git checkout -b feat/khutbah-model
 ```
+
+**Branch Naming Convention:** `type/feature-name`
+
+* **Types:** feat, fix, chore (maintenance), docs.
+* **Example:** `feat/khutbah-model`, `fix/login-validation`, `docs/api-readme`
 
 ### **Step 3: Code & Commit**
 
@@ -114,13 +150,26 @@ git checkout -b feat/khutbah-model
 
 ### **Step 4: Pull Request (PR)**
 
-1. Push to your fork: `git push origin feat/khutbah-model`
-2. Open a PR to the develop branch.  
-3. **Self-Review:** 
-    - Did you run `python manage.py test` and all tests passed? 
-    - Did you remove unnecessary `print()`? 
+1. Push your branch to remote:
+   ```bash
+   git push origin feat/khutbah-model
+   ```
+
+2. Go to the repository on GitHub and click **"Compare & pull request"**.
+
+3. **Important:** Ensure the PR is configured correctly:
+   - **Base:** `dev` (the branch you're merging INTO)
+   - **Compare:** `feat/khutbah-model` (YOUR branch)
+   
+   It should look like: `base: dev` ← `compare: feat/khutbah-model`
+
+4. **Self-Review Checklist:** 
+    - Did you run `python manage.py check` with no errors? 
+    - Did you remove unnecessary `print()` statements? 
     - Is it working as described on Clickup? 
     - Are you proud of it?
+
+5. Request a review from the Backend Lead or a teammate.
 
 ## **Backend Coding Standards**
 
