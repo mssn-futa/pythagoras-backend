@@ -48,6 +48,7 @@ INSTALLED_APPS = [
 
     'accounts',
     'quiz',
+    'dawah',
 ]
 
 MIDDLEWARE = [
