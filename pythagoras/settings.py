@@ -15,6 +15,8 @@ from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
 
+from .utils import StandardizedJSONRenderer, exception_handler
+
 
 load_dotenv()
 
@@ -48,6 +50,7 @@ INSTALLED_APPS = [
 
     'accounts',
     'dawah',
+    'quiz'
 ]
 
 MIDDLEWARE = [
@@ -143,6 +146,8 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'EXCEPTION_HANDLER': exception_handler,
+    'DEFAULT_RENDERER_CLASSES': [StandardizedJSONRenderer]
 }
 
 
