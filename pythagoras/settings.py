@@ -15,8 +15,6 @@ from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
 
-from .utils import StandardizedJSONRenderer, exception_handler
-
 
 load_dotenv()
 
@@ -47,6 +45,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
+    'drf_spectacular',
 
     'accounts',
     'dawah',
@@ -146,8 +145,9 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
-    'EXCEPTION_HANDLER': exception_handler,
-    'DEFAULT_RENDERER_CLASSES': [StandardizedJSONRenderer]
+    'EXCEPTION_HANDLER': 'pythagoras.utils.exception_handler',
+    'DEFAULT_RENDERER_CLASSES': ['pythagoras.utils.StandardizedJSONRenderer'],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
 
@@ -156,6 +156,24 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Pythagoras API',
+    'DESCRIPTION': 'API documentation for the Pythagoras backend',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SECURITY': [{'BearerAuth': []}],
+    'COMPONENTS': {
+        'securitySchemes': {
+            'BearerAuth': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+            }
+        }
+    },
+    'PREPROCESSING_HOOKS': ['pythagoras.utils.spectacular_preprocessing_filter_spec'],
 }
 
 

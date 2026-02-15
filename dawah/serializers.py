@@ -37,7 +37,7 @@ class EventResourceCreateSerializer(serializers.ModelSerializer):
 
 
 class EventCreateSerializer(serializers.ModelSerializer):
-    resources = EventResourceCreateSerializer()
+    resources = EventResourceCreateSerializer(required=False)
     
     def validate_time(self, event):
         if event['start_time'] > event['end_time']:
@@ -46,13 +46,14 @@ class EventCreateSerializer(serializers.ModelSerializer):
             )
 
     def create(self, validated_data):
-        resources_data = validated_data.pop('resources')
+        resources_data = validated_data.pop('resources', None)
 
         with transaction.atomic():
             event = Event.objects.create(**validated_data)
 
-            for resource_data in resources_data:
-                EventResource.objects.create(event=event, **resource_data)
+            if resources_data:
+                for resource_data in resources_data:
+                    EventResource.objects.create(event=event, **resource_data)
 
         return event
   
@@ -60,7 +61,7 @@ class EventCreateSerializer(serializers.ModelSerializer):
         model = Event
         fields = [
             'title', 'category', 'summary', 'tags', 'description', 
-            'speakers', 'location', 'start_time', 'end_time'
+            'speakers', 'location', 'start_time', 'end_time', 'resources'
         ]
 
 
