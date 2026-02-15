@@ -16,15 +16,20 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import include, path
+from rest_framework.permissions import AllowAny
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 
 class SchemaView(SpectacularAPIView):
     schema = None
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
 
 class SwaggerView(SpectacularSwaggerView):
     schema = None
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
 
 urlpatterns = [
