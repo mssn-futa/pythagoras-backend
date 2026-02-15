@@ -2,6 +2,7 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.utils import extend_schema
 
 from .serializers import UserLoginSerializer, UserRegistrationSerializer, UserSerializer
 
@@ -15,6 +16,11 @@ class UserRegistrationView(APIView):
 
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        request=UserRegistrationSerializer,
+        responses={201: UserSerializer},
+        description="Register a new user account."
+    )
     def post(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -40,6 +46,11 @@ class UserLoginView(APIView):
 
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        request=UserLoginSerializer,
+        responses={200: UserSerializer},
+        description="Authenticate user with email/matric number and password. Returns user data and JWT tokens."
+    )
     def post(self, request):
         serializer = UserLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
