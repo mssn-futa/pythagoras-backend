@@ -4,19 +4,26 @@ from dawah.models import Event
 from accounts.models import CustomUser
 
 
-class Course (models.Model):
+class Course(models.Model):
     code = models.CharField(max_length=7)
     title = models.CharField(max_length=100)
     department = models.CharField(max_length=100)
     level = models.CharField(max_length=3, choices=CustomUser.LEVEL_CHOICES)
     semester = models.CharField(max_length=10)
 
-    students = models.ManyToManyField(
-        settings.AUTH_USER_MODEL, related_name='courses'
-    )
-
     def __str__(self):
         return self.title
+
+
+class Enrollment(models.Model):
+    course = models.ForeignKey(to=Course, on_delete=models.CASCADE)
+    student = models.ForeignKey(to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = ["course", "student"]
+
+    def __str__(self):
+        return f"{self.student.email} -> {self.course.title}"
 
 
 class Quiz(models.Model):
@@ -25,11 +32,9 @@ class Quiz(models.Model):
     description = models.CharField(max_length=250)
 
     related_event = models.ForeignKey(Event, on_delete=models.CASCADE)
-    related_course = models.ForeignKey(
-        Course, on_delete=models.CASCADE)
+    related_course = models.ForeignKey(Course, on_delete=models.CASCADE)
 
-    time_limit = models.PositiveSmallIntegerField(
-        help_text="Time limit in minutes")
+    time_limit = models.PositiveSmallIntegerField(help_text="Time limit in minutes")
     is_active = models.BooleanField(default=False)
 
     def __str__(self):
@@ -38,8 +43,7 @@ class Quiz(models.Model):
 
 class Submission(models.Model):
     quiz = models.ForeignKey(Quiz, on_delete=models.CASCADE)
-    student = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
 
     answers = models.JSONField()
     score = models.PositiveSmallIntegerField()
@@ -49,9 +53,9 @@ class Submission(models.Model):
 
 class Question(models.Model):
     class Type(models.TextChoices):
-        mcq = 'mcq', 'MULTIPLE_CHOICE'
-        multi = 'multi', 'MULTIPLE_ANSWER'
-        text = 'text', 'TEXT'
+        mcq = "mcq", "MULTIPLE_CHOICE"
+        multi = "multi", "MULTIPLE_ANSWER"
+        text = "text", "TEXT"
 
     quiz = models.ForeignKey(Quiz, on_delete=models.CASCADE)
     type = models.CharField(max_length=5, choices=Type)
