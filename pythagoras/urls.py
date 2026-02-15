@@ -17,7 +17,14 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 from rest_framework.permissions import AllowAny
+from rest_framework.settings import api_settings
+from drf_spectacular.openapi import AutoSchema
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+
+
+if not isinstance(api_settings.DEFAULT_SCHEMA_CLASS, type) or \
+   api_settings.DEFAULT_SCHEMA_CLASS.__module__ != 'drf_spectacular.openapi':
+    api_settings.DEFAULT_SCHEMA_CLASS = AutoSchema
 
 
 class SchemaView(SpectacularAPIView):
