@@ -58,7 +58,7 @@ class CourseView(APIView):
 
 class QuizList(APIView):
     
-    # permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [IsAdminOrReadOnly]
 
     @extend_schema(
         responses={200: QuizListSerializer(many=True)},
@@ -96,6 +96,8 @@ class QuizList(APIView):
         )
 
 class QuizDetail(APIView):
+
+    permission_classes = [permissions.IsAuthenticated]
 
     @extend_schema(
         responses ={200: QuizSerializer},
@@ -152,6 +154,8 @@ class QuizDetail(APIView):
 
 class QuestionList(APIView):
 
+    permission_classes = [permissions.IsAuthenticated]
+
     @extend_schema(
         responses = {200: QuestionSerializer(many=True)}
     )
@@ -187,6 +191,8 @@ class QuestionList(APIView):
         )
 
 class QuestionDetail(APIView):
+
+    permission_classes = [permissions.IsAuthenticated]
 
     @extend_schema(
         responses ={200: QuestionSerializer},
@@ -245,7 +251,7 @@ class QuestionDetail(APIView):
 
 class QuizSubmissionView(APIView):
 
-    # permission_classes = [IsAdmin]
+    permission_classes = [IsAdmin]
 
     @extend_schema(
         summary="Get all submissions for a Quiz (Admin Only)",
@@ -269,7 +275,7 @@ class QuizSubmissionView(APIView):
 
 class UserSubmissionView(APIView):
 
-    # permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     @extend_schema(
         summary="Get my submission history",
@@ -319,7 +325,7 @@ class UserSubmissionView(APIView):
 
 class SubmissionDetailView(APIView):
 
-    # permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_object(self, pk, user):
         submission = get_object_or_404(Submission, pk=pk)
@@ -335,7 +341,6 @@ class SubmissionDetailView(APIView):
         responses = {200: SubmissionDetailSerializer}
     )
     def get(self, request, quiz_id):
-        # 'quiz_id' here is actually the submission pk in this view
         submission = self.get_object(pk=quiz_id, user=request.user)
         serializer = SubmissionDetailSerializer(submission, context={'request': request})
         return Response(
