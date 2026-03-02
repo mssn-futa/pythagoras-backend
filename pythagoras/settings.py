@@ -179,6 +179,11 @@ SPECTACULAR_SETTINGS = {
         }
     },
     'PREPROCESSING_HOOKS': ['pythagoras.utils.spectacular_preprocessing_filter_spec'],
+
+    'ENUM_NAME_OVERRIDES': {
+        'QuestionTypeEnum': 'quiz.models.Question.Type',
+        'EventResourceTypeEnum': 'dawah.models.EventResource.Type',
+    },
 }
 
 

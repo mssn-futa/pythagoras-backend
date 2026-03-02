@@ -31,10 +31,10 @@ class Quiz(models.Model):
     type = models.CharField(max_length=250)
     description = models.CharField(max_length=250)
 
-    related_event = models.ForeignKey(Event, on_delete=models.CASCADE)
-    related_course = models.ForeignKey(Course, on_delete=models.CASCADE)
+    related_event = models.ForeignKey(Event, null=True, blank=True, on_delete=models.CASCADE)
+    related_course = models.ForeignKey(Course, null=True, blank=True, on_delete=models.CASCADE)
 
-    time_limit = models.PositiveSmallIntegerField(help_text="Time limit in minutes")
+    time_limit = models.PositiveSmallIntegerField(null=True, help_text="Time limit in minutes")
     is_active = models.BooleanField(default=False)
 
     def __str__(self):
@@ -49,6 +49,7 @@ class Submission(models.Model):
     score = models.PositiveSmallIntegerField()
     submitted_at = models.DateTimeField(auto_now_add=True)
     graded_at = models.DateTimeField(blank=True, null=True)
+
 
 
 class Question(models.Model):

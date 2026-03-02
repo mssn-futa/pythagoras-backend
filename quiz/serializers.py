@@ -106,11 +106,11 @@ class QuizSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id']
     
-    def get_total_points(self, obj):
+    def get_total_points(self, obj) -> int:
         """Calculate total points for all questions in the quiz"""
         return sum(question.points for question in obj.question_set.all())
     
-    def get_question_count(self, obj):
+    def get_question_count(self, obj) -> int:
         """Get total number of questions in the quiz"""
         return obj.question_set.count()
 
@@ -130,7 +130,7 @@ class QuizListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id']
     
-    def get_question_count(self, obj):
+    def get_question_count(self, obj) -> int:
         """Get total number of questions in the quiz"""
         return obj.question_set.count()
 
