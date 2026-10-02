@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to Pythagoras</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        .container {
+            background-color: #ffffff;
+            border-radius: 10px;
+            padding: 40px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            text-align: center;
+            border-bottom: 3px solid #2c5530;
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            color: #2c5530;
+            margin: 0;
+            font-size: 28px;
+        }
+        .header p {
+            color: #666;
+            margin: 5px 0 0;
+            font-size: 14px;
+        }
+        .content h2 {
+            color: #2c5530;
+            font-size: 22px;
+        }
+        .user-info {
+            background-color: #f8f9fa;
+            border-left: 4px solid #2c5530;
+            padding: 15px 20px;
+            margin: 20px 0;
+            border-radius: 0 5px 5px 0;
+        }
+        .user-info p {
+            margin: 5px 0;
+        }
+        .user-info strong {
+            color: #2c5530;
+        }
+        .features {
+            margin: 20px 0;
+        }
+        .features ul {
+            padding-left: 20px;
+        }
+        .features li {
+            margin: 10px 0;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+            color: #888;
+            font-size: 12px;
+        }
+        .footer p {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎓 Pythagoras</h1>
+            <p>The MSSN FUTA Digital Platform</p>
+        </div>
+        
+        <div class="content">
+            <h2>Assalaamu Alaykum, {{ first_name }}! 👋</h2>
+            
+            <p>Welcome to <strong>Pythagoras</strong> - your gateway to Islamic knowledge and community at FUTA.</p>
+            
+            <p>Your account has been successfully created. Here are your details:</p>
+            
+            <div class="user-info">
+                <p><strong>Name:</strong> {{ first_name }} {{ last_name }}</p>
+                <p><strong>Email:</strong> {{ email }}</p>
+                {% if matric_number %}
+                <p><strong>Matric Number:</strong> {{ matric_number }}</p>
+                {% endif %}
+                {% if department %}
+                <p><strong>Department:</strong> {{ department }}</p>
+                {% endif %}
+                {% if level %}
+                <p><strong>Level:</strong> {{ level }}</p>
+                {% endif %}
+            </div>
+            
+            <div class="features">
+                <p>With Pythagoras, you can:</p>
+                <ul>
+                    <li>📚 Access Khutbah recordings and Islamic content</li>
+                    <li>📅 Stay updated with MSSN events and announcements</li>
+                    <li>📝 Take quizzes and track your learning progress</li>
+                    <li>🤝 Connect with the Muslim community at FUTA</li>
+                </ul>
+            </div>
+            
+            <p>May Allah bless your journey of knowledge, Aameen. 🤲</p>
+            
+            <p>Jazakallahu Khairan,<br>
+            <strong>The Pythagoras Team</strong></p>
+        </div>
+        
+        <div class="footer">
+            <p>MSSN FUTA - Muslim Students' Society of Nigeria</p>
+            <p>Federal University of Technology, Akure</p>
+            <p>© 2025 Pythagoras. All rights reserved.</p>
+        </div>
+    </div>
+</body>
+</html>
