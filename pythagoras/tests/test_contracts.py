@@ -90,10 +90,21 @@ class ResponseContractTests(SimpleTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()['data']['code'], 'PROVIDER_UNAVAILABLE')
         self.assertNotIn('provider-key', response.content.decode())
-        response = self.client.get('/errors/direct/')
+        with self.assertLogs('pythagoras.api', level='ERROR') as captured:
+            response = self.client.get('/errors/direct/')
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()['data']['code'], 'INTERNAL_ERROR')
         self.assertNotIn('private', response.content.decode())
+        self.assertIn(response['X-Request-ID'], captured.output[0])
+
+    def test_legacy_pre_enveloped_errors_cannot_bypass_normalization(self):
+        response = self.client.get('/errors/wrapped-validation/')
+        self.assertEqual(response.json()['data'], {'code': 'VALIDATION_ERROR'})
+        with self.assertLogs('pythagoras.api', level='ERROR') as captured:
+            response = self.client.get('/errors/wrapped-internal/')
+        self.assertEqual(response.json()['data'], {'code': 'INTERNAL_ERROR'})
+        self.assertNotIn('private-internal-detail', response.content.decode())
+        self.assertNotIn('secret', response.content.decode() + '\n'.join(captured.output))
 
     def test_request_ids_are_generated_not_trusted(self):
         first = self.client.get('/raw/', HTTP_X_REQUEST_ID='untrusted\nsecret')

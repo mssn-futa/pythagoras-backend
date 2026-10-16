@@ -56,6 +56,12 @@ class ErrorView(RawView):
             raise APIError('PROVIDER_UNAVAILABLE', 'provider-key-must-not-leak', status_code=503)
         if kind == 'direct':
             return Response({'detail': 'private-internal-detail'}, status=500)
+        if kind == 'wrapped-internal':
+            return Response({'success': False, 'data': {'code': 'RAW', 'traceback': 'secret'},
+                             'message': 'private-internal-detail'}, status=500)
+        if kind == 'wrapped-validation':
+            return Response({'success': False, 'data': {'detail': 'legacy-error'},
+                             'message': 'Legacy error.'}, status=400)
         if kind == 'missing':
             from django.http import Http404
             raise Http404('private record detail')

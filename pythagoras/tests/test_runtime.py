@@ -14,7 +14,8 @@ class ColdRuntimeTests(SimpleTestCase):
             env = {**os.environ, 'DJANGO_SETTINGS_MODULE': 'pythagoras.settings',
                    'PYTHON_DOTENV_DISABLED': '1', 'DEBUG': 'true',
                    'SECRET_KEY': 'test-only-cold-start-key-with-sufficient-length-1234567890',
-                   'DATABASE_URL': f'sqlite:///{directory}/db.sqlite3', **overrides}
+                   'DATABASE_URL': f'sqlite:///{directory}/db.sqlite3',
+                   'STATIC_ROOT': f'{directory}/static', **overrides}
             return subprocess.run([sys.executable, '-c', code], cwd=settings.BASE_DIR,
                                   env=env, text=True, capture_output=True, timeout=30)
 
@@ -88,6 +89,28 @@ assert not request.is_secure()
 assert settings.SECURE_PROXY_SSL_HEADER is None
 assert not settings.USE_X_FORWARDED_HOST
 """, TRUST_CLOUDFLARE_PROXY='false')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_production_static_admin_and_forwarded_https(self):
+        result = self.run_process("""
+import django
+django.setup()
+from django.core.management import call_command
+from django.contrib.staticfiles.storage import staticfiles_storage
+from django.test import Client
+call_command('collectstatic', interactive=False, verbosity=0)
+client = Client(enforce_csrf_checks=True, HTTP_HOST='api.example.test', HTTP_X_FORWARDED_PROTO='https')
+response = client.get('/admin/login/')
+assert response.status_code == 200
+assert response.cookies['csrftoken']['secure']
+assert b'csrfmiddlewaretoken' in response.content
+assert client.post('/admin/login/', {'username': 'test', 'password': 'test'}).status_code == 403
+asset_url = staticfiles_storage.url('admin/css/base.css')
+assert asset_url != '/static/admin/css/base.css'
+assert client.get(asset_url).status_code == 200
+assert client.get('/accounts/login/').status_code == 405
+""", DEBUG='false', SECURE_SSL_REDIRECT='true', TRUST_CLOUDFLARE_PROXY='true',
+            ALLOWED_HOSTS='api.example.test', CSRF_TRUSTED_ORIGINS='https://api.example.test')
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_invalid_configuration_fails_without_disclosing_value(self):

@@ -72,9 +72,17 @@ class StandardizedJSONRenderer(JSONRenderer):
                 if not is_envelope(data):
                     data = {'success': True, 'data': data,
                             'message': getattr(response, 'message', 'Request successful.')}
-            elif not (is_envelope(data) and data['success'] is False):
-                # Direct legacy Response(..., status=4xx/5xx) paths also use the contract.
-                data = error_envelope(response.status_code)
+            else:
+                normalized = (
+                    is_envelope(data) and data['success'] is False
+                    and isinstance(data['data'], dict)
+                    and isinstance(data['data'].get('code'), str)
+                )
+                if response.status_code >= 500 or not normalized:
+                    # Direct and legacy errors cannot bypass internal sanitization.
+                    data = error_envelope(response.status_code)
+                if response.status_code >= 500 and not getattr(response, '_api_error_logged', False):
+                    log_internal_error(response, (renderer_context or {}).get('request'), data)
         return super().render(data, accepted_media_type, renderer_context)
 
 
@@ -93,8 +101,12 @@ def exception_handler(exc, context):
         code, message = 'MALFORMED_REQUEST', 'The request could not be parsed.'
     response.data = error_envelope(response.status_code, code=code, message=message, fields=fields)
     if response.status_code >= 500:
-        request = context.get('request')
-        # Never include exception text, traceback, URL, headers or request payload.
-        logger.error('api_error request_id=%s code=%s',
-                     getattr(request, 'request_id', 'unavailable'), response.data['data']['code'])
+        log_internal_error(response, context.get('request'), response.data)
     return response
+
+
+def log_internal_error(response, request, data):
+    # Never include exception text, traceback, URL, headers or request payload.
+    logger.error('api_error request_id=%s code=%s',
+                 getattr(request, 'request_id', 'unavailable'), data['data']['code'])
+    response._api_error_logged = True
