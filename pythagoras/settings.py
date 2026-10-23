@@ -11,29 +11,64 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+import re
 from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
+from django.core.exceptions import ImproperlyConfigured
 
 import dj_database_url
-from .utils import StandardizedJSONRenderer, exception_handler
-
-load_dotenv()
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')
+
+
+def env_bool(name, default=False):
+    value = os.getenv(name, str(default)).strip().lower()
+    if value not in {'true', 'false', '1', '0'}:
+        raise ImproperlyConfigured(f'{name} must be true or false.')
+    return value in {'true', '1'}
+
+
+def env_list(name, default=''):
+    return [value for value in re.split(r'[,\s]+', os.getenv(name, default).strip()) if value]
+
+
+def env_positive_int(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    raise ImproperlyConfigured(f'{name} must be a positive integer.')
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-53di4ob7u0jgoh*3oz-dnj*#*_mk)p%wc_p(g6e&va#lt*6&2u'
+SECRET_KEY = os.getenv('SECRET_KEY', '').strip()
+if not SECRET_KEY:
+    raise ImproperlyConfigured('SECRET_KEY must be configured in the environment.')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
+DEBUG = env_bool('DEBUG')
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost 127.0.0.1').split(' ')
+ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', 'localhost 127.0.0.1')
+CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS')
+CORS_ALLOW_CREDENTIALS = False
+CORS_EXPOSE_HEADERS = ['X-Request-ID', 'Retry-After']
+CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS')
+# Enable only behind a router that removes client-supplied forwarding headers
+# and supplies its own verified scheme/host. RELEASE-09 verifies this boundary.
+TRUST_CLOUDFLARE_PROXY = env_bool('TRUST_CLOUDFLARE_PROXY')
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https') if TRUST_CLOUDFLARE_PROXY else None
+USE_X_FORWARDED_HOST = TRUST_CLOUDFLARE_PROXY
+SECURE_SSL_REDIRECT = env_bool('SECURE_SSL_REDIRECT', not DEBUG)
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
 
 
 # Application definition
@@ -48,6 +83,7 @@ INSTALLED_APPS = [
 
     'rest_framework',
     'drf_spectacular',
+    'corsheaders',
 
     'accounts',
     'dawah',
@@ -55,8 +91,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'pythagoras.middleware.RequestIDMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware', 
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -90,7 +128,7 @@ WSGI_APPLICATION = 'pythagoras.wsgi.application'
 
 DATABASES = {
     'default': dj_database_url.config(
-        default=os.getenv('DATABASE_URL', 'sqlite:///db.sqlite3'),
+        default=f'sqlite:///{BASE_DIR / "db.sqlite3"}',
         conn_max_age=600,)
 }
 
@@ -131,9 +169,14 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-if not DEBUG:
-    STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+STATIC_ROOT = Path(os.getenv('STATIC_ROOT', str(BASE_DIR / 'staticfiles')))
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {
+        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage' if DEBUG
+        else 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
@@ -145,14 +188,16 @@ AUTH_USER_MODEL = 'accounts.CustomUser'
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
-        'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
     'EXCEPTION_HANDLER': 'pythagoras.utils.exception_handler',
     'DEFAULT_RENDERER_CLASSES': ['pythagoras.utils.StandardizedJSONRenderer'],
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_SCHEMA_CLASS': 'pythagoras.schema.EnvelopeAutoSchema',
+    'DEFAULT_PAGINATION_CLASS': 'pythagoras.pagination.StandardPagination',
+    'PAGE_SIZE': 20,
+    'DATETIME_FORMAT': 'iso-8601',
 }
 
 
@@ -168,24 +213,35 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': 'API documentation for the Pythagoras backend',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
-    'SECURITY': [{'BearerAuth': []}],
-    'COMPONENTS': {
-        'securitySchemes': {
-            'BearerAuth': {
-                'type': 'http',
-                'scheme': 'bearer',
-                'bearerFormat': 'JWT',
-            }
-        }
-    },
     'PREPROCESSING_HOOKS': ['pythagoras.utils.spectacular_preprocessing_filter_spec'],
+
+    'ENUM_NAME_OVERRIDES': {
+        'QuestionTypeEnum': 'quiz.models.Question.Type',
+        'EventResourceTypeEnum': 'dawah.models.EventResource.Type',
+    },
 }
 
 
-EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
-EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
-EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
-EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').lower() == 'true'
-EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
-EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
-DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'Pythagoras <iselfboss@gamil.com>')
+# Legacy welcome delivery remains non-networked until PLAT-03 adopts Resend.
+EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+RESEND_API_KEY = os.getenv('RESEND_API_KEY', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '')
+EMAIL_REPLY_TO = os.getenv('EMAIL_REPLY_TO', '')
+RESEND_TIMEOUT_SECONDS = env_positive_int('RESEND_TIMEOUT_SECONDS', 30)
+RESEND_REQUESTS_PER_SECOND = env_positive_int('RESEND_REQUESTS_PER_SECOND', 2)
+RESEND_DAILY_REQUEST_BUDGET = env_positive_int('RESEND_DAILY_REQUEST_BUDGET', 100)
+
+# Configuration interfaces only; DAWAH-02 owns the S3/R2 implementation.
+R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')
+R2_S3_ENDPOINT_URL = os.getenv('R2_S3_ENDPOINT_URL', '')
+R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY', '')
+R2_PRIVATE_BUCKET = os.getenv('R2_PRIVATE_BUCKET', '')
+R2_PUBLIC_BUCKET = os.getenv('R2_PUBLIC_BUCKET', '')
+R2_PUBLIC_DOMAIN = os.getenv('R2_PUBLIC_DOMAIN', '')
+R2_UPLOAD_INTENT_TTL_SECONDS = env_positive_int('R2_UPLOAD_INTENT_TTL_SECONDS', 900)
+R2_PREVIEW_TTL_SECONDS = env_positive_int('R2_PREVIEW_TTL_SECONDS', 300)
+R2_CORS_ALLOWED_ORIGINS = env_list('R2_CORS_ALLOWED_ORIGINS')
+AUTOMATION_TIMEZONE = os.getenv('AUTOMATION_TIMEZONE', 'Africa/Lagos')
+AUTOMATION_CATCH_UP_DAYS = env_positive_int('AUTOMATION_CATCH_UP_DAYS', 1)
+AUTOMATION_REMINDER_GRACE_SECONDS = env_positive_int('AUTOMATION_REMINDER_GRACE_SECONDS', 900)
