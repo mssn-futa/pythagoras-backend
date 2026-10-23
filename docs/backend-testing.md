@@ -49,17 +49,23 @@ do not replace PostgreSQL model/constraint/transaction checks.
 
 ## Known baseline blocker
 
+**2026-10-23 resolution:** RELEASE-11 PR #27 corrects only the fixture enum
+values and the accidental answer-string concatenation. All 30 tests now pass
+on PostgreSQL locally and in the complete Linux merge-candidate gate (run
+39949464040). No model, service, schema, or grading assertion changed. The
+description below records the original failure, not the composed current state.
+
 At PLAT-02 `669cb9e`, the 27 shared runtime/contract tests pass on PostgreSQL.
 All three historical `quiz.tests.TestQuizService` cases error in fixture setup:
 `Question.type` is `varchar(5)`, but the fixture inserts `MULTIPLE_ANSWER`.
 SQLite previously accepted the oversized value. Fresh migrations and drift
 checks pass; no schema widening or fixture suppression is made in this WP.
 
-ASSESS-01 owns the portable assessment fixtures and safety repair, after its
-PLAT-03 identity prerequisite. RELEASE-01 remains draft/blocked until that
-integration is verified and the complete PostgreSQL suite is green. This
-workflow deliberately exposes the failure rather than certifying a false green
-baseline. Existing quiz schema type warnings are also retained for their owner.
+RELEASE-11 owns this portable legacy fixture repair under the takeover
+decomposition; ASSESS-01 still owns API/security behavior after PLAT-03. Passing
+the legacy suite does not establish assessment endpoint safety. This workflow
+exposed the baseline failure before its repair. Existing quiz schema type
+warnings are retained for their owner.
 
 ## Controlled failure proof
 
@@ -102,3 +108,9 @@ First workflow attempt failed validation before starting jobs because the
 runner context is unavailable in job-level environment definitions. The static
 directory now uses a job-VM-local `/tmp` path. CI must still demonstrate the
 actual matrix; the fixture failure remains an explicit integration blocker.
+
+The corrected workflow subsequently ran all stages on Linux in run 39948853233:
+only the full suite failed on the same three fixtures. RELEASE-11 then made the
+complete merge-candidate pipeline green in run 39949464040, proving the gate
+both detects and accepts the actual repaired database case. Review and final
+integrated-head results are recorded in [foundation review](backend-foundation-review.md).
