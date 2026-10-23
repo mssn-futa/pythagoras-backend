@@ -75,3 +75,30 @@ Before acceptance, demonstrate that:
 Record actual local and CI outcomes in the WP PR. No live provider/network
 integration or production-engine concurrency coverage is implied by startup
 and fixture tests. Domain WPs add their required tests to this full-suite gate.
+
+### Takeover verification record — 2026-10-23
+
+Used a newly initialized PostgreSQL 15 cluster bound to loopback port 55439,
+with database `pythagoras_release01`, outside the primary checkout. Reused the
+fresh CPython 3.12 review venv at
+`/Users/ade/project-pythagoras-worktrees/backend-runtime-review/.venv`; the
+application and management commands ran from the RELEASE-01 worktree. No
+primary-checkout environment or database was copied.
+
+Passed: dependency compatibility, system checks, fresh migrations, drift check,
+schema validation (zero errors, 3 warnings / 2 unique), production system checks,
+production `collectstatic` (163 copied, 777 post-processed), and all 27 shared
+tests. The full 30-test PostgreSQL suite at the identical PLAT-02 code revision
+failed on exactly the 3 fixture errors above; SQLite passed all 30.
+
+The temporary false-assertion test exited 1 under
+`manage.py test pythagoras.tests.test_ci_failure_probe --noinput`. Adding a
+temporary `CustomUser.ci_failure_probe` field made the ordinary
+`makemigrations --check --dry-run` exit 1 and report a required migration. Both
+probes were removed; no migration was written, and the drift check returned to
+`No changes detected`. No domain source changes remain in this WP.
+
+First workflow attempt failed validation before starting jobs because the
+runner context is unavailable in job-level environment definitions. The static
+directory now uses a job-VM-local `/tmp` path. CI must still demonstrate the
+actual matrix; the fixture failure remains an explicit integration blocker.

@@ -39,7 +39,7 @@ jobs:
       DEBUG: 'true'
       ALLOWED_HOSTS: localhost,127.0.0.1,testserver
       DATABASE_URL: postgresql://ci:ci-only-postgres@127.0.0.1:5432/pythagoras_ci
-      STATIC_ROOT: ${{ runner.temp }}/pythagoras-static
+      STATIC_ROOT: /tmp/pythagoras-ci-static
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
