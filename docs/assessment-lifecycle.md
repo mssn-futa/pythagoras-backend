@@ -158,25 +158,19 @@ returns `id, quiz_id, quiz_title, status, started_at, expires_at, server_time,
 submission_id` (`status` effective at `server_time`; `submission_id` null
 until finalized). Questions are delivered by the ASSESS-04 view.
 
-## Existing API changes (temporary paths, until ASSESS-03/04)
+## Existing API changes
+
+The authoring/publication/closing API (ASSESS-03) supersedes the temporary
+quiz/question write behaviour described here in ASSESS-02; see
+[assessment-authoring.md](assessment-authoring.md). Still temporary until
+ASSESS-04:
 
 - Student visibility is `published` and `deadline > now`, not `is_active`.
-- `POST/PUT /quiz/quizzes/`: `status`/`is_active` are read-only; sending a
-  different value is a 400 field error. Published/closed quizzes accept only
-  title/description (else 409 `QUIZ_IMMUTABLE`). `deadline` is writable.
-- Question writes only on content-editable quizzes (draft without attempts or
-  submissions; else 409 `QUIZ_IMMUTABLE`); `order` is
-  optional and validated for uniqueness. Payloads include `order`, `status`,
-  `deadline`, `published_at`, `closed_at`, `created_at`, `updated_at`.
-- `DELETE /quiz/quizzes/{id}/`: 409 `RESOURCE_REFERENCED` with
-  attempts/submissions, 409 `QUIZ_IMMUTABLE` if not draft.
 - `POST /quiz/submissions/` (direct submit) keeps its request/response and
   promises; it now creates the student's attempt at the server instant and
   finalizes it in the same transaction (`started_at == finalized_at`), storing
   `total_points` and a snapshot. An existing expired attempt yields 409
   `ATTEMPT_EXPIRED`.
-- There is no publish endpoint until ASSESS-03; publish via
-  `quiz.lifecycle.publish_quiz` (e.g. `manage.py shell`).
 
 ## Migrations and existing data
 
