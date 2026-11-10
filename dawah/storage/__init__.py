@@ -64,8 +64,8 @@ def normalize_etag(value):
 class ObjectStorage:
     """Port. Adapters implement every method; all raise :class:`StorageError`."""
 
-    def presign_put(self, key: str, *, content_type: str, expires_in: int) -> str:
-        """Signed browser PUT to a *private staging* key with a signed Content-Type."""
+    def presign_put(self, key: str, *, content_type: str, content_length: int, expires_in: int) -> str:
+        """Signed browser PUT to a *private staging* key; Content-Type and Content-Length are signed."""
         raise NotImplementedError
 
     def presign_get(self, key: str, *, expires_in: int, content_type: str, filename: str) -> str:
@@ -86,8 +86,13 @@ class ObjectStorage:
         """
         raise NotImplementedError
 
-    def open_stream(self, key: str, *, bucket: str = PRIVATE, byte_range: tuple[int, int] | None = None):
-        """Readable binary stream (``.read(n)``/``.close()``), optionally an inclusive byte range."""
+    def open_stream(self, key: str, *, bucket: str = PRIVATE, byte_range: tuple[int, int] | None = None,
+                    if_match: str | None = None):
+        """Readable binary stream (``.read(n)``/``.close()``), optionally an inclusive byte range.
+
+        With ``if_match`` the read fails with :class:`PreconditionFailed` unless the
+        object still has that ETag.
+        """
         raise NotImplementedError
 
     def delete(self, key: str, *, bucket: str) -> None:

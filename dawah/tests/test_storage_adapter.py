@@ -50,18 +50,19 @@ class SettingsTests(SimpleTestCase):
         default = storage.get_storage()
         self.assertIsInstance(default, UnconfiguredStorage)
         with self.assertRaises(StorageUnavailable):
-            default.presign_put('staging/x', content_type='audio/mpeg', expires_in=900)
+            default.presign_put('staging/x', content_type='audio/mpeg', content_length=1, expires_in=900)
 
 
 class PresignTests(SimpleTestCase):
     def test_put_signs_content_type_on_the_s3_host_only(self):
-        url = adapter().presign_put('staging/audio/tok', content_type='audio/mpeg', expires_in=900)
+        url = adapter().presign_put('staging/audio/tok', content_type='audio/mpeg', content_length=10,
+                                    expires_in=900)
         parts = urlsplit(url)
         query = parse_qs(parts.query)
         self.assertEqual(parts.netloc, 'acct123.r2.cloudflarestorage.com')
         self.assertEqual(parts.path, '/pyth-private/staging/audio/tok')
         self.assertEqual(query['X-Amz-Expires'], ['900'])
-        self.assertEqual(query['X-Amz-SignedHeaders'], ['content-type;host'])
+        self.assertEqual(query['X-Amz-SignedHeaders'], ['content-length;content-type;host'])
         self.assertNotIn('media.example.org', url)
         self.assertNotIn('example-secret-not-real', url)
 

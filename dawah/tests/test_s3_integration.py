@@ -130,7 +130,9 @@ class LiveS3CompatibleTests(SimpleTestCase):
         self.data = mp3_bytes()
         for bucket, key in ((PRIVATE, self.staging), (PRIVATE, self.validation), (PUBLIC, self.public)):
             self.addCleanup(self.storage.delete, key, bucket=bucket)
-        self.url = self.storage.presign_put(self.staging, content_type='audio/mpeg', expires_in=900)
+        self.url = self.storage.presign_put(self.staging, content_type='audio/mpeg', content_length=len(self.data),
+                                            expires_in=900)
+        self.tampered = self.data[:-8] + b'tampered'  # same length: the signed Content-Length matches
 
     def put_staged(self):
         status, body, _ = http('PUT', self.url, self.data, {'Content-Type': 'audio/mpeg'})
@@ -147,12 +149,17 @@ class LiveS3CompatibleTests(SimpleTestCase):
         self.assertEqual(http('PUT', self.url, self.data, {'Content-Type': 'text/html'})[0], 403)
         self.assertIsNone(self.storage.head(self.staging))
 
+    def test_signed_content_length_is_enforced(self):
+        emulator_limit('signed_headers')
+        self.assertEqual(http('PUT', self.url, self.data + b'x', {'Content-Type': 'audio/mpeg'})[0], 403)
+        self.assertIsNone(self.storage.head(self.staging))
+
     def test_signed_put_cannot_target_validation_or_public_keys(self):
         emulator_limit('signed_headers')
         swapped = self.url.replace(self.staging, self.validation)
-        self.assertEqual(http('PUT', swapped, b'evil', {'Content-Type': 'audio/mpeg'})[0], 403)
+        self.assertEqual(http('PUT', swapped, self.tampered, {'Content-Type': 'audio/mpeg'})[0], 403)
         unsigned = self.url.split('?', 1)[0].replace(self.staging, self.validation)
-        self.assertIn(http('PUT', unsigned, b'evil', {'Content-Type': 'audio/mpeg'})[0], (400, 401, 403))
+        self.assertIn(http('PUT', unsigned, self.tampered, {'Content-Type': 'audio/mpeg'})[0], (400, 401, 403))
         self.assertIsNone(self.storage.head(self.validation))
 
     def test_copy_at_observed_etag(self):
@@ -168,14 +175,14 @@ class LiveS3CompatibleTests(SimpleTestCase):
             self.storage.copy_if_match(self.staging, self.validation, etag='0' * 32, content_type='audio/mpeg')
         self.assertIsNone(self.storage.head(self.validation))
         # After the still-valid PUT URL overwrites staging, the old observed ETag no longer copies.
-        self.assertEqual(http('PUT', self.url, b'tampered', {'Content-Type': 'audio/mpeg'})[0], 200)
+        self.assertEqual(http('PUT', self.url, self.tampered, {'Content-Type': 'audio/mpeg'})[0], 200)
         with self.assertRaises(PreconditionFailed):
             self.storage.copy_if_match(self.staging, self.validation, etag=staged.etag, content_type='audio/mpeg')
 
     def test_staging_overwrite_does_not_change_validated_copy(self):
         staged = self.put_staged()
         self.storage.copy_if_match(self.staging, self.validation, etag=staged.etag, content_type='audio/mpeg')
-        self.assertEqual(http('PUT', self.url, b'tampered', {'Content-Type': 'audio/mpeg'})[0], 200)
+        self.assertEqual(http('PUT', self.url, self.tampered, {'Content-Type': 'audio/mpeg'})[0], 200)
         self.assertNotEqual(self.storage.head(self.staging).etag, staged.etag)
         stream = self.storage.open_stream(self.validation)
         self.assertEqual(stream.read(), self.data)

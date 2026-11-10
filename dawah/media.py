@@ -3,7 +3,11 @@
 The immutable server-side copy is streamed into a bounded spooled temporary
 file, then checked twice: a strict MPEG audio Layer III frame-chain walk (so
 arbitrary bytes or a renamed file with one lucky sync word are rejected) and
-mutagen's parser, which also supplies the duration.
+mutagen's MPEG stream parser, which also supplies the duration.
+
+ID3 tags are never parsed: their frames may be zlib-compressed (a small file
+can expand to gigabytes). The tag is skipped using only its 10-byte header,
+whose declared size is capped, and ``MPEGInfo`` starts after it.
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ CHUNK_BYTES = 1024 * 1024
 SPOOL_BYTES = 8 * 1024 * 1024
 SYNC_SEARCH_BYTES = 64 * 1024
 REQUIRED_FRAMES = 4
+ID3_MAX_BYTES = 16 * 1024 * 1024  # a larger leading tag is rejected, never parsed
 
 _BITRATES_V1_L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
 _BITRATES_V2_L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
@@ -71,6 +76,8 @@ def _id3v2_length(head):
                 raise MediaRejected('INVALID_MP3', 'The file is not valid MP3 audio.')
             size = (size << 7) | byte
         footer = 10 if head[5] & 0x10 else 0
+        if size + footer > ID3_MAX_BYTES:
+            raise MediaRejected('INVALID_MP3', 'The file is not valid MP3 audio.')
         return 10 + size + footer
     return 0
 
@@ -96,12 +103,19 @@ def _frame_length(header):
     return (coefficient * bitrate // sample_rate + padding), (version, sample_rate)
 
 
-def check_frame_chain(fileobj, size):
-    """Require REQUIRED_FRAMES consecutive, consistent Layer III frames."""
+def audio_start(fileobj, size):
+    """Offset of the audio after a (bounded, unparsed) leading ID3v2 tag."""
     fileobj.seek(0)
     start = _id3v2_length(fileobj.read(10))
     if start >= size:
         raise MediaRejected('INVALID_MP3', 'The file is not valid MP3 audio.')
+    return start
+
+
+def check_frame_chain(fileobj, size, start=None):
+    """Require REQUIRED_FRAMES consecutive, consistent Layer III frames."""
+    if start is None:
+        start = audio_start(fileobj, size)
     fileobj.seek(start)
     window = fileobj.read(SYNC_SEARCH_BYTES + 4)
     for offset in range(max(0, len(window) - 3)):
@@ -132,17 +146,18 @@ def validate_mp3(fileobj, size) -> AudioInfo:
         raise MediaRejected('EMPTY_FILE', 'The file is empty.')
     if size > MP3_MAX_BYTES:
         raise MediaRejected('FILE_TOO_LARGE', 'The file exceeds the 100 MiB audio limit.')
-    check_frame_chain(fileobj, size)
-    from mutagen import MutagenError
-    from mutagen.mp3 import MP3
-
-    fileobj.seek(0)
     try:
-        audio = MP3(fileobj)
-    except (MutagenError, ValueError, EOFError, OSError, IndexError, KeyError):
+        start = audio_start(fileobj, size)
+        check_frame_chain(fileobj, size, start)
+        from mutagen.mp3 import MPEGInfo
+
+        info = MPEGInfo(fileobj, offset=start)  # MPEG stream only; never ID3 frames
+        length = getattr(info, 'length', 0) or 0
+    except MediaRejected:
+        raise
+    except Exception:
+        # Any parser/IO surprise on untrusted bytes is a rejection, never a 500.
         raise MediaRejected('INVALID_MP3', 'The file is not valid MP3 audio.') from None
-    info = audio.info
-    length = getattr(info, 'length', 0) or 0
     if length <= 0:
         raise MediaRejected('INVALID_MP3', 'The file is not valid MP3 audio.')
     duration = max(1, round(length))

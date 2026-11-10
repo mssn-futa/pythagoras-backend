@@ -211,7 +211,11 @@ class UploadIntent(models.Model):
     OPEN = (Status.ISSUED, Status.VALIDATING)
 
     resource = models.ForeignKey(EventResource, on_delete=models.CASCADE, related_name='upload_intents')
-    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='+')
+    # SET_NULL: deleting an admin must not cascade-delete intents (their keys
+    # would be orphaned unrecorded). Unowned intents can no longer be finalized
+    # (404) and are expired/cleaned by the cleanup command.
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+                                   related_name='+')
     kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.AUDIO)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.ISSUED)
 
@@ -260,13 +264,18 @@ class StorageCleanup(models.Model):
         PENDING = 'pending', 'Pending'
         DONE = 'done', 'Done'
         SKIPPED = 'skipped', 'Skipped (still referenced)'
+        CANCELLED = 'cancelled', 'Cancelled (object was attached)'
 
     bucket = models.CharField(max_length=8, choices=Bucket.choices)
     key = models.CharField(max_length=512)
     reason = models.CharField(max_length=40)
     resource_id = models.BigIntegerField(blank=True, null=True)
     upload_id = models.BigIntegerField(blank=True, null=True)
-    status = models.CharField(max_length=8, choices=Status.choices, default=Status.PENDING)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    public_url = models.CharField(max_length=1024, blank=True, default='',
+                                  help_text='Public delivery URL to purge from the CDN after deletion.')
+    not_before = models.DateTimeField(blank=True, null=True,
+                                      help_text='Do not process before this time (in-flight promotion grace).')
     attempts = models.PositiveIntegerField(default=0)
     last_error_code = models.CharField(max_length=40, blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)

@@ -8,7 +8,19 @@ from rest_framework_simplejwt.tokens import AccessToken
 from dawah import storage
 from dawah.models import Event, EventResource, PublicationStatus
 from dawah.storage import PUBLIC
+from dawah.storage import purge
 from dawah.storage.memory import InMemoryObjectStorage
+
+
+class RecordingPurger(purge.CachePurger):
+    def __init__(self):
+        self.purged = []
+        self.error = None
+
+    def purge(self, urls):
+        if self.error is not None:
+            raise self.error
+        self.purged.extend(urls)
 
 User = get_user_model()
 UTC = timezone.utc
@@ -84,6 +96,9 @@ class FakeStorageMixin:
         self.storage = InMemoryObjectStorage()
         storage.set_storage(self.storage)
         self.addCleanup(storage.set_storage, None)
+        self.purger = RecordingPurger()
+        purge.set_purger(self.purger)
+        self.addCleanup(purge.set_purger, None)
 
 
 class DawahAPITestCase(FakeStorageMixin):

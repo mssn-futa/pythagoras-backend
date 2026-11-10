@@ -13,7 +13,7 @@ from dawah import uploads
 from dawah.models import EventResource, StorageCleanup, UploadIntent
 from dawah.storage import PRIVATE, PUBLIC, PreconditionFailed, StorageUnavailable, UnconfiguredStorage
 
-from .helpers import PUBLISHED, UNPUBLISHED, DawahAPITestCase, User, make_event, make_resource, mp3_bytes
+from .helpers import PUBLISHED, UNPUBLISHED, DawahAPITestCase, User, make_event, make_resource, mp3_bytes  # noqa: I001
 
 MP3 = mp3_bytes()
 
@@ -217,7 +217,10 @@ class FinalizeTests(UploadTestCase):
 
     def test_size_mismatch_is_rejected(self):
         intent = self.issue(size_bytes=len(MP3) + 10)
-        self.storage.client_put(intent['upload_url'], MP3, content_type='audio/mpeg')
+        # Content-Length is signed: storage refuses a body of another size...
+        self.assertEqual(self.storage.client_put(intent['upload_url'], MP3, content_type='audio/mpeg'), 403)
+        # ...and finalize still checks what storage actually holds.
+        self.storage.put_private(UploadIntent.objects.get(pk=intent['upload_id']).staging_key, MP3)
         data = self.finalize(intent['upload_id'])
         self.assertEqual((data['upload']['status'], data['upload']['error_code']), ('rejected', 'SIZE_MISMATCH'))
         self.assertEqual(data['resource']['storage_status'], 'failed')
@@ -302,7 +305,8 @@ class FinalizeTests(UploadTestCase):
         data = self.error(self.finalize(intent['upload_id'], status=503), 503, 'PROVIDER_UNAVAILABLE')
         self.assertEqual(set(data), {'code'})
         stored = UploadIntent.objects.get(pk=intent['upload_id'])
-        self.assertEqual((stored.status, stored.lease_token), ('validating', ''))
+        # No immutable copy yet: back to issued (normal expiry applies), lease released.
+        self.assertEqual((stored.status, stored.lease_token, stored.lease_expires_at), ('issued', '', None))
         del self.storage.fail['head']
         self.assertEqual(self.finalize(intent['upload_id'])['upload']['status'], 'ready')
 
@@ -329,7 +333,7 @@ class FinalizeTests(UploadTestCase):
         intent = self.ready_resource()
         validated_key = self.resource.private_object_key
         # The signed PUT is still unexpired: the browser (or an attacker holding it) overwrites staging.
-        evil = mp3_bytes(frames=50) + b'tampered'
+        evil = MP3[:-8] + b'tampered'  # same length: the signed Content-Length still matches
         self.assertEqual(self.storage.client_put(intent['upload_url'], evil, content_type='audio/mpeg'), 200)
         self.assertEqual(self.storage.objects[PRIVATE][validated_key]['data'], MP3)
         self.assertEqual(self.finalize(intent['upload_id'])['upload']['status'], 'ready')  # replay
@@ -452,8 +456,10 @@ class PublicationTests(UploadTestCase):
             data = self.data(self.client.post(
                 f'/dawah/events/{self.event.pk}/resources/{self.resource.pk}/unpublish/'))
         self.assertEqual((data['status'], data['media_url'], data['storage_status']), ('unpublished', None, 'ready'))
-        row = StorageCleanup.objects.get(bucket='public', key=public_key)
-        self.assertEqual((row.reason, row.status), ('unpublished', 'done'))
+        row = StorageCleanup.objects.get(bucket='public', key=public_key, reason='unpublished')
+        self.assertEqual((row.status, row.public_url), ('done', url))
+        self.assertEqual(self.purger.purged, [url])  # deleted public URL purged from the CDN
+        self.assertEqual(StorageCleanup.objects.get(key=public_key, reason='promotion_pending').status, 'cancelled')
         self.assertEqual(self.storage.public_get(url)[0], 404)
         self.as_user(None)
         self.error(self.client.get(f'/dawah/resources/{self.resource.pk}/'), 404, 'NOT_FOUND')
@@ -476,15 +482,104 @@ class PublicationTests(UploadTestCase):
         self.assertEqual(row.status, 'done')
         self.assertNotIn(row.key, out.getvalue())
 
-    def test_event_unpublish_hides_resource_without_rewriting_state(self):
+    def event_action(self, action, status=200):
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(f'/dawah/events/{self.event.pk}/{action}/')
+        return self.data(response) if status == 200 else response
+
+    def test_event_unpublish_retires_public_copies_and_republish_repromotes(self):
         self.ready_resource()
-        self.publish()
-        self.data(self.client.post(f'/dawah/events/{self.event.pk}/unpublish/'))
+        old_url = self.publish()['media_url']
+        old_key = EventResource.objects.get(pk=self.resource.pk).public_object_key
+        self.event_action('unpublish')
         self.resource.refresh_from_db()
-        self.assertEqual((self.resource.status, bool(self.resource.public_media_url)), ('published', True))
+        # Resource state is not rewritten, but its public copy is gone and purged.
+        self.assertEqual((self.resource.status, self.resource.public_object_key, self.resource.public_media_url),
+                         ('published', '', ''))
+        row = StorageCleanup.objects.get(key=old_key, reason='event_unpublished')
+        self.assertEqual((row.status, row.public_url), ('done', old_url))
+        self.assertEqual(self.storage.public_get(old_url)[0], 404)
+        self.assertIn(old_url, self.purger.purged)
         self.as_user(None)
         self.error(self.client.get(f'/dawah/resources/{self.resource.pk}/'), 404, 'NOT_FOUND')
         self.assertEqual(self.data(self.client.get('/dawah/archive/'))['count'], 0)
+
+        self.as_admin()
+        self.event_action('publish')
+        self.resource.refresh_from_db()
+        new_url = self.resource.public_media_url
+        self.assertTrue(new_url)
+        self.assertNotEqual(new_url, old_url)
+        self.assertEqual(self.storage.public_get(new_url)[:2], (200, MP3))
+        self.as_user(None)
+        self.assertEqual(self.data(self.client.get(f'/dawah/resources/{self.resource.pk}/'))['media_url'], new_url)
+        self.assertEqual(StorageCleanup.objects.get(key=self.resource.public_object_key).status, 'cancelled')
+
+    def test_event_republish_promotion_failure_keeps_event_unpublished(self):
+        self.ready_resource()
+        self.publish()
+        self.event_action('unpublish')
+        self.storage.fail['copy_if_match'] = StorageUnavailable('PROVIDER_UNAVAILABLE')
+        self.error(self.event_action('publish', status=503), 503, 'PROVIDER_UNAVAILABLE')
+        self.event.refresh_from_db()
+        self.resource.refresh_from_db()
+        self.assertEqual((self.event.status, self.resource.public_media_url), ('unpublished', ''))
+        failed = StorageCleanup.objects.get(reason='promotion_failed')
+        self.assertLessEqual(failed.not_before, timezone.now())  # eligible for cleanup immediately
+
+    def test_event_republish_rolls_back_all_copies_when_one_fails(self):
+        self.ready_resource()
+        self.publish()
+        second = make_resource(self.event, status=PUBLISHED, ready=True)
+        second_key = second.public_object_key
+        self.event_action('unpublish')
+        self.assertNotIn(second_key, self.storage.keys(PUBLIC))
+        calls = {'n': 0}
+        original = self.storage.copy_if_match
+
+        def fail_second(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 2:
+                raise StorageUnavailable('PROVIDER_UNAVAILABLE')
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.storage, 'copy_if_match', fail_second):
+            self.error(self.event_action('publish', status=503), 503, 'PROVIDER_UNAVAILABLE')
+        self.assertEqual(EventResource.objects.exclude(public_object_key='').count(), 0)
+        uploads.process_cleanup()
+        self.assertEqual(self.storage.keys(PUBLIC), set())  # the first, unattached copy was cleaned up
+
+    def test_purge_failure_keeps_cleanup_pending(self):
+        self.ready_resource()
+        url = self.publish()['media_url']
+        from dawah.storage.purge import PurgeError
+        self.purger.error = PurgeError('PURGE_UNAVAILABLE')
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(f'/dawah/events/{self.event.pk}/resources/{self.resource.pk}/unpublish/')
+        row = StorageCleanup.objects.get(reason='unpublished')
+        self.assertEqual((row.status, row.last_error_code), ('pending', 'PURGE_UNAVAILABLE'))
+        self.assertEqual(self.storage.public_get(url)[0], 404)  # object already deleted
+        self.purger.error = None
+        uploads.process_cleanup()
+        row.refresh_from_db()
+        self.assertEqual(row.status, 'done')
+        self.assertEqual(self.purger.purged, [url])
+
+    def test_promotion_row_is_recorded_before_copy_with_grace(self):
+        self.ready_resource()
+        seen = {}
+        original = self.storage.copy_if_match
+
+        def spy(src, dst, **kwargs):
+            if kwargs.get('dst_bucket') == PUBLIC:
+                row = StorageCleanup.objects.get(key=dst)
+                seen.update(status=row.status, reason=row.reason, future=row.not_before > timezone.now())
+                self.assertEqual(uploads.process_cleanup(), {'done': 0, 'skipped': 0, 'failed': 0})
+            return original(src, dst, **kwargs)
+
+        with mock.patch.object(self.storage, 'copy_if_match', spy):
+            self.publish()
+        self.assertEqual(seen, {'status': 'pending', 'reason': 'promotion_pending', 'future': True})
 
 
 class CleanupTests(UploadTestCase):

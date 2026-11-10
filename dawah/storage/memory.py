@@ -44,12 +44,12 @@ class InMemoryObjectStorage(ObjectStorage):
 
     # ------------------------------------------------------------ port
 
-    def presign_put(self, key, *, content_type, expires_in):
+    def presign_put(self, key, *, content_type, content_length, expires_in):
         self._record('presign_put', key=key)
         token = secrets.token_hex(16)
-        self.signed_puts[token] = (key, content_type)
+        self.signed_puts[token] = (key, content_type, content_length)
         return (f'https://{FAKE_HOST}/private/{quote(key)}?X-Amz-Expires={expires_in}'
-                f'&X-Amz-SignedHeaders=content-type%3Bhost&X-Amz-Signature={token}')
+                f'&X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost&X-Amz-Signature={token}')
 
     def presign_get(self, key, *, expires_in, content_type, filename):
         self._record('presign_get', key=key)
@@ -77,11 +77,13 @@ class InMemoryObjectStorage(ObjectStorage):
                     cache_control=cache_control)
         return self.head(dst_key, bucket=dst_bucket)
 
-    def open_stream(self, key, *, bucket=PRIVATE, byte_range=None):
+    def open_stream(self, key, *, bucket=PRIVATE, byte_range=None, if_match=None):
         self._record('open_stream', key=key, bucket=bucket)
         info = self.objects[bucket].get(key)
         if info is None:
             raise ObjectNotFound()
+        if if_match is not None and info['etag'] != normalize_etag(if_match):
+            raise PreconditionFailed()
         data = info['data']
         if byte_range is not None:
             data = data[byte_range[0]:byte_range[1] + 1]
@@ -104,11 +106,11 @@ class InMemoryObjectStorage(ObjectStorage):
         signed = self.signed_puts.get(token)
         if parts.netloc != FAKE_HOST or signed is None:
             return 403
-        key, signed_type = signed
+        key, signed_type, signed_length = signed
         if unquote(parts.path) != f'/private/{key}':
             return 403  # the signature covers the exact key
-        if content_type != signed_type:
-            return 403  # Content-Type is a signed header
+        if content_type != signed_type or len(data) != signed_length:
+            return 403  # Content-Type and Content-Length are signed headers
         self._store(PRIVATE, key, data, content_type)
         return 200
 

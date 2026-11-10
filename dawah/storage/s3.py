@@ -21,11 +21,21 @@ from . import (
     StorageUnavailable, normalize_etag,
 )
 
-NOT_FOUND_CODES = {'404', 'NoSuchKey', 'NotFound', 'NoSuchBucket'}
+NOT_FOUND_CODES = {'404', 'NoSuchKey', 'NotFound'}
 PRECONDITION_CODES = {'412', 'PreconditionFailed'}
+# Wrong bucket/credentials/permissions: configuration, not a missing object.
+MISCONFIGURED_CODES = {'NoSuchBucket', 'AccessDenied', '403', 'InvalidAccessKeyId', 'SignatureDoesNotMatch',
+                       'InvalidBucketName', 'AllAccessDisabled'}
 
 
-def _public_base(value, *, require_https):
+def _https_url(value):
+    parts = urlsplit((value or '').strip())
+    if parts.scheme != 'https' or not parts.netloc or parts.username or parts.password:
+        return ''
+    return value.strip().rstrip('/')
+
+
+def _public_base(value, *, require_https, allow_r2_dev=False):
     value = (value or '').strip().rstrip('/')
     if not value:
         return ''
@@ -36,6 +46,9 @@ def _public_base(value, *, require_https):
         return ''
     if require_https and parts.scheme != 'https':
         return ''
+    host = (parts.hostname or '').lower()
+    if not allow_r2_dev and (host == 'r2.dev' or host.endswith('.r2.dev')):
+        return ''  # production delivery uses the organization custom domain
     return value
 
 
@@ -64,10 +77,11 @@ class S3ObjectStorage(ObjectStorage):
     @classmethod
     def from_settings(cls):
         """Adapter from the R2_* settings, or ``None`` when they are incomplete."""
-        endpoint = settings.R2_S3_ENDPOINT_URL.strip()
-        if not endpoint and settings.R2_ACCOUNT_ID.strip():
+        endpoint = _https_url(settings.R2_S3_ENDPOINT_URL)
+        if not settings.R2_S3_ENDPOINT_URL.strip() and settings.R2_ACCOUNT_ID.strip():
             endpoint = f'https://{settings.R2_ACCOUNT_ID.strip()}.r2.cloudflarestorage.com'
-        public_base = _public_base(settings.R2_PUBLIC_DOMAIN, require_https=True)
+        allow_r2_dev = bool(settings.DEBUG and getattr(settings, 'R2_ALLOW_R2_DEV_DOMAIN', False))
+        public_base = _public_base(settings.R2_PUBLIC_DOMAIN, require_https=True, allow_r2_dev=allow_r2_dev)
         values = [endpoint, settings.R2_ACCESS_KEY_ID, settings.R2_SECRET_ACCESS_KEY,
                   settings.R2_PRIVATE_BUCKET, settings.R2_PUBLIC_BUCKET, public_base]
         if not all(v.strip() for v in values):
@@ -93,6 +107,8 @@ class S3ObjectStorage(ObjectStorage):
             error = exc.response.get('Error', {})
             code = str(error.get('Code', ''))
             status = str(exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode', ''))
+            if code in MISCONFIGURED_CODES or status == '403':
+                raise StorageUnavailable('PROVIDER_MISCONFIGURED') from None
             if code in NOT_FOUND_CODES or status == '404':
                 raise ObjectNotFound() from None
             if code in PRECONDITION_CODES or status == '412':
@@ -105,9 +121,10 @@ class S3ObjectStorage(ObjectStorage):
 
     # ------------------------------------------------------------ port
 
-    def presign_put(self, key, *, content_type, expires_in):
+    def presign_put(self, key, *, content_type, content_length, expires_in):
         return self._call('generate_presigned_url', ClientMethod='put_object', ExpiresIn=expires_in,
-                          Params={'Bucket': self._bucket(PRIVATE), 'Key': key, 'ContentType': content_type})
+                          Params={'Bucket': self._bucket(PRIVATE), 'Key': key, 'ContentType': content_type,
+                                  'ContentLength': int(content_length)})
 
     def presign_get(self, key, *, expires_in, content_type, filename):
         return self._call('generate_presigned_url', ClientMethod='get_object', ExpiresIn=expires_in,
@@ -142,8 +159,10 @@ class S3ObjectStorage(ObjectStorage):
             raise StorageError('COPY_NOT_VISIBLE')
         return info
 
-    def open_stream(self, key, *, bucket=PRIVATE, byte_range=None):
+    def open_stream(self, key, *, bucket=PRIVATE, byte_range=None, if_match=None):
         params = {'Bucket': self._bucket(bucket), 'Key': key}
+        if if_match:
+            params['IfMatch'] = f'"{normalize_etag(if_match)}"'
         if byte_range is not None:
             params['Range'] = f'bytes={byte_range[0]}-{byte_range[1]}'
         return _SafeStream(self._call('get_object', **params)['Body'])

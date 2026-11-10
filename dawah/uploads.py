@@ -31,6 +31,7 @@ from pythagoras.utils import APIError
 from . import media
 from .models import Event, EventResource, PublicationStatus, StorageCleanup, UploadIntent
 from .storage import PRIVATE, PUBLIC, ObjectNotFound, PreconditionFailed, StorageError, get_storage
+from .storage.purge import PurgeError, get_purger
 from .storage.s3 import inline_disposition
 
 logger = logging.getLogger('dawah.uploads')
@@ -39,6 +40,7 @@ Status = UploadIntent.Status
 Storage = EventResource.StorageStatus
 LEASE_SECONDS = 300
 ABANDONED_AFTER = timedelta(days=1)
+PROMOTION_GRACE = timedelta(hours=1)  # an in-flight public copy is not deleted before this
 PUBLIC_CACHE_CONTROL = 'public, max-age=31536000, immutable'
 DURATION_MAX = 32767  # EventResource.duration is a PositiveSmallIntegerField
 MAX_INTENT_TTL = 900   # D2: 15-minute signed PUT; settings may shorten, never lengthen
@@ -73,18 +75,30 @@ def safe_file_name(name, extension='.mp3'):
 
 # ---------------------------------------------------------------- cleanup records
 
-def record_cleanup(bucket, key, reason, *, resource_id=None, upload_id=None):
+def record_cleanup(bucket, key, reason, *, resource_id=None, upload_id=None, public_url='', not_before=None):
     if not key:
         return None
     return StorageCleanup.objects.create(bucket=bucket, key=key, reason=reason, resource_id=resource_id,
-                                         upload_id=upload_id)
+                                         upload_id=upload_id, public_url=public_url, not_before=not_before)
+
+
+def retire_public_copy(resource, reason):
+    """On a locked resource: record its public copy (and URL to purge) for
+    deletion and clear the pointer. Caller saves the fields. Returns row id."""
+    if not resource.public_object_key:
+        return None
+    row = record_cleanup(PUBLIC, resource.public_object_key, reason, resource_id=resource.pk,
+                         public_url=resource.public_media_url)
+    resource.public_object_key = resource.public_media_url = ''
+    return row.pk
 
 
 def record_resource_cleanup(resource, reason):
     """Record every provider object a deleted resource leaves behind."""
     ids = []
-    for bucket, key in ((PRIVATE, resource.private_object_key), (PUBLIC, resource.public_object_key)):
-        row = record_cleanup(bucket, key, reason, resource_id=resource.pk)
+    for bucket, key, url in ((PRIVATE, resource.private_object_key, ''),
+                             (PUBLIC, resource.public_object_key, resource.public_media_url)):
+        row = record_cleanup(bucket, key, reason, resource_id=resource.pk, public_url=url)
         if row:
             ids.append(row.pk)
     for intent in resource.upload_intents.all():
@@ -98,16 +112,20 @@ def record_resource_cleanup(resource, reason):
 def _referenced(row):
     if row.bucket == StorageCleanup.Bucket.PUBLIC:
         return EventResource.objects.filter(public_object_key=row.key).exists()
+    # An unfinished intent's validation copy may be retried, whatever its lease.
     return (EventResource.objects.filter(private_object_key=row.key).exists()
-            or UploadIntent.objects.filter(validation_key=row.key, status=Status.VALIDATING,
-                                           lease_expires_at__gt=timezone.now()).exists())
+            or UploadIntent.objects.filter(validation_key=row.key, status__in=UploadIntent.OPEN).exists())
 
 
 def process_cleanup(*, ids=None, limit=100):
-    """Delete recorded orphans. Returns counts; never deletes referenced keys."""
+    """Delete recorded orphans, then purge their public URLs from the CDN.
+
+    Returns counts; never deletes referenced keys or rows still in their grace period.
+    """
     storage = get_storage()
     counts = {'done': 0, 'skipped': 0, 'failed': 0}
-    rows = StorageCleanup.objects.filter(status=StorageCleanup.Status.PENDING)
+    rows = StorageCleanup.objects.filter(Q(not_before__isnull=True) | Q(not_before__lte=timezone.now()),
+                                         status=StorageCleanup.Status.PENDING)
     if ids is not None:
         rows = rows.filter(pk__in=ids)
     for row in rows.order_by('id')[:limit]:
@@ -123,6 +141,16 @@ def process_cleanup(*, ids=None, limit=100):
             logger.warning('storage cleanup failed', extra={'cleanup_id': row.pk, 'error_code': exc.code})
             counts['failed'] += 1
             continue
+        if row.bucket == StorageCleanup.Bucket.PUBLIC and row.public_url:
+            try:
+                get_purger().purge([row.public_url])
+            except PurgeError as exc:
+                # Deleted but maybe still cached: keep pending so the purge is retried.
+                StorageCleanup.objects.filter(pk=row.pk).update(attempts=row.attempts + 1,
+                                                               last_error_code=exc.code)
+                logger.warning('cache purge failed', extra={'cleanup_id': row.pk, 'error_code': exc.code})
+                counts['failed'] += 1
+                continue
         StorageCleanup.objects.filter(pk=row.pk).update(status=StorageCleanup.Status.DONE, processed_at=now,
                                                        attempts=row.attempts + 1, last_error_code='')
         counts['done'] += 1
@@ -194,7 +222,8 @@ def create_audio_intent(event_id, resource_id, data, user):
     validation_key = f'media/audio/{_token()}.mp3'
     try:
         # Signing is local computation; done before any row exists.
-        upload_url = storage.presign_put(staging_key, content_type=media.MP3_CONTENT_TYPE, expires_in=ttl)
+        upload_url = storage.presign_put(staging_key, content_type=media.MP3_CONTENT_TYPE,
+                                         content_length=data['size_bytes'], expires_in=ttl)
     except StorageError as exc:
         logger.warning('upload intent signing failed', extra={'resource_id': resource_id, 'error_code': exc.code})
         raise media_upload_failed() from None
@@ -245,11 +274,15 @@ def _not_found():
     return APIError('NOT_FOUND', 'Upload not found.', status_code=404)
 
 
-def _release_lease(upload_id, token, *, back_to_issued=False):
-    updates = {'lease_token': '', 'lease_expires_at': None, 'updated_at': timezone.now()}
-    if back_to_issued:
-        updates['status'] = Status.ISSUED
-    UploadIntent.objects.filter(pk=upload_id, lease_token=token, status=Status.VALIDATING).update(**updates)
+def _release_lease(upload_id, token):
+    """Give up the lease. Without an immutable copy the intent is ``issued``
+    again (so normal expiry applies); with one it stays ``validating`` with no
+    lease, retryable at once and abandoned by the cleanup command if left."""
+    rows = UploadIntent.objects.filter(pk=upload_id, lease_token=token, status=Status.VALIDATING)
+    now = timezone.now()
+    rows.filter(validation_etag='').update(status=Status.ISSUED, lease_token='', lease_expires_at=None,
+                                           updated_at=now)
+    rows.update(lease_token='', lease_expires_at=None, updated_at=now)
 
 
 def _terminal(intent, status, code='', message=''):
@@ -297,12 +330,17 @@ def finalize_upload(upload_id, user):
     try:
         outcome = _observe_and_validate(storage, snapshot, token)
     except _Retryable as exc:
-        _release_lease(snapshot.pk, token, back_to_issued=exc.back_to_issued)
+        _release_lease(snapshot.pk, token)
         raise exc.error from None
     except StorageError as exc:
         _release_lease(snapshot.pk, token)
         logger.warning('upload finalize provider failure',
                        extra={'upload_id': snapshot.pk, 'error_code': exc.code})
+        raise media_upload_failed() from None
+    except Exception:  # noqa: BLE001 - e.g. temp disk full; never a 500 with details or a stuck lease
+        _release_lease(snapshot.pk, token)
+        logger.error('upload finalize internal failure',
+                     extra={'upload_id': snapshot.pk, 'error_code': 'FINALIZE_INTERNAL_ERROR'})
         raise media_upload_failed() from None
 
     # Phase 3: attach or reject atomically under the lock chain.
@@ -313,7 +351,6 @@ class _Retryable(Exception):
     def __init__(self, error, back_to_issued=False):
         super().__init__(error.code)
         self.error = error
-        self.back_to_issued = back_to_issued
 
 
 def _content_type_matches(observed, expected):
@@ -361,8 +398,8 @@ def _observe_and_validate(storage, intent, token):
     if copy is None or copy.etag != intent.validation_etag or copy.size != intent.observed_size:
         return ('failed', 'VALIDATION_COPY_MISSING', 'The validated copy is unavailable. Upload the file again.')
     try:
-        stream = storage.open_stream(intent.validation_key)
-    except ObjectNotFound:
+        stream = storage.open_stream(intent.validation_key, if_match=intent.validation_etag)
+    except (ObjectNotFound, PreconditionFailed):
         return ('failed', 'VALIDATION_COPY_MISSING', 'The validated copy is unavailable. Upload the file again.')
     try:
         spool = media.spool_stream(stream, expected_size=copy.size)
@@ -376,23 +413,33 @@ def _observe_and_validate(storage, intent, token):
 
 
 def _complete(upload_id, user, token, snapshot, outcome):
+    """Attach or reject under the lock chain, only while our lease is live."""
     cleanup_ids = []
+    after_commit_error = None
+    result = None
     with transaction.atomic():
         event, resource, intent = _locked_chain(upload_id, user)
         if intent is None or resource is None:
-            gone = True
+            after_commit_error = 'gone'
+        elif intent.lease_token != token or intent.status != Status.VALIDATING:
+            # Superseded or taken over: report the current state, do not attach.
+            if intent.status != Status.READY:
+                cleanup_ids.append(record_cleanup(PRIVATE, snapshot.validation_key, 'superseded',
+                                                  resource_id=resource.pk, upload_id=intent.pk).pk)
+            if intent.status in UploadIntent.TERMINAL:
+                result = FinalizeResult(intent, resource)
+            else:
+                after_commit_error = 'in_progress'
+        elif intent.lease_expires_at is None or intent.lease_expires_at < timezone.now():
+            # Our lease lapsed (validation outlived it): another finalize may start.
+            # Attach nothing; drop the lease so a retry starts cleanly.
+            intent.lease_token = ''
+            intent.lease_expires_at = None
+            if not intent.validation_etag:
+                intent.status = Status.ISSUED
+            intent.save()
+            after_commit_error = 'lease_expired'
         else:
-            gone = False
-            if intent.lease_token != token or intent.status != Status.VALIDATING:
-                # Superseded or taken over: report the current state, do not attach.
-                if intent.status != Status.READY:
-                    cleanup_ids.append(record_cleanup(PRIVATE, snapshot.validation_key, 'superseded',
-                                                      resource_id=resource.pk, upload_id=intent.pk).pk)
-                cleanup_after_commit(cleanup_ids)
-                if intent.status in UploadIntent.TERMINAL:
-                    return FinalizeResult(intent, resource)
-                raise APIError('UPLOAD_IN_PROGRESS', 'This upload is already being validated. Retry shortly.',
-                               status_code=409)
             kind = outcome[0]
             if kind == 'ready':
                 conflict = _attach_conflict(resource)
@@ -408,15 +455,22 @@ def _complete(upload_id, user, token, snapshot, outcome):
                     cleanup_ids.append(record_cleanup(PRIVATE, key, f'upload_{kind}', resource_id=resource.pk,
                                                       upload_id=intent.pk).pk)
                 refresh_storage_status(resource)
-            cleanup_after_commit(cleanup_ids)
-    if gone:
+            result = FinalizeResult(intent, resource)
+        cleanup_after_commit(cleanup_ids)
+    if after_commit_error == 'gone':
         # Resource (and its intent) deleted during validation: record the orphan copy.
         record_cleanup(PRIVATE, snapshot.validation_key, 'resource_deleted', resource_id=snapshot.resource_id,
                        upload_id=snapshot.pk)
         raise _not_found()
-    logger.info('upload finalized', extra={'upload_id': intent.pk, 'resource_id': resource.pk,
-                                           'upload_status': intent.status, 'error_code': intent.error_code})
-    return FinalizeResult(intent, resource)
+    if after_commit_error == 'in_progress':
+        raise APIError('UPLOAD_IN_PROGRESS', 'This upload is already being validated. Retry shortly.',
+                       status_code=409)
+    if after_commit_error == 'lease_expired':
+        raise APIError('UPLOAD_LEASE_EXPIRED', 'Validation took too long. Retry finalize.', status_code=409)
+    logger.info('upload finalized', extra={'upload_id': result.intent.pk, 'resource_id': result.resource.pk,
+                                           'upload_status': result.intent.status,
+                                           'error_code': result.intent.error_code})
+    return result
 
 
 def _attach_conflict(resource):
@@ -433,9 +487,7 @@ def _attach(resource, intent, info):
     if resource.private_object_key and resource.private_object_key != intent.validation_key:
         cleanup_ids.append(record_cleanup(PRIVATE, resource.private_object_key, 'replaced',
                                           resource_id=resource.pk).pk)
-    if resource.public_object_key:
-        cleanup_ids.append(record_cleanup(PUBLIC, resource.public_object_key, 'replaced',
-                                          resource_id=resource.pk).pk)
+    cleanup_ids.append(retire_public_copy(resource, 'replaced'))
     now = timezone.now()
     resource.private_object_key = intent.validation_key
     resource.etag = intent.validation_etag
@@ -443,14 +495,13 @@ def _attach(resource, intent, info):
     resource.size_bytes = intent.observed_size
     resource.file_name = intent.file_name
     resource.uploaded_at = now
-    resource.public_object_key = ''
-    resource.public_media_url = ''
     resource.storage_status = Storage.READY
     fields = ['private_object_key', 'etag', 'content_type', 'size_bytes', 'file_name', 'uploaded_at',
               'public_object_key', 'public_media_url', 'storage_status', 'updated_at']
-    if info.duration_seconds and info.duration_seconds <= DURATION_MAX:
-        resource.duration = info.duration_seconds
-        fields.append('duration')
+    # The new asset's duration replaces the old one; unknown/out of range clears it.
+    in_range = bool(info.duration_seconds) and info.duration_seconds <= DURATION_MAX
+    resource.duration = info.duration_seconds if in_range else None
+    fields.append('duration')
     resource.save(update_fields=fields)
     intent.duration = info.duration_seconds
     _terminal(intent, Status.READY)
@@ -476,24 +527,44 @@ def preview_url(resource):
 def promote_to_public(resource):
     """Copy the validated private bytes (at their ETag) to a new unique public key.
 
-    Returns ``(public_key, public_url)``. Records cleanup of the new key on failure.
+    The cleanup row for the new key is recorded *before* the copy, with a grace
+    period, so a crash at any point leaves no unrecorded public object. The
+    caller marks it attached (:func:`promotion_attached`) on success or
+    :func:`promotion_abandoned` otherwise. Returns ``(public_key, url, row_id)``.
     """
     storage = get_storage()
     file_name = resource.file_name or 'audio.mp3'
     public_key = f'audio/{_token()}/{file_name}'
     try:
+        url = storage.public_url(public_key)
+    except StorageError:
+        raise media_upload_failed() from None
+    row = record_cleanup(PUBLIC, public_key, 'promotion_pending', resource_id=resource.pk, public_url=url,
+                         not_before=timezone.now() + PROMOTION_GRACE)
+    try:
         storage.copy_if_match(resource.private_object_key, public_key, etag=resource.etag, src_bucket=PRIVATE,
                               dst_bucket=PUBLIC, content_type=resource.content_type or media.MP3_CONTENT_TYPE,
                               content_disposition=inline_disposition(file_name), cache_control=PUBLIC_CACHE_CONTROL)
-        url = storage.public_url(public_key)
     except StorageError as exc:
-        record_cleanup(PUBLIC, public_key, 'promotion_failed', resource_id=resource.pk)
+        promotion_abandoned([row.pk], 'promotion_failed')
         logger.warning('publication promotion failed', extra={'resource_id': resource.pk, 'error_code': exc.code})
         if isinstance(exc, (ObjectNotFound, PreconditionFailed)):
             raise APIError('MEDIA_NOT_READY', 'The validated asset is unavailable. Upload the audio again.',
                            status_code=409) from None
         raise media_upload_failed() from None
-    return public_key, url
+    return public_key, url, row.pk
+
+
+def promotion_attached(row_ids):
+    """The promoted copy is now referenced: its pending cleanup is cancelled."""
+    StorageCleanup.objects.filter(pk__in=[i for i in row_ids if i], status=StorageCleanup.Status.PENDING).update(
+        status=StorageCleanup.Status.CANCELLED, processed_at=timezone.now())
+
+
+def promotion_abandoned(row_ids, reason):
+    """The promoted copy will not be attached: make its cleanup eligible now."""
+    StorageCleanup.objects.filter(pk__in=[i for i in row_ids if i], status=StorageCleanup.Status.PENDING).update(
+        reason=reason, not_before=timezone.now())
 
 
 # ---------------------------------------------------------------- maintenance
@@ -504,8 +575,10 @@ def expire_stale_intents(now=None):
     expired = abandoned = 0
     stale = UploadIntent.objects.filter(
         Q(status=Status.ISSUED, expires_at__lte=now)
-        | Q(status=Status.VALIDATING, validation_etag='', expires_at__lte=now, lease_expires_at__lte=now)
-        | Q(status=Status.VALIDATING, lease_expires_at__lte=now, expires_at__lte=now - ABANDONED_AFTER)
+        | (Q(status=Status.VALIDATING, validation_etag='', expires_at__lte=now)
+           & (Q(lease_expires_at__lte=now) | Q(lease_expires_at__isnull=True)))
+        | (Q(status=Status.VALIDATING, expires_at__lte=now - ABANDONED_AFTER)
+           & (Q(lease_expires_at__lte=now) | Q(lease_expires_at__isnull=True)))
     ).values_list('pk', 'resource_id', 'resource__event_id')
     for upload_id, resource_id, event_id in stale:
         with transaction.atomic():
