@@ -189,8 +189,11 @@ class ResourcePermissionTests(DawahAPITestCase, TestCase):
         resource = make_resource(event, status=PUBLISHED, ready=True, duration=2100)
         data = self.data(self.client.get(f'/dawah/resources/{resource.pk}/'))
         self.assertEqual(set(data), {'id', 'event_id', 'title', 'type', 'status', 'storage_status', 'duration',
-                                     'media_url', 'playback', 'published_at', 'created_at', 'updated_at',
+                                     'media_url', 'playback', 'content_type', 'size_bytes', 'uploaded_at',
+                                     'preview_url', 'published_at', 'created_at', 'updated_at',
                                      'created_by', 'legacy_file_present', 'event'})
+        self.assertIsNone(data['preview_url'])
+        self.assertEqual(data['media_url'], resource.public_media_url)
         self.assertEqual(data['event'], {'id': event.pk, 'title': event.title, 'speakers': event.speakers,
                                          'category': event.category, 'start_time': '2026-10-09T12:00:00Z',
                                          'summary': event.summary})

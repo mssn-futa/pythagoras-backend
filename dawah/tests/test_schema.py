@@ -88,4 +88,7 @@ class DawahSchemaTests(DawahAPITestCase, TestCase):
         archive_params = {p['name'] for p in paths['/dawah/archive/']['get']['parameters']}
         self.assertEqual(archive_params, {'page', 'page_size', 'type', 'search', 'speaker', 'category',
                                           'date_from', 'date_to'})
-        self.assertNotIn('upload', ' '.join(paths))
+        # DAWAH-02 upload routes are the only upload operations, and are admin protocol routes.
+        self.assertEqual(sorted(p for p in paths if 'upload' in p or p.endswith('/audio/')),
+                         ['/dawah/events/{event_id}/resources/{resource_id}/audio/',
+                          '/dawah/uploads/{upload_id}/finalize/'])
