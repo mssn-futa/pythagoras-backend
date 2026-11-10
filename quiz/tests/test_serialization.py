@@ -53,10 +53,10 @@ class AnswerKeyLeakageTests(QuizAPITestMixin, TestCase):
         self.assertEqual(data['question_count'], 2)
         self.assertEqual(data['total_points'], 5)
         first = data['questions'][0]
-        self.assertEqual(set(first), {'id', 'quiz', 'text', 'points', 'options'})
+        self.assertEqual(set(first), {'id', 'quiz', 'text', 'points', 'order', 'options'})
         self.assertEqual(len(first['options']), 4)
         for option in first['options']:
-            self.assertEqual(set(option), {'id', 'text'})
+            self.assertEqual(set(option), {'id', 'text', 'order'})
         listed = self.call(self.student, 'get', '/quiz/quizzes/').json()['data'][0]
         self.assertEqual(listed['question_count'], 2)
 
@@ -99,7 +99,9 @@ class DispatchRegressionTests(QuizAPITestMixin, TestCase):
                          sorted(q.pk for q, _, _ in self.questions))
 
     def test_question_create_and_replace_return_the_question(self):
-        body = {'quiz': self.quiz.pk, 'text': 'Pick B', 'points': 2,
+        # Authoring targets a draft (published content is immutable since ASSESS-02).
+        draft, _ = make_quiz('Dispatch draft', active=False)
+        body = {'quiz': draft.pk, 'text': 'Pick B', 'points': 2,
                 'options': [{'text': label, 'is_correct': label == 'B'} for label in 'ABCD']}
         response = self.call(self.admin, 'post', '/quiz/question/', body)
         self.assertEqual(response.status_code, 201, response.content)
@@ -170,9 +172,11 @@ class LegacyQuestionConversionTests(QuizAPITestMixin, TestCase):
         self.assertNotIn('legacy answer', detail.content.decode())
 
     def test_put_without_type_keeps_mcq_question_mcq(self):
-        question = self.questions[0][0]
+        # Published questions are immutable (ASSESS-02); edit a draft's question.
+        draft, questions = make_quiz('Draft conversion', active=False)
+        question = questions[0][0]
         response = self.call(self.admin, 'put', f'/quiz/question/{question.pk}/',
-                             {'quiz': self.quiz.pk, 'text': 'Edited MCQ', 'points': 4})
+                             {'quiz': draft.pk, 'text': 'Edited MCQ', 'points': 4})
         self.assertEqual(response.status_code, 200, response.content)
         question.refresh_from_db()
         self.assertEqual((question.type, question.text, question.points),

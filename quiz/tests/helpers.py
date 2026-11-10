@@ -1,8 +1,12 @@
 """Shared fixtures for assessment API tests (PostgreSQL, no hard-coded PKs)."""
+from datetime import timedelta
+
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from quiz import lifecycle
 from quiz.models import Option, Question, Quiz, Submission
 
 User = get_user_model()
@@ -27,9 +31,15 @@ def walk_keys(value):
 
 def make_quiz(title, *, active=True, points=(2, 3), legacy_text_question=False):
     """Quiz with one MCQ question per ``points`` entry, each with four options
-    of which the second is correct. Returns ``(quiz, [(question, correct, wrong_options)])``."""
+    of which the second is correct. Returns ``(quiz, [(question, correct, wrong_options)])``.
+
+    ``active`` publishes it through ``quiz.lifecycle.publish_quiz`` (deadline a
+    week ahead); otherwise it stays a draft. A published quiz cannot hold a
+    legacy text question through any write path, so ``legacy_text_question``
+    with ``active`` simulates that pre-ASSESS-02 state with a bulk update.
+    """
     quiz = Quiz.objects.create(title=title, type='arabic', description='Weekly assessment',
-                               time_limit=30, is_active=active)
+                               time_limit=30, deadline=timezone.now() + timedelta(days=7))
     questions = []
     for index, value in enumerate(points, start=1):
         question = Question.objects.create(quiz=quiz, type=Question.Type.mcq,
@@ -41,6 +51,12 @@ def make_quiz(title, *, active=True, points=(2, 3), legacy_text_question=False):
         legacy = Question.objects.create(quiz=quiz, type=Question.Type.text,
                                          text=f'{title} legacy text question', points=1)
         Option.objects.create(question=legacy, text='legacy answer', is_correct=True)
+    if active and legacy_text_question:
+        Quiz.objects.filter(pk=quiz.pk).update(
+            status=Quiz.Status.PUBLISHED, is_active=True, published_at=timezone.now())
+    elif active:
+        lifecycle.publish_quiz(quiz.pk)
+    quiz.refresh_from_db()
     return quiz, questions
 
 
@@ -88,8 +104,9 @@ class QuizAPITestMixin:
         return getattr(client, method)(path, body, format='json')
 
     def submission(self, quiz, student, answers=None, score=0):
+        """A stored legacy-shape result (no attempt), as pre-ASSESS-02 rows are."""
         return Submission.objects.create(quiz=quiz, student=student, answers=answers or {},
-                                         score=score)
+                                         score=score, is_legacy=True)
 
     def assertNoAnswerKeys(self, response):
         payload = response.json()

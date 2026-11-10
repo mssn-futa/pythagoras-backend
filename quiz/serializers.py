@@ -9,13 +9,19 @@ at any nesting depth (D0 A12, D3). ``QuizListSerializer`` and
 Release behaviour is MCQ-only: student payloads include only MCQ questions and
 authoring accepts only ``type="mcq"``. Legacy text/multi-answer questions stay
 readable to admins.
+
+ASSESS-02: questions/options are listed in persisted ``order`` (ID tie-break).
+Quiz ``status``/``is_active``/``published_at``/``closed_at`` are read-only here
+(publication is ASSESS-03); published content edits are refused by the model
+and ``quiz.lifecycle`` guards (409 ``QUIZ_IMMUTABLE``).
 """
 from collections.abc import Mapping
 
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import Course, Enrollment, Option, Question, Quiz, Submission
+from .lifecycle import assert_quiz_changes_allowed
+from .models import Attempt, Course, Enrollment, Option, Question, Quiz, Submission
 from .permissions import is_admin
 
 
@@ -33,7 +39,8 @@ class RejectUnknownFieldsMixin:
 
 
 def _ordered(queryset):
-    return queryset.order_by('pk')
+    """Persisted order with ID tie-break (deterministic for every audience)."""
+    return queryset.order_by('order', 'pk')
 
 
 class CourseSerializer(serializers.ModelSerializer):
@@ -75,8 +82,12 @@ class AdminOptionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Option
-        fields = ['id', 'text', 'is_correct']
+        fields = ['id', 'text', 'is_correct', 'order']
         read_only_fields = ['id']
+        # Omitted order: numbered after the explicit ones. Uniqueness is checked
+        # by AdminQuestionWriteSerializer (the DB constraint is deferred).
+        extra_kwargs = {'order': {'required': False, 'min_value': 1}}
+        validators = []
 
 
 class AdminQuestionSerializer(serializers.ModelSerializer):
@@ -85,7 +96,7 @@ class AdminQuestionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Question
-        fields = ['id', 'quiz', 'type', 'text', 'points', 'options']
+        fields = ['id', 'quiz', 'type', 'text', 'points', 'order', 'options']
         read_only_fields = fields
 
     @extend_schema_field(AdminOptionSerializer(many=True))
@@ -117,8 +128,29 @@ class AdminQuestionWriteSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Question
-        fields = ['id', 'quiz', 'type', 'text', 'points', 'options']
+        fields = ['id', 'quiz', 'type', 'text', 'points', 'order', 'options']
         read_only_fields = ['id']
+        # Omitted order: appended after the quiz's last question (create), kept
+        # (update) or appended in the new quiz (move). Uniqueness is checked
+        # under the quiz row lock in create/update (the DB constraint is deferred).
+        extra_kwargs = {'order': {'required': False, 'min_value': 1}}
+        validators = []
+
+    def validate_options(self, options):
+        orders = [option['order'] for option in options if 'order' in option]
+        if len(orders) != len(set(orders)):
+            raise serializers.ValidationError('Option orders must be unique.')
+        free = (n for n in range(1, len(options) + len(orders) + 2) if n not in set(orders))
+        return [option if 'order' in option else {**option, 'order': next(free)}
+                for option in options]
+
+    def _check_question_order(self, quiz, order, exclude_pk=None):
+        # Serializes with publish/close and other authoring writes on this quiz.
+        Quiz.objects.select_for_update(no_key=True).filter(pk=quiz.pk).first()
+        taken = Question.objects.filter(quiz=quiz, order=order).exclude(pk=exclude_pk)
+        if order is not None and taken.exists():
+            raise serializers.ValidationError({'order': ['Another question of this quiz '
+                                                         'already has this order.']})
 
     def validate(self, data):
         if self.instance is None:
@@ -134,6 +166,7 @@ class AdminQuestionWriteSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         options_data = validated_data.pop('options', [])
+        self._check_question_order(validated_data['quiz'], validated_data.get('order'))
         question = Question.objects.create(**validated_data)
         for option_data in options_data:
             Option.objects.create(question=question, **option_data)
@@ -141,8 +174,12 @@ class AdminQuestionWriteSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         options_data = validated_data.pop('options', None)
+        moved = validated_data.get('quiz', instance.quiz) != instance.quiz
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+        if moved and 'order' not in validated_data:
+            instance.order = None  # appended in the target quiz
+        self._check_question_order(instance.quiz, instance.order, exclude_pk=instance.pk)
         instance.save()
         if options_data is not None:
             instance.option_set.all().delete()
@@ -174,19 +211,45 @@ class _QuizSummaryMixin(serializers.Serializer):
 
 QUIZ_FIELDS = [
     'id', 'title', 'type', 'description', 'related_event',
-    'related_course', 'time_limit', 'is_active', 'questions',
+    'related_course', 'time_limit', 'deadline', 'status', 'is_active', 'published_at',
+    'closed_at', 'created_at', 'updated_at', 'questions',
     'course_title', 'event_title', 'total_points', 'question_count',
 ]
+QUIZ_LIFECYCLE_FIELDS = ['status', 'is_active', 'published_at', 'closed_at']
 
 
 class AdminQuizSerializer(_QuizSummaryMixin, serializers.ModelSerializer):
-    """Quiz with every question and its keys. Admin read/write."""
+    """Quiz with every question and its keys. Admin read/write.
+
+    Writes create/edit drafts. ``status``/``is_active`` are derived lifecycle
+    state: a request that tries to change them is a 400 field error (they are
+    not silently ignored). A published/closed quiz accepts only title and
+    description changes; anything else is ``QuizImmutable`` (409).
+    """
     questions = serializers.SerializerMethodField()
 
     class Meta:
         model = Quiz
         fields = QUIZ_FIELDS
-        read_only_fields = ['id']
+        read_only_fields = ['id', *QUIZ_LIFECYCLE_FIELDS, 'created_at', 'updated_at']
+
+    def validate(self, data):
+        current = {'status': Quiz.Status.DRAFT, 'is_active': False}
+        if self.instance is not None:
+            current = {'status': self.instance.status, 'is_active': self.instance.is_active}
+        initial = self.initial_data if isinstance(self.initial_data, Mapping) else {}
+        errors = {name: ['Quiz status changes only through the publish/close actions.']
+                  for name, value in current.items()
+                  if name in initial and initial[name] != value}
+        if errors:
+            raise serializers.ValidationError(errors)
+        return data
+
+    def update(self, instance, validated_data):
+        changed = [name for name, value in validated_data.items()
+                   if getattr(instance, name) != value]
+        assert_quiz_changes_allowed(instance, changed)
+        return super().update(instance, validated_data)
 
     @extend_schema_field(AdminQuestionSerializer(many=True))
     def get_questions(self, obj):
@@ -205,8 +268,8 @@ class QuizListSerializer(serializers.ModelSerializer):
         model = Quiz
         fields = [
             'id', 'title', 'type', 'description', 'related_event',
-            'related_course', 'time_limit', 'is_active', 'course_title',
-            'event_title', 'question_count'
+            'related_course', 'time_limit', 'deadline', 'status', 'is_active',
+            'course_title', 'event_title', 'question_count'
         ]
         read_only_fields = fields
 
@@ -256,7 +319,7 @@ class AdminSubmissionDetailSerializer(AdminSubmissionSerializer):
 class StudentOptionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Option
-        fields = ['id', 'text']
+        fields = ['id', 'text', 'order']
         read_only_fields = fields
 
 
@@ -265,7 +328,7 @@ class StudentQuestionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Question
-        fields = ['id', 'quiz', 'text', 'points', 'options']
+        fields = ['id', 'quiz', 'text', 'points', 'order', 'options']
         read_only_fields = fields
 
     @extend_schema_field(StudentOptionSerializer(many=True))
@@ -303,6 +366,38 @@ class StudentSubmissionSerializer(serializers.ModelSerializer):
 
     def get_is_graded(self, obj) -> bool:
         return obj.graded_at is not None
+
+
+class StudentAttemptQuestionSerializer(StudentQuestionSerializer):
+    class Meta(StudentQuestionSerializer.Meta):
+        fields = ['id', 'text', 'points', 'order', 'options']
+        read_only_fields = fields
+
+
+class StudentAttemptSerializer(serializers.ModelSerializer):
+    """Frozen D3 student attempt shape for ASSESS-04/06 (not routed in ASSESS-02).
+
+    ``status`` is the effective status at ``context['now']`` (an in-progress
+    attempt past expiry reads ``expired``). The view adds ``server_time``.
+    Questions are MCQ-only, in persisted order, without keys.
+    """
+    quiz_id = serializers.IntegerField(read_only=True)
+    status = serializers.SerializerMethodField()
+    questions = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Attempt
+        fields = ['id', 'quiz_id', 'status', 'started_at', 'expires_at', 'questions']
+        read_only_fields = fields
+
+    def get_status(self, obj) -> str:
+        from .lifecycle import effective_attempt_status, server_now
+        return effective_attempt_status(obj, self.context.get('now') or server_now())
+
+    @extend_schema_field(StudentAttemptQuestionSerializer(many=True))
+    def get_questions(self, obj):
+        questions = _ordered(obj.quiz.question_set.filter(type=Question.Type.mcq))
+        return StudentAttemptQuestionSerializer(questions, many=True).data
 
 
 @extend_schema_field({

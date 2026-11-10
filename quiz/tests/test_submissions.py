@@ -3,7 +3,8 @@ from unittest import mock
 
 from django.test import TestCase
 
-from quiz.models import Question, Quiz, Submission
+from quiz import lifecycle
+from quiz.models import Option, Question, Quiz, Submission
 from quiz.services import InvalidAnswers, QuizService
 
 from .helpers import QuizAPITestMixin, make_quiz
@@ -141,7 +142,9 @@ class SubmissionTests(QuizAPITestMixin, TestCase):
         self.assertFalse(Submission.objects.exists())
 
     def test_score_capacity_is_checked_before_saving(self):
-        Question.objects.filter(pk=self.q1.pk).update(points=32767)
+        # ASSESS-02 widened storage to integer; exercise the same check at a
+        # lowered capacity (5 available points > 4).
+        self.enterContext(mock.patch('quiz.services.MAX_STORED_SCORE', 4))
         self.assertRejected({'quiz': self.quiz.pk, 'answers': self.answers()}, 'quiz')
 
     # -- one submission per student and quiz ---------------------------------
@@ -154,7 +157,7 @@ class SubmissionTests(QuizAPITestMixin, TestCase):
         self.assertEqual(replay.json()['data'], first.json()['data'])
         self.assertEqual(Submission.objects.count(), 1)
         # Replay still succeeds after the quiz is no longer available.
-        Quiz.objects.filter(pk=self.quiz.pk).update(is_active=False)
+        lifecycle.close_quiz(self.quiz.pk)
         late = self.post({'quiz': self.quiz.pk, 'answers': self.answers()})
         self.assertEqual(late.status_code, 200, late.content)
         self.assertEqual(late.json()['data']['id'], first.json()['data']['id'])
@@ -177,7 +180,7 @@ class SubmissionTests(QuizAPITestMixin, TestCase):
         self.assertEqual(Submission.objects.filter(quiz=self.quiz).count(), 2)
 
     def test_grading_failure_rolls_back(self):
-        with mock.patch.object(QuizService, 'grade_answers', side_effect=RuntimeError('boom')):
+        with mock.patch.object(QuizService, 'grade', side_effect=RuntimeError('boom')):
             response = self.post({'quiz': self.quiz.pk, 'answers': self.answers()})
         self.assertEnvelopeError(response, 500, 'INTERNAL_ERROR')
         self.assertNotIn('boom', response.content.decode())
@@ -199,8 +202,8 @@ class AnswerValidationServiceTests(TestCase):
 
     def test_question_with_several_correct_options_awards_nothing(self):
         (q1, c1, w1), _ = self.questions
-        w1[0].is_correct = True
-        w1[0].save()
+        # Legacy-shaped data: a published question cannot be edited any more.
+        Option.objects.filter(pk=w1[0].pk).update(is_correct=True)
         self.assertEqual(QuizService.grade_answers(self.quiz, {str(q1.pk): c1.pk}), 0)
 
     def test_invalid_answers_collects_every_error(self):

@@ -9,45 +9,27 @@ the server against the persisted correct option and question points.
 It is retained only as legacy coverage for records stored in that shape and is
 not used by any release endpoint.
 """
-import json
 import re
+from dataclasses import dataclass
 
 from django.db import transaction
 from django.db.models import Prefetch
 
-from .models import Option, Question, Quiz, Submission
+from .errors import AttemptExpired, InvalidAnswers, SubmissionConflict  # noqa: F401 (re-exported)
+from .models import MAX_STORED_POINTS, Attempt, Option, Question, Quiz, Submission
 
-# Submission.score is a PositiveSmallIntegerField until ASSESS-02 widens it.
-MAX_STORED_SCORE = 32767
+# Capacity of Submission.score/total_points (widened to integer by ASSESS-02).
+MAX_STORED_SCORE = MAX_STORED_POINTS
 
 _CANONICAL_ID = re.compile(r'[1-9][0-9]*')
+SNAPSHOT_VERSION = 1
 
 
-class SubmissionConflict(Exception):
-    """The student already has a submission with different answers (409)."""
-
-
-class InvalidAnswers(ValueError):
-    """Answers do not have the structure a grader requires.
-
-    ``errors`` maps a question-ID string (or ``non_field_errors``) to a list of
-    messages. ``as_fields()`` nests them under ``field`` (``answers`` by
-    default) for a D0 ``VALIDATION_ERROR`` ``fields`` object; ``field=None``
-    means ``errors`` already names request fields.
-    """
-
-    def __init__(self, errors, field='answers'):
-        self.errors = errors
-        self.field = field
-        super().__init__('Invalid answers.')
-
-    def as_fields(self):
-        return self.errors if self.field is None else {self.field: self.errors}
-
-
-def _canonical_json(value):
-    # Strict comparison: JSON true/1/1.0 are different answers.
-    return json.dumps(value, sort_keys=True)
+@dataclass(frozen=True)
+class GradingResult:
+    score: int
+    total_points: int
+    snapshot: dict
 
 
 def is_canonical_id(key):
@@ -96,21 +78,46 @@ class QuizService:
         return normalized
 
     @staticmethod
-    def grade_answers(quiz, answers):
-        """Weighted score for answers already returned by ``validate_answers``."""
-        score = 0
-        questions = quiz.question_set.filter(type=Question.Type.mcq).prefetch_related(
+    def grade(quiz, answers):
+        """Grade answers from ``validate_answers``; return a ``GradingResult``.
+
+        Weighted by persisted question points, against persisted correct
+        option IDs, MCQ questions only, in persisted (order, id) order.
+        ``snapshot`` (version 1) is what a finalized submission stores::
+
+            {"version": 1, "quiz_id": 45, "quiz_title": "Arabic week 1",
+             "score": 2, "total_points": 5,
+             "questions": [{"question_id": 10, "order": 1, "points": 2,
+                            "selected_option_id": 102, "awarded_points": 2}, ...]}
+
+        It deliberately holds no correct-option IDs. Unanswered questions have
+        ``selected_option_id: null`` and score zero.
+        """
+        questions = quiz.question_set.filter(type=Question.Type.mcq).order_by(
+            'order', 'pk').prefetch_related(
             Prefetch('option_set', queryset=Option.objects.filter(is_correct=True),
-                     to_attr='correct_options')
-        )
+                     to_attr='correct_options'))
+        rows = []
+        score = total = 0
         for question in questions:
             selected = answers.get(str(question.pk))
             correct = {option.pk for option in question.correct_options}
             # Exactly one correct option is the release rule (A08); a legacy
             # question with zero or several correct options never awards points.
-            if selected is not None and correct == {selected}:
-                score += question.points
-        return score
+            awarded = question.points if selected is not None and correct == {selected} else 0
+            score += awarded
+            total += question.points
+            rows.append({'question_id': question.pk, 'order': question.order,
+                         'points': question.points, 'selected_option_id': selected,
+                         'awarded_points': awarded})
+        snapshot = {'version': SNAPSHOT_VERSION, 'quiz_id': quiz.pk, 'quiz_title': quiz.title,
+                    'score': score, 'total_points': total, 'questions': rows}
+        return GradingResult(score=score, total_points=total, snapshot=snapshot)
+
+    @classmethod
+    def grade_answers(cls, quiz, answers):
+        """Weighted score for answers already returned by ``validate_answers``."""
+        return cls.grade(quiz, answers).score
 
     @staticmethod
     def available_points(quiz):
@@ -118,41 +125,45 @@ class QuizService:
 
     @classmethod
     def submit(cls, *, quiz_id, student, answers):
-        """Grade and persist a legacy direct submission; return ``(submission, created)``.
+        """Temporary direct submission (until ASSESS-04); returns ``(submission, created)``.
 
-        Temporary until the ASSESS-04 attempt contract. Under the quiz row lock:
-        an existing submission by this student is returned unchanged for an
-        identical answer map (replay, also after the quiz is deactivated) or is a
-        ``SubmissionConflict``; otherwise the quiz must be active, answers
-        are validated, and score/graded_at are computed here, never taken from
-        the client. Raises ``InvalidAnswers`` (400) or ``SubmissionConflict`` (409).
-        Domain exceptions keep this module free of HTTP imports.
+        Same promises as ASSESS-01, stored in the ASSESS-02 shape. Under the
+        quiz row lock: an existing submission by this student (legacy or not)
+        is returned unchanged for an identical answer map (replay, also after
+        closing/deadline) or is a ``SubmissionConflict``. Otherwise the quiz
+        must be available (published, deadline in the future); the student's
+        attempt is created at this server instant (``started_at`` =
+        ``finalized_at`` = ``submitted_at`` = ``graded_at``; this path has no
+        separate start) or, if one exists, finalized subject to its expiry
+        (``AttemptExpired``). Answers are validated (``InvalidAnswers``) and
+        graded with a snapshot via ``quiz.lifecycle``. Any failure rolls back
+        the attempt too, so a rejected request never consumes the attempt.
         """
+        from . import lifecycle  # lifecycle imports this module
+
         with transaction.atomic():
             quiz = Quiz.objects.select_for_update().filter(pk=quiz_id).first()
             existing = None
             if quiz is not None:
-                existing = Submission.objects.filter(quiz=quiz, student=student).order_by('pk').first()
+                existing = Submission.objects.filter(quiz=quiz, student=student).first()
             if existing is not None:
-                if _canonical_json(existing.answers) == _canonical_json(answers):
-                    return existing, False
-                raise SubmissionConflict()
-            if quiz is None or not quiz.is_active:
+                return lifecycle.replay_or_conflict(existing, answers), False
+            if quiz is None:
                 raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
-            normalized = cls.validate_answers(quiz, answers)
+            now = lifecycle.server_now()
+            attempt = Attempt.objects.select_for_update().filter(quiz=quiz, student=student).first()
+            if attempt is None:
+                if not lifecycle.quiz_is_available(quiz, now):
+                    raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
+                attempt = Attempt.objects.create(
+                    quiz=quiz, student=student, started_at=now,
+                    expires_at=lifecycle.compute_expires_at(now, quiz.time_limit, quiz.deadline))
+            elif attempt.status != Attempt.Status.IN_PROGRESS or lifecycle.is_expired(attempt, now):
+                raise AttemptExpired()
             if cls.available_points(quiz) > MAX_STORED_SCORE:
                 raise InvalidAnswers({'quiz': ['This quiz cannot be graded until its points '
                                                'are reduced.']}, field=None)
-            submission = Submission.objects.create(
-                quiz=quiz,
-                student=student,
-                answers=normalized,
-                score=cls.grade_answers(quiz, normalized),
-            )
-            # Graded synchronously: one instant for both timestamps
-            # (submitted_at is auto_now_add, so it is set by the insert).
-            submission.graded_at = submission.submitted_at
-            submission.save(update_fields=['graded_at'])
+            submission = lifecycle.finalize_locked(quiz, attempt, answers, now)
         return submission, True
 
     # ------------------------------------------------------------------

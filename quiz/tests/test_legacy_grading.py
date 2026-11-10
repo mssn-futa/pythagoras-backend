@@ -15,8 +15,11 @@ class TestQuizService(TestCase):
     """
 
     def setUp(self):
-        student = CustomUser.objects.create_user(
-            email="django@email.com", password="DjangoBoy!!"
+        # One legacy submission per student and quiz (ASSESS-02 constraint), so
+        # each graded record belongs to its own student.
+        student, student2, student3 = (
+            CustomUser.objects.create_user(email=email, password=None)
+            for email in ("django@email.com", "django2@email.com", "django3@email.com")
         )
 
         event = Event.objects.create(
@@ -82,11 +85,12 @@ class TestQuizService(TestCase):
                 ],
             },
             score=0,
+            is_legacy=True,
         )
         # Submission 2
         self.submission2 = Submission.objects.create(
             quiz=quiz,
-            student=student,
+            student=student2,
             answers={
                 str(q1.id): "true",
                 str(q2.id): "runtime environment",
@@ -97,11 +101,12 @@ class TestQuizService(TestCase):
                 ],
             },
             score=0,
+            is_legacy=True,
         )
         # Submission 3
         self.submission3 = Submission.objects.create(
             quiz=quiz,
-            student=student,
+            student=student3,
             answers={
                 str(q1.id): "true",
                 str(q2.id): "web framework",
@@ -111,6 +116,7 @@ class TestQuizService(TestCase):
                 ],
             },
             score=0,
+            is_legacy=True,
         )
 
     def test_all_answers_correct(self):

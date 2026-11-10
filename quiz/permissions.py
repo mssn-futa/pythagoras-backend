@@ -5,12 +5,15 @@ an active account with ``role == 'admin'``; ``is_staff`` grants nothing here.
 Object visibility is expressed as querysets so a hidden object is a 404 before
 any serializer or mutation runs.
 
-Legacy availability: until ASSESS-02 adds quiz status, a quiz is visible to a
-student only while ``is_active`` is true. That rule is temporary.
+Student availability (D3, ASSESS-02): a quiz is visible to a student only
+while it is published and its deadline is in the future (database clock), via
+``quiz.lifecycle.available_quizzes``. ``is_active`` is derived from status and
+no longer decides visibility. History stays reachable through submissions.
 """
 from accounts.permissions import IsActiveAdmin, IsActiveStudent, IsActiveUser
 from rest_framework.permissions import SAFE_METHODS
 
+from .lifecycle import available_quizzes
 from .models import Question, Quiz, Submission
 
 __all__ = ['IsActiveAdmin', 'IsActiveStudent', 'IsActiveUser', 'is_admin',
@@ -34,7 +37,7 @@ def visible_quizzes(user):
     queryset = Quiz.objects.all()
     if is_admin(user):
         return queryset
-    return queryset.filter(is_active=True)
+    return available_quizzes(queryset)
 
 
 def visible_questions(user):
@@ -42,7 +45,7 @@ def visible_questions(user):
     if is_admin(user):
         return queryset
     # Release behaviour is MCQ-only; legacy text/multi questions stay admin-only.
-    return queryset.filter(quiz__is_active=True, type=Question.Type.mcq)
+    return queryset.filter(quiz__in=available_quizzes(), type=Question.Type.mcq)
 
 
 def visible_submissions(user):
