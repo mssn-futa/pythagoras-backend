@@ -25,13 +25,13 @@ import django
 django.setup()
 from rest_framework.settings import api_settings
 from rest_framework.views import APIView
-from rest_framework_simplejwt.authentication import JWTAuthentication
+from accounts.authentication import ActiveUserJWTAuthentication
 from pythagoras.utils import StandardizedJSONRenderer, exception_handler
 from pythagoras.schema import EnvelopeAutoSchema
 from pythagoras.pagination import StandardPagination
 assert api_settings.DEFAULT_RENDERER_CLASSES == [StandardizedJSONRenderer]
 assert APIView.renderer_classes == [StandardizedJSONRenderer]
-assert api_settings.DEFAULT_AUTHENTICATION_CLASSES == [JWTAuthentication]
+assert api_settings.DEFAULT_AUTHENTICATION_CLASSES == [ActiveUserJWTAuthentication]
 assert api_settings.DEFAULT_SCHEMA_CLASS is EnvelopeAutoSchema
 assert api_settings.EXCEPTION_HANDLER is exception_handler
 assert api_settings.DEFAULT_PAGINATION_CLASS is StandardPagination
