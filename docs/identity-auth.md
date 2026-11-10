@@ -97,6 +97,44 @@ nothing is applied. Message on success: `Profile updated.`.
 returns 403 `ACCOUNT_INACTIVE` for a valid access token of a deactivated
 account on every endpoint, including domain apps.
 
+## Student administration (PLAT-05)
+
+Admin only (`IsActiveAdmin`); anonymous 401, student 403 `PERMISSION_DENIED`,
+deactivated admin 403 `ACCOUNT_INACTIVE`. No throttle (D5 lists none for these).
+
+| Route | Method | Success |
+| --- | --- | --- |
+| `/accounts/students/` | GET | 200 paginated student-role users |
+| `/accounts/students/{id}/` | GET | 200 student; unknown or administrator id 404 |
+| `/accounts/students/{id}/` | PATCH | 200 `Student updated.` |
+
+List filters (AND): `search` (every term matches full name, email or matric,
+case-insensitive), `department` (trimmed, case-insensitive exact), `level`
+(`100`-`500`), `is_active` (`true`/`false`); empty values are ignored, invalid
+ones are 400 field errors. `page`/`page_size` (default 20, max 100); ordered by
+last name, first name, id. Rows are the user shape plus `date_joined`:
+
+```json
+{"success":true,"data":{"count":1,"next":null,"previous":null,"results":[{"id":1,"email":"student@example.test","first_name":"Amina","last_name":"Yusuf","matric_number":"CSC/21/001","department":"Computer Science","level":"300","role":"student","is_active":true,"date_joined":"2026-09-14T08:30:00Z"}]},"message":"Request successful."}
+```
+
+PATCH accepts `first_name`, `last_name`, `department`, `level`, `email`,
+`matric_number`, `is_active`, normalized exactly as registration; collisions are
+400 field errors. Any other key (`role`, `is_staff`, `groups`, `password`, ...)
+is 400 `{"role":["This field cannot be set or changed here."]}` and nothing is
+applied. Deactivation applies on the student's next request (existing access
+tokens get 403, refresh fails 403).
+
+`accounts.student_admin.set_account_active()` / `lock_status_scope()` /
+`assert_status_change_allowed()` are the shared status protection: the target
+and all active admin rows are locked (`select_for_update`, pk order) and a
+change that would deactivate the acting admin (409 `SELF_DEACTIVATION`) or the
+last active admin (409 `LAST_ADMIN`) is refused. Use them for any future
+operation that can change an admin's status. The Django admin user change form
+uses the same protection (also for `role` changes and for single and bulk deletion; self-deletion and
+deleting every active admin are refused, with 409-equivalent
+`SELF_DEMOTION`), showing a form error instead of saving.
+
 ## Shared permissions for domain apps
 
 ```python
