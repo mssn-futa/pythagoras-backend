@@ -1,8 +1,12 @@
 import email.message
+import http.client
 import io
 import json
 import logging
+import os
 import socket
+import threading
+import time
 import urllib.error
 from dataclasses import FrozenInstanceError
 from unittest import mock
@@ -123,7 +127,9 @@ class ResendTransportTests(SimpleTestCase):
         result = self.send(FakeResponse(), message(reply_to='help@example.test'))
         self.assertEqual(result, SendResult.accepted('4ef9a417-02e9-4d39-ad75-9611e0fcc33c'))
         request = self.opener.open.call_args.args[0]
-        self.assertEqual(self.opener.open.call_args.kwargs, {'timeout': 7})
+        # Per-socket timeout is the remaining share of the 7 s total budget.
+        self.assertEqual(set(self.opener.open.call_args.kwargs), {'timeout'})
+        self.assertTrue(0 < self.opener.open.call_args.kwargs['timeout'] <= 7)
         self.assertEqual(self.opener.open.call_count, 1)  # no opaque retries
         self.assertEqual(request.full_url, 'https://api.resend.com/emails')
         self.assertEqual(request.get_method(), 'POST')
@@ -176,6 +182,11 @@ class ResendTransportTests(SimpleTestCase):
             (urllib.error.URLError(socket.timeout('timed out')), SendResult.uncertain('TIMEOUT')),
             (urllib.error.URLError(ConnectionRefusedError()), SendResult.uncertain('CONNECTION_ERROR')),
             (ConnectionResetError(), SendResult.uncertain('TRANSPORT_ERROR')),
+            (http.client.BadStatusLine('garbage'), SendResult.uncertain('TRANSPORT_ERROR')),
+            (http.client.LineTooLong('status line'), SendResult.uncertain('TRANSPORT_ERROR')),
+            (http.client.IncompleteRead(b'{"id"', 20), SendResult.uncertain('TRANSPORT_ERROR')),
+            (http.client.RemoteDisconnected('closed'), SendResult.uncertain('TRANSPORT_ERROR')),
+            (RuntimeError('unexpected bug'), SendResult.uncertain('TRANSPORT_ERROR')),
         ]
         for outcome, expected in cases:
             with self.subTest(expected=expected):
@@ -212,3 +223,122 @@ class DeployCheckTests(SimpleTestCase):
             self.assertEqual(warning.id, 'pythagoras.W102')
         with override_settings(EMAIL_TRANSPORT='resend', RESEND_API_KEY=API_KEY, DEFAULT_FROM_EMAIL='a@x.test'):
             self.assertEqual(email_transport_check(None), [])
+
+
+class IdempotencyKeyTests(SimpleTestCase):
+    def test_namespaced_keys(self):
+        from pythagoras.mail import idempotency_key
+        self.assertEqual(settings.EMAIL_IDEMPOTENCY_NAMESPACE, 'local')
+        self.assertEqual(idempotency_key('welcome', 7, 'v1'), 'local/welcome/7/v1')
+        with override_settings(EMAIL_IDEMPOTENCY_NAMESPACE='production'):
+            self.assertEqual(idempotency_key('broadcast', 3, 'generation', 1),
+                             'production/broadcast/3/generation/1')
+        for bad in ((), ('a/b',), ('',), (' x',), ('x' * 300,)):
+            with self.subTest(parts=bad), self.assertRaises(ValueError):
+                idempotency_key(*bad)
+
+    @override_settings(EMAIL_TRANSPORT='resend', RESEND_API_KEY=API_KEY, RESEND_TIMEOUT_SECONDS=30)
+    def test_timeout_override_only_tightens(self):
+        self.assertEqual(get_transport()._timeout, 30)
+        self.assertEqual(get_transport(timeout=10)._timeout, 10)
+        self.assertEqual(get_transport(timeout=99)._timeout, 30)
+
+
+class LocalServerTransportTests(SimpleTestCase):
+    """Real sockets against a local server; no provider traffic."""
+
+    def serve(self, handler):
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        stop = threading.Event()
+
+        def run():
+            listener.settimeout(5)
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(5)
+                try:
+                    data = b''
+                    while b'\r\n\r\n' not in data:
+                        data += conn.recv(65536)
+                    handler(conn, stop)
+                except OSError:
+                    pass
+            listener.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(thread.join, 10)
+        return f'http://127.0.0.1:{listener.getsockname()[1]}/emails'
+
+    def send(self, url, timeout):
+        transport = ResendTransport(api_key=API_KEY, timeout=timeout, url=url)
+        env = {'NO_PROXY': '*', 'no_proxy': '*'}
+        with mock.patch.dict(os.environ, env), self.assertLogs('pythagoras.mail', 'INFO') as logs:
+            started = time.monotonic()
+            result = transport.send(message())
+            elapsed = time.monotonic() - started
+        self.assertNotIn(API_KEY, '\n'.join(logs.output))
+        return result, elapsed
+
+    def test_slow_drip_response_hits_total_deadline(self):
+        def drip(conn, stop):
+            body = b'{"id":"4ef9a417-02e9-4d39-ad75-1"}'
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+                         b'Content-Length: %d\r\n\r\n' % len(body))
+            for byte in body:
+                if stop.wait(0.3):
+                    return
+                conn.sendall(bytes([byte]))
+
+        result, elapsed = self.send(self.serve(drip), timeout=1)
+        self.assertEqual(result, SendResult.uncertain('DEADLINE_EXCEEDED'))
+        self.assertLess(elapsed, 2.5)
+
+    def test_fast_local_success(self):
+        def ok(conn, stop):
+            body = b'{"id":"local-id-1"}'
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+
+        result, _ = self.send(self.serve(ok), timeout=5)
+        self.assertEqual(result, SendResult.accepted('local-id-1'))
+
+    def test_garbage_status_line_is_uncertain_not_raised(self):
+        result, _ = self.send(self.serve(lambda conn, stop: conn.sendall(b'garbage\r\n\r\n')), timeout=5)
+        self.assertEqual(result, SendResult.uncertain('TRANSPORT_ERROR'))
+
+    def test_overlong_status_line_is_uncertain_not_raised(self):
+        result, _ = self.send(self.serve(
+            lambda conn, stop: conn.sendall(b'HTTP/1.1 200 ' + b'x' * 70000 + b'\r\n\r\n')), timeout=5)
+        self.assertEqual(result, SendResult.uncertain('TRANSPORT_ERROR'))
+
+    def test_truncated_body_is_never_accepted(self):
+        result, _ = self.send(self.serve(lambda conn, stop: conn.sendall(
+            b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"id":"x"')), timeout=5)
+        self.assertEqual(result.status, SendStatus.UNCERTAIN)
+
+    def test_oversized_body_is_capped(self):
+        def big(conn, stop):
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n{"id":"' + b'a' * 200000)
+
+        result, _ = self.send(self.serve(big), timeout=5)
+        self.assertEqual(result, SendResult.uncertain('MALFORMED_SUCCESS'))
+
+    def test_unbounded_dns_is_cut_by_total_deadline(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hanging_getaddrinfo(*args, **kwargs):
+            release.wait(10)
+            raise socket.gaierror('released')
+
+        with mock.patch('socket.getaddrinfo', hanging_getaddrinfo):
+            result, elapsed = self.send('https://api.resend.invalid/emails', timeout=1)
+        self.assertEqual(result, SendResult.uncertain('DEADLINE_EXCEEDED'))
+        self.assertLess(elapsed, 2.5)

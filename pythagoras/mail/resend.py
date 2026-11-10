@@ -3,11 +3,13 @@
 Never logs or returns the API key, request body, or addresses.
 """
 import email.utils
+import http.client
 import json
 import logging
 import math
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +21,12 @@ logger = logging.getLogger('pythagoras.mail')
 RESEND_EMAILS_URL = 'https://api.resend.com/emails'
 USER_AGENT = 'pythagoras-backend/1.0'
 MAX_RESPONSE_BYTES = 64 * 1024
+READ_CHUNK_BYTES = 4096
 _SAFE_NAME = re.compile(r'^[a-z][a-z0-9_]{0,63}$')
+
+
+class _DeadlineExceeded(Exception):
+    pass
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -79,6 +86,7 @@ def classify_http_error(status, name, retry_after):
 
 class ResendTransport(EmailTransport):
     def __init__(self, *, api_key, timeout, url=RESEND_EMAILS_URL):
+        """``timeout`` is the total wall-clock budget in seconds for one send."""
         self._api_key = api_key or ''
         self._timeout = timeout
         self._url = url
@@ -110,23 +118,65 @@ class ResendTransport(EmailTransport):
         )
 
     def send(self, message: OutboundEmail) -> SendResult:
+        """One attempt, bounded by a total wall-clock deadline of ``timeout``
+        seconds covering DNS, connect, send and read. Never raises."""
         if not self._api_key:
             result = SendResult.failed('TRANSPORT_NOT_CONFIGURED')
         else:
-            result = self._send(message)
+            result = self._send_with_deadline(message)
         logger.info('email_send transport=resend key=%s status=%s code=%s provider_id=%s',
                     message.idempotency_key, result.status.value, result.code,
                     result.provider_message_id)
         return result
 
-    def _send(self, message):
+    def _send_with_deadline(self, message):
+        deadline = time.monotonic() + self._timeout
+        outcome = {}
+
+        def attempt():
+            try:
+                outcome['result'] = self._send(message, deadline)
+            except Exception:  # never let a transport problem escape
+                outcome['result'] = SendResult.uncertain('TRANSPORT_ERROR')
+
+        # DNS resolution has no socket timeout; a daemon worker plus join()
+        # bounds the whole attempt. A request still running at the deadline
+        # may have reached the provider, so the outcome is uncertain.
+        worker = threading.Thread(target=attempt, name='resend-send', daemon=True)
+        worker.start()
+        worker.join(max(0.0, deadline - time.monotonic()))
+        if worker.is_alive() or 'result' not in outcome:
+            return SendResult.uncertain('DEADLINE_EXCEEDED')
+        return outcome['result']
+
+    @staticmethod
+    def _read_body(response, deadline):
+        """Read at most MAX_RESPONSE_BYTES, one recv at a time, against the deadline."""
+        read = getattr(response, 'read1', None) or response.read
+        chunks, size = [], 0
+        while size < MAX_RESPONSE_BYTES:
+            if time.monotonic() >= deadline:
+                raise _DeadlineExceeded()
+            chunk = read(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b''.join(chunks)
+
+    def _send(self, message, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return SendResult.uncertain('DEADLINE_EXCEEDED')
         try:
-            with _opener().open(self._request(message), timeout=self._timeout) as response:
+            with _opener().open(self._request(message), timeout=remaining) as response:
                 status = response.status
-                body = response.read(MAX_RESPONSE_BYTES)
+                body = self._read_body(response, deadline)
+        except _DeadlineExceeded:
+            return SendResult.uncertain('DEADLINE_EXCEEDED')
         except urllib.error.HTTPError as error:
             try:
-                body = error.read(MAX_RESPONSE_BYTES)
+                body = self._read_body(error, deadline)
             except Exception:
                 body = b''
             finally:
@@ -141,7 +191,8 @@ class ResendTransport(EmailTransport):
             if isinstance(error.reason, (TimeoutError, socket.timeout)):
                 return SendResult.uncertain('TIMEOUT')
             return SendResult.uncertain('CONNECTION_ERROR')
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
+            # Includes BadStatusLine, LineTooLong, IncompleteRead, resets.
             return SendResult.uncertain('TRANSPORT_ERROR')
 
         if not 200 <= status < 300:
