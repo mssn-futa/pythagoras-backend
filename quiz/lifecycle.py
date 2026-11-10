@@ -310,11 +310,13 @@ def start_attempt(quiz_id, student, *, now=None):
     """Start, or return unchanged, the student's single attempt; ``(attempt, created)``.
 
     An existing attempt is returned first, even after closing/deadline/expiry
-    (its retrieval path never disappears). Otherwise: a student with a legacy
-    submission for the quiz has used their attempt (``SubmissionConflict``);
-    the quiz must be available at arrival (``QuizUnavailable``). Concurrent
-    starts by one student yield one row (unique constraint). Raises
-    ``Quiz.DoesNotExist``/``QuizUnavailable``.
+    (its retrieval path never disappears). Otherwise: a draft quiz raises
+    ``Quiz.DoesNotExist`` before any other check, so drafts are
+    indistinguishable from missing quizzes for every student (also one with a
+    legacy submission); a student with a legacy submission for the quiz has
+    used their attempt (``SubmissionConflict``); the quiz must be available at
+    arrival (``QuizUnavailable``). Concurrent starts by one student yield one
+    row (unique constraint). Raises ``Quiz.DoesNotExist``/``QuizUnavailable``.
     """
     if not is_eligible_student(student):
         raise QuizUnavailable('Only active student accounts can take assessments.')
@@ -324,6 +326,8 @@ def start_attempt(quiz_id, student, *, now=None):
         existing = Attempt.objects.filter(quiz=quiz, student=student).first()
         if existing is not None:
             return existing, False
+        if quiz.status == Quiz.Status.DRAFT:
+            raise Quiz.DoesNotExist()  # hidden like a missing quiz (404)
         if Submission.objects.filter(quiz=quiz, student=student).exists():
             raise SubmissionConflict('You already have a submission for this quiz.')
         if not quiz_is_available(quiz, now):

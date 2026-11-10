@@ -18,7 +18,7 @@ Code: `quiz/views.py` (`QuizAttemptStartView`, `AttemptDetailView`,
 
 | Route | Method | Who | Behaviour |
 | --- | --- | --- | --- |
-| `/quiz/quizzes/{id}/attempts/` | POST | active student | Start (201) or return the existing attempt unchanged (200), also after closing/deadline/expiry. New attempt needs an available quiz: closed/past deadline 409 `QUIZ_UNAVAILABLE`, draft/missing 404, legacy submission 409 `SUBMISSION_CONFLICT`. No body (`{}` accepted). 20/min per student. |
+| `/quiz/quizzes/{id}/attempts/` | POST | active student | Start (201) or return the existing attempt unchanged (200), also after closing/deadline/expiry. New attempt: a draft/missing quiz is 404, checked before anything else so a draft looks missing to every student; then a legacy submission is 409 `SUBMISSION_CONFLICT`; then a closed/past-deadline quiz is 409 `QUIZ_UNAVAILABLE`. No body (`{}` accepted). 20/min per student. |
 | `/quiz/attempts/{id}/` | GET | active student | Own attempt only (other/missing 404) with key-free questions and `server_time`. |
 | `/quiz/submissions/` | POST | active student | Finalize own attempt: `{"attempt_id", "answers"}`. 201 graded; identical replay 200; changed 409 `SUBMISSION_CONFLICT`; first arrival at/after expiry 409 `ATTEMPT_EXPIRED`; 400 validation; 404 foreign/missing attempt. 60/min per student. |
 | `/quiz/submissions/` | GET | active user | Own results, newest first (`-submitted_at`, `-id`), D0-paginated, filters `attempt`, `quiz` (positive integers, else 400). Admins have none of their own. |

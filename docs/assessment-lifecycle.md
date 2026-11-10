@@ -139,7 +139,7 @@ TRUNCATE does not fire row triggers (test flushes, operator restores).
 | `delete_draft_quiz(quiz_id)` | `QuizReferenced` (history) before `QuizImmutable` (not draft) |
 | `is_eligible_student(user)` | active `role=student` (no enrollment gate) |
 | `share_lock_quiz(id)` / `lock_attempt(**lookup)` / `create_attempt(quiz, student, now)` | locking building blocks |
-| `start_attempt(quiz_id, student)` | returns existing attempt unchanged first; legacy submission is `SubmissionConflict`; else requires availability at arrival (`QuizUnavailable`); `(attempt, created)` |
+| `start_attempt(quiz_id, student)` | returns existing attempt unchanged first; a draft is `Quiz.DoesNotExist` (404) next; legacy submission is `SubmissionConflict`; else requires availability at arrival (`QuizUnavailable`); `(attempt, created)` |
 | `finalize_attempt(attempt_id, student, answers)` | ownership (`Attempt.DoesNotExist`), replay/`SubmissionConflict`, expiry at arrival (`AttemptExpired`; not persisted), `InvalidAnswers`, then atomic grade + snapshot + attempt `submitted`; `(submission, created)` |
 | `mark_expired(attempt_id)` | persist expiry without a grade (operator use only; see the resolved edge) |
 | `replay_or_conflict(submission, answers)` | strict JSON comparison |

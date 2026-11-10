@@ -389,7 +389,9 @@ class AttemptTests(QuizAPITestMixin, TestCase):
         closed, _ = make_quiz('Closed')
         lifecycle.close_quiz(closed.pk)
         past = past_quiz('Past')
-        for quiz in (draft, closed, past):
+        with self.assertRaises(Quiz.DoesNotExist):  # a draft is hidden like a missing quiz
+            lifecycle.start_attempt(draft.pk, self.student)
+        for quiz in (closed, past):
             with self.subTest(quiz=quiz.title), self.assertRaises(QuizUnavailable):
                 lifecycle.start_attempt(quiz.pk, self.student)
         for user in (self.admin, self.inactive_student):

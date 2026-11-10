@@ -133,6 +133,18 @@ class AttemptStartTests(QuizAPITestMixin, TestCase):
                                  'SUBMISSION_CONFLICT')
         self.assertFalse(Attempt.objects.exists())
 
+    def test_draft_is_missing_even_with_a_legacy_submission(self):
+        """The draft check precedes the legacy-submission check (no 409 leaks a draft)."""
+        draft, _ = make_quiz('Legacy draft', active=False)
+        insert_legacy_submission(draft.pk, self.student.pk)
+        missing = self.start_api(self.student, 999999)
+        for user in (self.student, self.other_student):
+            with self.subTest(user=user.email):
+                response = self.start_api(user, draft.pk)
+                self.assertEnvelopeError(response, 404, 'NOT_FOUND')
+                self.assertEqual(response.json(), missing.json())
+        self.assertFalse(Attempt.objects.exists())
+
     def test_start_takes_no_body_and_only_students_start(self):
         payload = self.assertEnvelopeError(
             self.call(self.student, 'post', f'/quiz/quizzes/{self.quiz.pk}/attempts/',

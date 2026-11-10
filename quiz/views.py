@@ -600,19 +600,15 @@ class QuizAttemptStartView(APIView):
             'deadline/expiry passed, so a retry never creates or re-times an attempt. Only a '
             'new attempt needs an available quiz (published, deadline in the future): a '
             'closed or past-deadline quiz is 409 QUIZ_UNAVAILABLE, a draft or missing quiz '
-            '404; a legacy submission for the quiz is 409 SUBMISSION_CONFLICT. No request '
+            '404 (checked first, so drafts look missing to every student); a legacy '
+            'submission for the quiz is 409 SUBMISSION_CONFLICT. No request '
             'body. Throttled at 20/min per student (429).'),
     )
     def post(self, request, quiz_id):
         reject_body(request)
         with domain_errors():
-            try:
-                attempt, created = lifecycle.start_attempt(quiz_id, request.user)
-            except AssessmentError as exc:
-                if exc.code == 'QUIZ_UNAVAILABLE' and not Quiz.objects.filter(
-                        pk=quiz_id).exclude(status=Quiz.Status.DRAFT).exists():
-                    raise Http404()  # drafts stay indistinguishable from missing quizzes
-                raise
+            # A draft raises Quiz.DoesNotExist (404) before any other check.
+            attempt, created = lifecycle.start_attempt(quiz_id, request.user)
         if created:
             return attempt_response(attempt, 'Attempt started.', status.HTTP_201_CREATED)
         return attempt_response(attempt, 'Attempt retrieved.')
