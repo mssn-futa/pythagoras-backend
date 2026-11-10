@@ -38,19 +38,19 @@ class TestQuizService(TestCase):
         )
         # Question 1
         q1 = Question.objects.create(
-            pk=1, quiz=quiz, text="Django is a python web framework", type="TEXT"
+            pk=1, quiz=quiz, text="Django is a python web framework", type=Question.Type.text
         )
         Option.objects.create(question=q1, text="True", is_correct=True)
         Option.objects.create(question=q1, text="False", is_correct=False)
         # Question 2
         q2 = Question.objects.create(
-            pk=2, quiz=quiz, text="NodeJS is a javascript ___", type="TEXT"
+            pk=2, quiz=quiz, text="NodeJS is a javascript ___", type=Question.Type.text
         )
         Option.objects.create(question=q2, text="web framework", is_correct=False)
         Option.objects.create(question=q2, text="runtime environment", is_correct=True)
         # Question 3
         q3 = Question.objects.create(
-            pk=3, quiz=quiz, text="Choose all correct options: ", type="MULTIPLE_ANSWER"
+            pk=3, quiz=quiz, text="Choose all correct options: ", type=Question.Type.multi
         )
         Option.objects.create(
             question=q3, text="The python interpreter is written in C", is_correct=True
@@ -87,7 +87,7 @@ class TestQuizService(TestCase):
                 "1": "true",
                 "2": "runtime environment",
                 "3": [
-                    "Pythagoras' grading engine would not be reliable without some tests"
+                    "Pythagoras' grading engine would not be reliable without some tests",
                     "The python interpreter is written in C",
                     "GitHub is a version control system",
                 ],
