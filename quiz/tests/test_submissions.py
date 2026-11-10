@@ -191,7 +191,8 @@ class AnswerValidationServiceTests(TestCase):
     """Reusable service boundary for ASSESS-04."""
 
     def setUp(self):
-        self.quiz, self.questions = make_quiz('Service', points=(2, 3))
+        # A draft, so a test can shape legacy-like content (published content is frozen).
+        self.quiz, self.questions = make_quiz('Service', points=(2, 3), active=False)
 
     def test_validate_and_grade(self):
         (q1, c1, w1), (q2, c2, _) = self.questions

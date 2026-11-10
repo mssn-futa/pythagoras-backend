@@ -15,7 +15,7 @@ result.
 """
 from contextlib import contextmanager
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import PolymorphicProxySerializer, extend_schema
@@ -36,7 +36,7 @@ from quiz.serializers import (
     StudentSubmissionSerializer, SubmissionCreateSerializer,
 )
 from quiz import lifecycle
-from quiz.errors import AssessmentError, PublicationInvalid
+from quiz.errors import AssessmentError, PublicationInvalid, QuizImmutable, is_immutable_db_error
 from quiz.services import InvalidAnswers, QuizService
 
 
@@ -54,6 +54,11 @@ def domain_errors():
     except ProtectedError:
         raise APIError('RESOURCE_REFERENCED',
                        'This record is referenced by assessment history and cannot be deleted.')
+    except IntegrityError as exc:
+        # A quiz.0007 trigger refusal (a path the Python guards did not cover).
+        if is_immutable_db_error(exc):
+            raise APIError(QuizImmutable.code, QuizImmutable.default_message)
+        raise
 
 
 def role_specific(name, admin, student):

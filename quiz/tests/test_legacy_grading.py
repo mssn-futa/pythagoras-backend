@@ -15,8 +15,8 @@ class TestQuizService(TestCase):
     """
 
     def setUp(self):
-        # One legacy submission per student and quiz (ASSESS-02 constraint), so
-        # each graded record belongs to its own student.
+        # Legacy-shaped records are graded unsaved: new legacy rows cannot be
+        # stored (quiz.0007), and each belongs to its own student.
         student, student2, student3 = (
             CustomUser.objects.create_user(email=email, password=None)
             for email in ("django@email.com", "django2@email.com", "django3@email.com")
@@ -73,7 +73,7 @@ class TestQuizService(TestCase):
             is_correct=True,
         )
         # Submission 1
-        self.submission1 = Submission.objects.create(
+        self.submission1 = Submission(
             quiz=quiz,
             student=student,
             answers={
@@ -85,10 +85,9 @@ class TestQuizService(TestCase):
                 ],
             },
             score=0,
-            is_legacy=True,
         )
         # Submission 2
-        self.submission2 = Submission.objects.create(
+        self.submission2 = Submission(
             quiz=quiz,
             student=student2,
             answers={
@@ -101,10 +100,9 @@ class TestQuizService(TestCase):
                 ],
             },
             score=0,
-            is_legacy=True,
         )
         # Submission 3
-        self.submission3 = Submission.objects.create(
+        self.submission3 = Submission(
             quiz=quiz,
             student=student3,
             answers={
@@ -116,7 +114,6 @@ class TestQuizService(TestCase):
                 ],
             },
             score=0,
-            is_legacy=True,
         )
 
     def test_all_answers_correct(self):

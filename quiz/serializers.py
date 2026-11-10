@@ -368,36 +368,43 @@ class StudentSubmissionSerializer(serializers.ModelSerializer):
         return obj.graded_at is not None
 
 
-class StudentAttemptQuestionSerializer(StudentQuestionSerializer):
-    class Meta(StudentQuestionSerializer.Meta):
-        fields = ['id', 'text', 'points', 'order', 'options']
-        read_only_fields = fields
-
-
 class StudentAttemptSerializer(serializers.ModelSerializer):
-    """Frozen D3 student attempt shape for ASSESS-04/06 (not routed in ASSESS-02).
+    """Frozen student attempt contract for ASSESS-04/06 (not routed in ASSESS-02).
 
-    ``status`` is the effective status at ``context['now']`` (an in-progress
-    attempt past expiry reads ``expired``). The view adds ``server_time``.
-    Questions are MCQ-only, in persisted order, without keys.
+    ``status`` is the effective status at ``server_time`` (an in-progress
+    attempt past expiry reads ``expired``); ``server_time`` is
+    ``context['now']`` or the database clock; ``submission_id`` is null until
+    the attempt is finalized. Questions are delivered by the ASSESS-04 view.
+    No answer keys.
     """
     quiz_id = serializers.IntegerField(read_only=True)
+    quiz_title = serializers.CharField(source='quiz.title', read_only=True)
     status = serializers.SerializerMethodField()
-    questions = serializers.SerializerMethodField()
+    server_time = serializers.SerializerMethodField()
+    submission_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Attempt
-        fields = ['id', 'quiz_id', 'status', 'started_at', 'expires_at', 'questions']
+        fields = ['id', 'quiz_id', 'quiz_title', 'status', 'started_at', 'expires_at',
+                  'server_time', 'submission_id']
         read_only_fields = fields
 
-    def get_status(self, obj) -> str:
-        from .lifecycle import effective_attempt_status, server_now
-        return effective_attempt_status(obj, self.context.get('now') or server_now())
+    def _now(self):
+        if 'now' not in self.context:
+            from .lifecycle import server_now
+            self.context['now'] = server_now()
+        return self.context['now']
 
-    @extend_schema_field(StudentAttemptQuestionSerializer(many=True))
-    def get_questions(self, obj):
-        questions = _ordered(obj.quiz.question_set.filter(type=Question.Type.mcq))
-        return StudentAttemptQuestionSerializer(questions, many=True).data
+    def get_status(self, obj) -> str:
+        from .lifecycle import effective_attempt_status
+        return effective_attempt_status(obj, self._now())
+
+    @extend_schema_field(serializers.DateTimeField())
+    def get_server_time(self, obj):
+        return serializers.DateTimeField().to_representation(self._now())
+
+    def get_submission_id(self, obj) -> int | None:
+        return Submission.objects.filter(attempt=obj).values_list('pk', flat=True).first()
 
 
 @extend_schema_field({

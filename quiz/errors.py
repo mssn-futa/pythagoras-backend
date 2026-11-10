@@ -90,3 +90,22 @@ class InvalidAnswers(ValueError):
 
     def as_fields(self):
         return self.errors if self.field is None else {self.field: self.errors}
+
+
+# SQLSTATEs raised by the quiz.0007 triggers (class 23, so Django raises
+# IntegrityError). IMMUTABLE: frozen content/state/history; MISMATCH: a
+# submission whose quiz/student differ from its attempt's.
+IMMUTABLE_SQLSTATE = '23Q01'
+MISMATCH_SQLSTATE = '23Q02'
+
+
+def db_error_sqlstate(exc):
+    """SQLSTATE of a wrapped database error (psycopg2 ``pgcode`` or psycopg 3
+    ``sqlstate``; ``None`` if unavailable)."""
+    cause = getattr(exc, '__cause__', None)
+    return getattr(cause, 'pgcode', None) or getattr(cause, 'sqlstate', None)
+
+
+def is_immutable_db_error(exc):
+    """True for a trigger refusal that should surface as ``QuizImmutable`` (409)."""
+    return db_error_sqlstate(exc) == IMMUTABLE_SQLSTATE

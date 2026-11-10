@@ -7,6 +7,7 @@ from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
 from dawah.models import Event
+from pythagoras.utils import APIError
 from quiz import lifecycle
 from quiz.errors import (
     AttemptExpired, InvalidAnswers, InvalidTransition, PublicationInvalid, QuizImmutable,
@@ -15,7 +16,9 @@ from quiz.errors import (
 from quiz.models import MAX_STORED_POINTS, Attempt, Course, Option, Question, Quiz, Submission
 from quiz.serializers import StudentAttemptSerializer
 
-from .helpers import QuizAPITestMixin, make_quiz, walk_keys, KEY_FIELDS
+from quiz.views import domain_errors
+
+from .helpers import KEY_FIELDS, QuizAPITestMixin, make_quiz, raw_update, walk_keys
 
 T0 = datetime(2026, 10, 12, 10, 0, tzinfo=dt_timezone.utc)
 
@@ -59,6 +62,13 @@ class ExpiryComputationTests(SimpleTestCase):
                                 (30, None), (30, T0), (30, T0 - timedelta(minutes=1))):
             with self.subTest(limit=limit, deadline=deadline), self.assertRaises(ValueError):
                 lifecycle.compute_expires_at(T0, limit, deadline)
+
+
+def past_quiz(title):
+    """A quiz published (judged an hour earlier) whose deadline has passed."""
+    deadline = timezone.now() - timedelta(hours=1)
+    quiz, _ = make_quiz(title, deadline=deadline, published_now=deadline - timedelta(hours=1))
+    return quiz
 
 
 def draft_quiz(title='Draft', **kwargs):
@@ -164,15 +174,14 @@ class PublicationTests(TestCase):
                        {'status': 'closed'}, {'status': 'bogus', 'is_active': False}):
             with self.subTest(fields=fields), self.assertRaises(IntegrityError), \
                     transaction.atomic():
-                Quiz.objects.filter(pk=quiz.pk).update(**fields)
+                raw_update('quiz_quiz', quiz.pk, **fields)
 
     def test_available_quizzes(self):
         live, _ = make_quiz('Live')
         draft, _ = draft_quiz()
         closed, _ = make_quiz('Closed')
         lifecycle.close_quiz(closed.pk)
-        expired, _ = make_quiz('Past deadline')
-        Quiz.objects.filter(pk=expired.pk).update(deadline=timezone.now() - timedelta(seconds=1))
+        past_quiz('Past deadline')
         self.assertEqual(list(lifecycle.available_quizzes().values_list('pk', flat=True)), [live.pk])
 
 
@@ -371,16 +380,15 @@ class AttemptTests(QuizAPITestMixin, TestCase):
 
     def test_deadline_before_duration_caps_expiry(self):
         deadline = lifecycle.server_now() + timedelta(minutes=5)
-        Quiz.objects.filter(pk=self.quiz.pk).update(deadline=deadline)
-        attempt, _ = self.start()
+        quiz, _ = make_quiz('Short deadline', deadline=deadline)
+        attempt, _ = lifecycle.start_attempt(quiz.pk, self.student)
         self.assertEqual(attempt.expires_at, deadline)
 
     def test_start_requires_available_quiz_and_eligible_student(self):
         draft, _ = draft_quiz()
         closed, _ = make_quiz('Closed')
         lifecycle.close_quiz(closed.pk)
-        past, _ = make_quiz('Past')
-        Quiz.objects.filter(pk=past.pk).update(deadline=timezone.now() - timedelta(seconds=1))
+        past = past_quiz('Past')
         for quiz in (draft, closed, past):
             with self.subTest(quiz=quiz.title), self.assertRaises(QuizUnavailable):
                 lifecycle.start_attempt(quiz.pk, self.student)
@@ -391,11 +399,6 @@ class AttemptTests(QuizAPITestMixin, TestCase):
         with self.assertRaises(Quiz.DoesNotExist):
             lifecycle.start_attempt(999999, self.student)
         self.assertFalse(Attempt.objects.exists())
-
-    def test_legacy_submission_uses_the_attempt(self):
-        self.submission(self.quiz, self.student)
-        with self.assertRaises(SubmissionConflict):
-            self.start()
 
     def test_database_rejects_second_attempt(self):
         attempt, _ = self.start()
@@ -480,17 +483,24 @@ class AttemptTests(QuizAPITestMixin, TestCase):
         self.assertEqual(lifecycle.mark_expired(attempt.pk).status, 'in_progress')
         self.assertEqual(lifecycle.mark_expired(attempt.pk, now=attempt.expires_at).status, 'expired')
 
-    def test_student_attempt_shape_has_no_keys(self):
+    def test_student_attempt_contract(self):
         attempt, _ = self.start()
         data = StudentAttemptSerializer(attempt, context={'now': attempt.started_at}).data
-        self.assertEqual(set(data), {'id', 'quiz_id', 'status', 'started_at', 'expires_at',
-                                     'questions'})
-        self.assertEqual(data['status'], 'in_progress')
-        self.assertEqual(set(data['questions'][0]), {'id', 'text', 'points', 'order', 'options'})
-        self.assertEqual(set(data['questions'][0]['options'][0]), {'id', 'text', 'order'})
+        self.assertEqual(set(data), {'id', 'quiz_id', 'quiz_title', 'status', 'started_at',
+                                     'expires_at', 'server_time', 'submission_id'})
+        self.assertEqual((data['id'], data['quiz_id'], data['quiz_title'], data['status'],
+                          data['submission_id']),
+                         (attempt.pk, self.quiz.pk, 'Timed', 'in_progress', None))
+        self.assertEqual(data['server_time'], data['started_at'])
+        self.assertTrue(data['server_time'].endswith('Z'))
         self.assertFalse(KEY_FIELDS.intersection(walk_keys(data)))
         late = StudentAttemptSerializer(attempt, context={'now': attempt.expires_at}).data
         self.assertEqual(late['status'], 'expired')
+        submission, _ = lifecycle.finalize_attempt(attempt.pk, self.student, self.answers)
+        attempt.refresh_from_db()
+        done = StudentAttemptSerializer(attempt).data  # server_time from the DB clock
+        self.assertEqual((done['status'], done['submission_id']), ('submitted', submission.pk))
+        self.assertIsNotNone(done['server_time'])
 
     def test_direct_submit_creates_and_finalizes_the_attempt(self):
         response = self.call(self.student, 'post', '/quiz/submissions/',
@@ -559,13 +569,24 @@ class HistoryInvariantTests(QuizAPITestMixin, TestCase):
             'release row without snapshot': {**base, 'attempt': attempt, 'total_points': 0},
             'score above total': {**base, 'attempt': attempt, 'total_points': 1, 'score': 2,
                                   'grading_snapshot': {}},
-            'legacy row with attempt': {**base, 'attempt': attempt, 'is_legacy': True},
-            'second submission for student/quiz': {**base, 'student': self.student,
-                                                   'is_legacy': True},
         }
         for name, fields in cases.items():
             with self.subTest(name), self.assertRaises(IntegrityError), transaction.atomic():
                 Submission.objects.create(**fields)
+        # Constraints that only legacy-shaped rows can reach: proven with the
+        # quiz.0007 guard disabled inside this (rolled back) transaction.
+        legacy_sql = ('INSERT INTO quiz_submission (quiz_id, student_id, attempt_id, answers, '
+                      'score, is_legacy, submitted_at) VALUES (%s, %s, %s, %s, 0, true, now())')
+        for name, params in {
+            'legacy row with attempt': [self.quiz.pk, other.pk, attempt.pk, '{}'],
+            'second submission for student/quiz': [self.quiz.pk, self.student.pk, None, '{}'],
+        }.items():
+            with self.subTest(name), self.assertRaises(IntegrityError), transaction.atomic():
+                immediate_constraints()  # ALTER TABLE needs no pending FK checks
+                with connection.cursor() as cursor:
+                    cursor.execute('ALTER TABLE quiz_submission '
+                                   'DISABLE TRIGGER quiz_submission_history_guard')
+                    cursor.execute(legacy_sql, params)
         # A second submission for the same attempt violates the one-to-one key.
         with self.assertRaises(IntegrityError), transaction.atomic():
             Submission.objects.create(quiz=self.quiz, student=self.student, attempt=self.attempt,
@@ -573,16 +594,17 @@ class HistoryInvariantTests(QuizAPITestMixin, TestCase):
                                       graded_at=timezone.now())
         # Finalization at/after expiry is rejected by the database as well.
         with self.assertRaises(IntegrityError), transaction.atomic():
-            Attempt.objects.filter(pk=attempt.pk).update(
-                status='submitted', finalized_at=attempt.expires_at)
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            Attempt.objects.filter(pk=attempt.pk).update(expires_at=attempt.started_at)
+            raw_update('quiz_attempt', attempt.pk, status='submitted',
+                       finalized_at=attempt.expires_at)
 
     def test_score_storage_is_wide(self):
-        row = Submission.objects.create(quiz=self.quiz, student=self.other_student, answers={},
-                                        score=MAX_STORED_POINTS, is_legacy=True)
+        attempt, _ = lifecycle.start_attempt(self.quiz.pk, self.other_student)
+        row = Submission.objects.create(
+            quiz=self.quiz, student=self.other_student, attempt=attempt, answers={},
+            score=MAX_STORED_POINTS, total_points=MAX_STORED_POINTS, grading_snapshot={},
+            graded_at=timezone.now())
         row.refresh_from_db()
-        self.assertEqual(row.score, 2147483647)
+        self.assertEqual((row.score, row.total_points), (2147483647, 2147483647))
 
 
 class ProtectedDeletionTests(QuizAPITestMixin, TestCase):
@@ -632,3 +654,189 @@ class ProtectedDeletionTests(QuizAPITestMixin, TestCase):
         for label in 'ABCD':
             Option.objects.create(question=question, text=label, is_correct=label == 'A')
         return self.quiz.pk
+
+
+def sqlstate(exc):
+    from quiz.errors import db_error_sqlstate
+    return db_error_sqlstate(exc)
+
+
+class TransitionTokenTests(TestCase):
+    """M2: Quiz.save() cannot publish/close; only publish_quiz/close_quiz can."""
+
+    def test_save_cannot_publish_even_a_valid_quiz(self):
+        quiz, _ = draft_quiz()
+        self.assertEqual(lifecycle.publication_errors(quiz, timezone.now()), {})
+        quiz.status = Quiz.Status.PUBLISHED
+        quiz.published_at = timezone.now()
+        with self.assertRaises(InvalidTransition) as caught:
+            quiz.save()
+        self.assertIn('status', caught.exception.fields)
+        self.assertEqual(Quiz.objects.get(pk=quiz.pk).status, 'draft')
+        # A token for another transition does not help, and tokens are single-use.
+        quiz._lifecycle_transition = (Quiz.Status.PUBLISHED, Quiz.Status.CLOSED)
+        with self.assertRaises(InvalidTransition):
+            quiz.save()
+
+    def test_save_cannot_close_or_move_lifecycle_timestamps(self):
+        quiz, _ = make_quiz('Published')
+        for field, value in (('status', Quiz.Status.CLOSED),
+                             ('published_at', quiz.published_at - timedelta(days=1)),
+                             ('closed_at', timezone.now())):
+            fresh = Quiz.objects.get(pk=quiz.pk)
+            setattr(fresh, field, value)
+            if field == 'status':
+                fresh.closed_at = timezone.now()
+            with self.subTest(field=field), self.assertRaises(InvalidTransition):
+                fresh.save()
+        self.assertEqual(Quiz.objects.get(pk=quiz.pk).status, 'published')
+
+    def test_create_with_lifecycle_timestamps_refused(self):
+        for fields in ({'published_at': timezone.now()}, {'closed_at': timezone.now()}):
+            with self.subTest(fields=fields), self.assertRaises(InvalidTransition):
+                Quiz.objects.create(title='x', description='y', **fields)
+
+    def test_bulk_update_cannot_change_lifecycle_or_frozen_fields(self):
+        quiz, _ = make_quiz('Bulk')
+        with self.assertRaises(InvalidTransition):
+            Quiz.objects.filter(pk=quiz.pk).update(status='closed', closed_at=timezone.now())
+        with self.assertRaises(QuizImmutable):
+            Quiz.objects.filter(pk=quiz.pk).update(time_limit=99)
+        Quiz.objects.filter(pk=quiz.pk).update(title='Bulk rename')  # metadata stays editable
+
+
+class BypassGuardTests(QuizAPITestMixin, TestCase):
+    """M3: every bulk/raw path the reviewer listed is refused in Python and in the DB."""
+
+    def setUp(self):
+        super().setUp()
+        self.quiz, self.questions = make_quiz('Locked')
+        self.question, self.correct, self.wrong = self.questions[0]
+        self.attempt, _ = lifecycle.start_attempt(self.quiz.pk, self.student)
+
+    def test_python_bulk_paths(self):
+        question, option = self.question, self.wrong[0]
+        operations = {
+            'question update': lambda: Question.objects.filter(pk=question.pk).update(points=9),
+            'question delete': lambda: Question.objects.filter(pk=question.pk).delete(),
+            'question bulk_create': lambda: Question.objects.bulk_create(
+                [Question(quiz=self.quiz, type='mcq', text='n', order=99)]),
+            'question bulk_update': lambda: Question.objects.bulk_update(
+                [Question(pk=question.pk, quiz=self.quiz, type='mcq', text='n', order=1)],
+                ['text']),
+            'option update': lambda: Option.objects.filter(pk=option.pk).update(is_correct=True),
+            'option delete': lambda: Option.objects.filter(question=question).delete(),
+            'option bulk_create': lambda: Option.objects.bulk_create(
+                [Option(question=question, text='E', order=5)]),
+            'option bulk_update': lambda: Option.objects.bulk_update(
+                [Option(pk=option.pk, question=question, text='Z', order=option.order)],
+                ['text']),
+            'related manager delete': lambda: question.option_set.all().delete(),
+        }
+        for name, operation in operations.items():
+            with self.subTest(name), self.assertRaises(QuizImmutable), transaction.atomic():
+                operation()
+        with self.assertRaises(QuizImmutable):
+            Attempt.objects.filter(pk=self.attempt.pk).update(
+                expires_at=self.attempt.expires_at + timedelta(hours=1))
+        self.assertEqual(Question.objects.get(pk=question.pk).points, 2)
+        self.assertEqual(Option.objects.filter(question=question).count(), 4)
+
+    def test_draft_content_moved_into_a_locked_quiz_is_refused(self):
+        draft, questions = draft_quiz()
+        with self.assertRaises(QuizImmutable):
+            Question.objects.filter(pk=questions[0][0].pk).update(quiz=self.quiz)
+        with self.assertRaises(QuizImmutable):
+            Option.objects.filter(pk=questions[0][1].pk).update(question=self.question)
+
+    def test_database_triggers(self):
+        submission, _ = lifecycle.finalize_attempt(self.attempt.pk, self.student, {})
+        statements = {
+            'question update': ('UPDATE quiz_question SET points = 9 WHERE id = %s',
+                                [self.question.pk]),
+            'question insert': ("INSERT INTO quiz_question (quiz_id, type, text, points, \"order\") "
+                                "VALUES (%s, 'mcq', 'n', 1, 99)", [self.quiz.pk]),
+            'question delete': ('DELETE FROM quiz_question WHERE id = %s', [self.question.pk]),
+            'option update': ('UPDATE quiz_option SET is_correct = true WHERE id = %s',
+                              [self.wrong[0].pk]),
+            'option insert': ("INSERT INTO quiz_option (question_id, text, is_correct, \"order\") "
+                              "VALUES (%s, 'E', false, 9)", [self.question.pk]),
+            'option delete': ('DELETE FROM quiz_option WHERE id = %s', [self.correct.pk]),
+            'quiz time_limit': ('UPDATE quiz_quiz SET time_limit = 99 WHERE id = %s',
+                                [self.quiz.pk]),
+            'quiz deadline': ("UPDATE quiz_quiz SET deadline = deadline + interval '1 day' "
+                              "WHERE id = %s", [self.quiz.pk]),
+            'quiz published_at': ("UPDATE quiz_quiz SET published_at = "
+                                  "published_at - interval '1 day' WHERE id = %s", [self.quiz.pk]),
+            'quiz back to draft': ("UPDATE quiz_quiz SET status = 'draft', is_active = false "
+                                   "WHERE id = %s", [self.quiz.pk]),
+            'quiz delete': ('DELETE FROM quiz_quiz WHERE id = %s', [self.quiz.pk]),
+            'attempt expiry': ("UPDATE quiz_attempt SET expires_at = expires_at + "
+                               "interval '1 hour' WHERE id = %s", [self.attempt.pk]),
+            'attempt reopen': ("UPDATE quiz_attempt SET status = 'in_progress', "
+                               "finalized_at = NULL WHERE id = %s", [self.attempt.pk]),
+            'attempt delete': ('DELETE FROM quiz_attempt WHERE id = %s', [self.attempt.pk]),
+            'submission score': ('UPDATE quiz_submission SET score = 99 WHERE id = %s',
+                                 [submission.pk]),
+            'submission delete': ('DELETE FROM quiz_submission WHERE id = %s', [submission.pk]),
+            'legacy insert': ("INSERT INTO quiz_submission (quiz_id, student_id, answers, score, "
+                              "is_legacy, submitted_at) VALUES (%s, %s, '{}', 0, true, now())",
+                              [self.quiz.pk, self.other_student.pk]),
+        }
+        for name, (sql, params) in statements.items():
+            with self.subTest(name), self.assertRaises(IntegrityError) as caught, \
+                    transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, params)
+            self.assertEqual(sqlstate(caught.exception), '23Q01', name)
+        # Metadata corrections and closing remain possible in SQL too.
+        raw_update('quiz_quiz', self.quiz.pk, title='SQL rename')
+        lifecycle.close_quiz(self.quiz.pk)
+
+    def test_trigger_refusal_maps_to_quiz_immutable(self):
+        with self.assertRaises(APIError) as caught, transaction.atomic(), domain_errors():
+            raw_update('quiz_question', self.question.pk, points=9)
+        self.assertEqual(caught.exception.code, 'QUIZ_IMMUTABLE')
+        self.assertEqual(caught.exception.status_code, 409)
+
+    def test_submission_must_match_its_attempt(self):
+        """L2: enforced by the model and by the database."""
+        other, _ = lifecycle.start_attempt(self.quiz.pk, self.other_student)
+        with self.assertRaises(ValueError):
+            Submission.objects.create(quiz=self.quiz, student=self.student, attempt=other,
+                                      answers={}, score=0, total_points=0, grading_snapshot={},
+                                      graded_at=timezone.now())
+        with self.assertRaises(IntegrityError) as caught, transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO quiz_submission (quiz_id, student_id, attempt_id, answers, score, "
+                    "total_points, grading_snapshot, is_legacy, submitted_at, graded_at) VALUES "
+                    "(%s, %s, %s, '{}', 0, 0, '{}', false, now(), now())",
+                    [self.quiz.pk, self.student.pk, other.pk])
+        self.assertEqual(sqlstate(caught.exception), '23Q02')
+
+    def test_no_new_legacy_rows(self):
+        """L3: legacy rows only come from the migration."""
+        with self.assertRaises(SubmissionImmutable):
+            Submission.objects.create(quiz=self.quiz, student=self.other_student, answers={},
+                                      score=0, is_legacy=True)
+
+    def test_finalize_locks_only_the_attempt_row(self):
+        """L1 (and M1): FOR SHARE on the quiz, FOR UPDATE OF the attempt only."""
+        from django.test.utils import CaptureQueriesContext
+        with CaptureQueriesContext(connection) as queries:
+            lifecycle.finalize_attempt(self.attempt.pk, self.student, {})
+        sql = [q['sql'] for q in queries.captured_queries]
+        self.assertTrue(any('transaction_timestamp()' in s for s in sql[:2]), sql[:2])
+        self.assertTrue(any(s.endswith('FOR SHARE') and 'quiz_quiz' in s for s in sql), sql)
+        attempt_locks = [s for s in sql if 'FOR UPDATE' in s]
+        self.assertEqual(len(attempt_locks), 1, attempt_locks)
+        self.assertIn('FOR UPDATE OF "quiz_attempt"', attempt_locks[0])
+
+    def test_content_guard_takes_its_own_lock(self):
+        """L4: the question/option guard locks the quiz row itself."""
+        from django.test.utils import CaptureQueriesContext
+        draft, questions = draft_quiz()
+        with CaptureQueriesContext(connection) as queries:
+            Question.objects.create(quiz=draft, type='mcq', text='Locked write')
+        self.assertTrue(any('FOR NO KEY UPDATE' in q['sql'] for q in queries.captured_queries))
