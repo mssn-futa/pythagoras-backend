@@ -2,6 +2,7 @@
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.db import connection
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -29,17 +30,30 @@ def walk_keys(value):
             yield from walk_keys(item)
 
 
-def make_quiz(title, *, active=True, points=(2, 3), legacy_text_question=False):
+def raw_update(table, pk, **columns):
+    """UPDATE one row with raw SQL, bypassing every Python guard (DB-layer tests
+    and states that no supported write path can produce)."""
+    assignments = ', '.join(f'"{name}" = %s' for name in columns)
+    with connection.cursor() as cursor:
+        cursor.execute(f'UPDATE {table} SET {assignments} WHERE id = %s', [*columns.values(), pk])
+
+
+def make_quiz(title, *, active=True, points=(2, 3), legacy_text_question=False, deadline=None,
+              published_now=None):
     """Quiz with one MCQ question per ``points`` entry, each with four options
     of which the second is correct. Returns ``(quiz, [(question, correct, wrong_options)])``.
 
     ``active`` publishes it through ``quiz.lifecycle.publish_quiz`` (deadline a
     week ahead); otherwise it stays a draft. A published quiz cannot hold a
     legacy text question through any write path, so ``legacy_text_question``
-    with ``active`` simulates that pre-ASSESS-02 state with a bulk update.
+    with ``active`` simulates that pre-ASSESS-02 state with raw SQL.
+    ``deadline``/``published_now`` let tests publish with a deadline that has
+    already passed (publication judged at an earlier instant), since a
+    published deadline can never be edited.
     """
     quiz = Quiz.objects.create(title=title, type='arabic', description='Weekly assessment',
-                               time_limit=30, deadline=timezone.now() + timedelta(days=7))
+                               time_limit=30,
+                               deadline=deadline or timezone.now() + timedelta(days=7))
     questions = []
     for index, value in enumerate(points, start=1):
         question = Question.objects.create(quiz=quiz, type=Question.Type.mcq,
@@ -52,10 +66,10 @@ def make_quiz(title, *, active=True, points=(2, 3), legacy_text_question=False):
                                          text=f'{title} legacy text question', points=1)
         Option.objects.create(question=legacy, text='legacy answer', is_correct=True)
     if active and legacy_text_question:
-        Quiz.objects.filter(pk=quiz.pk).update(
-            status=Quiz.Status.PUBLISHED, is_active=True, published_at=timezone.now())
+        raw_update('quiz_quiz', quiz.pk, status=Quiz.Status.PUBLISHED, is_active=True,
+                   published_at=timezone.now())
     elif active:
-        lifecycle.publish_quiz(quiz.pk)
+        lifecycle.publish_quiz(quiz.pk, now=published_now)
     quiz.refresh_from_db()
     return quiz, questions
 
@@ -103,10 +117,11 @@ class QuizAPITestMixin:
             return getattr(client, method)(path)
         return getattr(client, method)(path, body, format='json')
 
-    def submission(self, quiz, student, answers=None, score=0):
-        """A stored legacy-shape result (no attempt), as pre-ASSESS-02 rows are."""
-        return Submission.objects.create(quiz=quiz, student=student, answers=answers or {},
-                                         score=score, is_legacy=True)
+    def submission(self, quiz, student, answers=None):
+        """A finalized result through the lifecycle services (attempt + snapshot)."""
+        attempt, _ = lifecycle.start_attempt(quiz.pk, student)
+        submission, _ = lifecycle.finalize_attempt(attempt.pk, student, answers or {})
+        return submission
 
     def assertNoAnswerKeys(self, response):
         payload = response.json()

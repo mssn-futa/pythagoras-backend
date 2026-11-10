@@ -127,8 +127,9 @@ class QuizService:
     def submit(cls, *, quiz_id, student, answers):
         """Temporary direct submission (until ASSESS-04); returns ``(submission, created)``.
 
-        Same promises as ASSESS-01, stored in the ASSESS-02 shape. Under the
-        quiz row lock: an existing submission by this student (legacy or not)
+        Same promises as ASSESS-01, stored in the ASSESS-02 shape, with the
+        lifecycle locking (quiz ``FOR SHARE``, attempt row, unique-constraint
+        race resolution) and arrival time of ``quiz.lifecycle``: an existing submission by this student (legacy or not)
         is returned unchanged for an identical answer map (replay, also after
         closing/deadline) or is a ``SubmissionConflict``. Otherwise the quiz
         must be available (published, deadline in the future); the student's
@@ -142,23 +143,26 @@ class QuizService:
         from . import lifecycle  # lifecycle imports this module
 
         with transaction.atomic():
-            quiz = Quiz.objects.select_for_update().filter(pk=quiz_id).first()
-            existing = None
-            if quiz is not None:
-                existing = Submission.objects.filter(quiz=quiz, student=student).first()
+            now = lifecycle.server_now()  # arrival, before any lock wait
+            try:
+                quiz = lifecycle.share_lock_quiz(quiz_id)
+            except Quiz.DoesNotExist:
+                raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
+            existing = Submission.objects.filter(quiz=quiz, student=student).first()
             if existing is not None:
                 return lifecycle.replay_or_conflict(existing, answers), False
-            if quiz is None:
-                raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
-            now = lifecycle.server_now()
-            attempt = Attempt.objects.select_for_update().filter(quiz=quiz, student=student).first()
+            attempt = Attempt.objects.filter(quiz=quiz, student=student).first()
             if attempt is None:
                 if not lifecycle.quiz_is_available(quiz, now):
                     raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
-                attempt = Attempt.objects.create(
-                    quiz=quiz, student=student, started_at=now,
-                    expires_at=lifecycle.compute_expires_at(now, quiz.time_limit, quiz.deadline))
-            elif attempt.status != Attempt.Status.IN_PROGRESS or lifecycle.is_expired(attempt, now):
+                attempt, _ = lifecycle.create_attempt(quiz, student, now)
+            else:
+                attempt = lifecycle.lock_attempt(pk=attempt.pk)
+            # A concurrent request may have finalized it while we waited.
+            existing = Submission.objects.filter(attempt=attempt).first()
+            if existing is not None:
+                return lifecycle.replay_or_conflict(existing, answers), False
+            if attempt.status != Attempt.Status.IN_PROGRESS or lifecycle.is_expired(attempt, now):
                 raise AttemptExpired()
             if cls.available_points(quiz) > MAX_STORED_SCORE:
                 raise InvalidAnswers({'quiz': ['This quiz cannot be graded until its points '

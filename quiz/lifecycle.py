@@ -4,12 +4,24 @@ These are the service-layer building blocks for ASSESS-03 (authoring,
 publication, closing) and ASSESS-04 (attempt start/submit/results). They raise
 ``quiz.errors`` domain errors and never import HTTP code.
 
-Clock: every lifecycle timestamp comes from ``server_now()`` (PostgreSQL
-``statement_timestamp()``), read after the relevant row locks are held, so all
-application containers share one clock. Callers may pass ``now=`` only in tests.
+Clock and arrival: every lifecycle timestamp comes from ``server_now()``,
+PostgreSQL ``transaction_timestamp()``: the start of the transaction the
+service runs in (the request transaction when a view wraps the call in
+``atomic()``, otherwise the service's own transaction, whose first statement
+reads it before any lock is requested). That instant is the request's
+"arrival": expiry and availability are judged on it, so time spent waiting
+for locks never turns an on-time submission into ``ATTEMPT_EXPIRED``. All
+application containers share this one clock. Callers may pass ``now=`` only
+in tests.
 
-Lock order (avoids deadlocks): quiz row (``FOR UPDATE``), then attempt row.
-Question/option model saves take ``FOR NO KEY UPDATE`` on their quiz row.
+Locks (lock order: quiz row, then attempt row):
+
+* publish/close: quiz ``FOR UPDATE`` (exclusive).
+* start/finalize: quiz ``FOR SHARE`` (students proceed in parallel, but not
+  while the quiz publishes/closes or its content changes) and, for finalize,
+  the attempt row ``FOR UPDATE OF`` the attempt only. One attempt per student
+  is decided by the unique constraint (a racing insert waits, then reuses).
+* question/option writes: quiz ``FOR NO KEY UPDATE`` (conflicts with both).
 
 Every function that writes opens its own ``transaction.atomic()``.
 """
@@ -41,10 +53,14 @@ OPTIONS_PER_QUESTION = 4
 # ---------------------------------------------------------------------------
 
 def server_now():
-    """Authoritative current time: the database clock on PostgreSQL."""
+    """Arrival time: the current transaction's start on the database clock.
+
+    ``transaction_timestamp()`` is constant within a transaction, so every
+    timestamp a service writes in one transaction is the same instant.
+    """
     if connection.vendor == 'postgresql':
         with connection.cursor() as cursor:
-            cursor.execute('SELECT statement_timestamp()')
+            cursor.execute('SELECT transaction_timestamp()')
             return cursor.fetchone()[0]
     return timezone.now()
 
@@ -188,17 +204,18 @@ def publish_quiz(quiz_id, *, now=None):
     ``PublicationInvalid`` with ``fields``. Raises ``Quiz.DoesNotExist``.
     """
     with transaction.atomic():
+        now = now or server_now()
         quiz = _lock_quiz(quiz_id)
         if quiz.status == Quiz.Status.PUBLISHED:
             return quiz, False
         if quiz.status != Quiz.Status.DRAFT:
             raise InvalidTransition('A closed quiz cannot be published again.')
-        now = now or server_now()
         errors = publication_errors(quiz, now)
         if errors:
             raise PublicationInvalid(fields=errors)
         quiz.status = Quiz.Status.PUBLISHED
         quiz.published_at = now
+        quiz._lifecycle_transition = (Quiz.Status.DRAFT, Quiz.Status.PUBLISHED)
         quiz.save(update_fields=['status', 'published_at', 'updated_at'])
     return quiz, True
 
@@ -210,13 +227,15 @@ def close_quiz(quiz_id, *, now=None):
     A draft raises ``InvalidTransition``. Raises ``Quiz.DoesNotExist``.
     """
     with transaction.atomic():
+        now = now or server_now()
         quiz = _lock_quiz(quiz_id)
         if quiz.status == Quiz.Status.CLOSED:
             return quiz, False
         if quiz.status != Quiz.Status.PUBLISHED:
             raise InvalidTransition('Only a published quiz can be closed.')
         quiz.status = Quiz.Status.CLOSED
-        quiz.closed_at = now or server_now()
+        quiz.closed_at = now
+        quiz._lifecycle_transition = (Quiz.Status.PUBLISHED, Quiz.Status.CLOSED)
         quiz.save(update_fields=['status', 'closed_at', 'updated_at'])
     return quiz, True
 
@@ -246,7 +265,30 @@ def is_eligible_student(user):
     return bool(user is not None and user.is_active and getattr(user, 'role', None) == CustomUser.Role.STUDENT)
 
 
-def _create_attempt(quiz, student, now):
+def share_lock_quiz(quiz_id):
+    """Load a quiz holding ``FOR SHARE`` on its row (start/finalize).
+
+    Shared locks do not block each other, so all students start and submit in
+    parallel; they do conflict with publish/close (``FOR UPDATE``) and content
+    writes (``FOR NO KEY UPDATE``). Raises ``Quiz.DoesNotExist``.
+    """
+    if connection.vendor == 'postgresql':
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT id FROM quiz_quiz WHERE id = %s FOR SHARE', [quiz_id])
+            if cursor.fetchone() is None:
+                raise Quiz.DoesNotExist()
+    return Quiz.objects.get(pk=quiz_id)
+
+
+def lock_attempt(**lookup):
+    """Lock one attempt row (only the attempt, not the joined student row)."""
+    return (Attempt.objects.select_for_update(of=('self',)).select_related('student')
+            .get(**lookup))
+
+
+def create_attempt(quiz, student, now):
+    """Insert the attempt or, if a concurrent start won the unique race, return
+    that one locked; ``(attempt, created)``. Caller holds the quiz share lock."""
     attempt = Attempt(quiz=quiz, student=student, status=Attempt.Status.IN_PROGRESS,
                       started_at=now,
                       expires_at=compute_expires_at(now, quiz.time_limit, quiz.deadline))
@@ -254,8 +296,8 @@ def _create_attempt(quiz, student, now):
         with transaction.atomic():
             attempt.save(force_insert=True)
     except IntegrityError:
-        # Only reachable without the quiz lock; the unique constraint decides.
-        return Attempt.objects.get(quiz=quiz, student=student), False
+        # The competing insert has committed (it held the unique index entry).
+        return lock_attempt(quiz=quiz, student=student), False
     return attempt, True
 
 
@@ -265,22 +307,23 @@ def start_attempt(quiz_id, student, *, now=None):
     An existing attempt is returned first, even after closing/deadline/expiry
     (its retrieval path never disappears). Otherwise: a student with a legacy
     submission for the quiz has used their attempt (``SubmissionConflict``);
-    the quiz must be available (``QuizUnavailable``). The DB unique constraint
-    backs the quiz row lock. Raises ``Quiz.DoesNotExist``/``QuizUnavailable``.
+    the quiz must be available at arrival (``QuizUnavailable``). Concurrent
+    starts by one student yield one row (unique constraint). Raises
+    ``Quiz.DoesNotExist``/``QuizUnavailable``.
     """
     if not is_eligible_student(student):
         raise QuizUnavailable('Only active student accounts can take assessments.')
     with transaction.atomic():
-        quiz = _lock_quiz(quiz_id)
+        now = now or server_now()
+        quiz = share_lock_quiz(quiz_id)
         existing = Attempt.objects.filter(quiz=quiz, student=student).first()
         if existing is not None:
             return existing, False
         if Submission.objects.filter(quiz=quiz, student=student).exists():
             raise SubmissionConflict('You already have a submission for this quiz.')
-        now = now or server_now()
         if not quiz_is_available(quiz, now):
             raise QuizUnavailable()
-        return _create_attempt(quiz, student, now)
+        return create_attempt(quiz, student, now)
 
 
 def mark_expired(attempt_id, *, now=None):
@@ -289,8 +332,8 @@ def mark_expired(attempt_id, *, now=None):
     Never creates a grade. Safe to call repeatedly or for any attempt.
     """
     with transaction.atomic():
-        attempt = Attempt.objects.select_for_update().get(pk=attempt_id)
         now = now or server_now()
+        attempt = lock_attempt(pk=attempt_id)
         if attempt.status == Attempt.Status.IN_PROGRESS and is_expired(attempt, now):
             attempt.status = Attempt.Status.EXPIRED
             attempt.save(update_fields=['status'])
@@ -339,23 +382,22 @@ def finalize_attempt(attempt_id, student, answers, *, now=None):
     Order (D3): ownership (``Attempt.DoesNotExist`` for a foreign/missing
     attempt), then replay of an existing finalization (identical -> returned,
     even after expiry/closing; changed -> ``SubmissionConflict``), then expiry
-    (``AttemptExpired``; the attempt is persisted as expired, no grade), then
-    answer validation (``InvalidAnswers``) and atomic grading. Closing the quiz
-    does not block an unexpired attempt.
+    at arrival (``AttemptExpired``; the attempt is persisted as expired, no
+    grade), then answer validation (``InvalidAnswers``) and atomic grading.
+    Closing the quiz does not block an unexpired attempt.
     """
     expired = False
     with transaction.atomic():
+        now = now or server_now()  # arrival, before any lock wait
         quiz_id = Attempt.objects.filter(pk=attempt_id, student=student).values_list(
             'quiz_id', flat=True).first()
         if quiz_id is None:
             raise Attempt.DoesNotExist()
-        quiz = _lock_quiz(quiz_id)
-        attempt = Attempt.objects.select_for_update().select_related('student').get(
-            pk=attempt_id, student=student)
+        quiz = share_lock_quiz(quiz_id)
+        attempt = lock_attempt(pk=attempt_id, student=student)
         existing = Submission.objects.filter(attempt=attempt).first()
         if existing is not None:
             return replay_or_conflict(existing, answers), False
-        now = now or server_now()
         if attempt.status != Attempt.Status.IN_PROGRESS or is_expired(attempt, now):
             if attempt.status == Attempt.Status.IN_PROGRESS:
                 attempt.status = Attempt.Status.EXPIRED
