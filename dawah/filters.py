@@ -1,4 +1,5 @@
 """Query-parameter parsing for event, resource and archive lists (D2)."""
+import re
 from datetime import date, datetime, time, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -15,6 +16,10 @@ except ZoneInfoNotFoundError:  # no tz database in the image; Lagos is fixed UTC
 STATUS_ALL = 'all'
 STATUS_VALUES = [*PublicationStatus.values, STATUS_ALL]
 TRUE_VALUES = {'true', '1'}
+DATE_PATTERN = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
+# Keeps Lagos-day arithmetic (and date_to + 1 day) inside datetime's range.
+MIN_DATE = date(1900, 1, 1)
+MAX_DATE = date(9998, 12, 31)
 FALSE_VALUES = {'false', '0'}
 
 
@@ -33,12 +38,24 @@ def _date(params, name, errors):
     if value is None or value == '':
         return None
     try:
-        if len(value) != 10:
+        if not DATE_PATTERN.fullmatch(value):
             raise ValueError
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
     except ValueError:
         errors[name] = ['Enter a valid date in YYYY-MM-DD format.']
         return None
+    if not MIN_DATE <= parsed <= MAX_DATE:
+        errors[name] = [f'Enter a date between {MIN_DATE.isoformat()} and {MAX_DATE.isoformat()}.']
+        return None
+    return parsed
+
+
+def _text(params, name, errors):
+    value = (params.get(name) or '').strip()
+    if '\x00' in value:
+        errors[name] = ['Null characters are not allowed.']
+        return None
+    return value or None
 
 
 def _boolean(params, name, errors):
@@ -66,9 +83,9 @@ def parse_status(params, errors):
 def parse_content_filters(params, errors):
     """Shared search/speaker/category/date filters, evaluated on the event."""
     filters = {
-        'search': (params.get('search') or '').strip() or None,
-        'speaker': (params.get('speaker') or '').strip() or None,
-        'category': (params.get('category') or '').strip() or None,
+        'search': _text(params, 'search', errors),
+        'speaker': _text(params, 'speaker', errors),
+        'category': _text(params, 'category', errors),
         'date_from': _date(params, 'date_from', errors),
         'date_to': _date(params, 'date_to', errors),
     }

@@ -182,8 +182,3 @@ class EventResourceWriteSerializer(StrictWriteMixin, serializers.ModelSerializer
                 raise serializers.ValidationError('A resource with a ready asset cannot change type.')
         return value
 
-    def save(self, **kwargs):
-        resource_type = self.validated_data.get('type')
-        if resource_type and (self.instance is None or resource_type != self.instance.type):
-            kwargs['storage_status'] = EventResource.initial_storage_status(resource_type)
-        return super().save(**kwargs)

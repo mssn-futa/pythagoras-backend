@@ -78,10 +78,9 @@ TYPE_PARAM = OpenApiParameter('type', str, enum=EventResource.Type.values, descr
 
 def status_filter(request, errors, default):
     """Admins may widen visibility with ``status``; others never can."""
-    value = filters.parse_status(request.query_params, errors)
     if not reader_is_admin(request):
         return PublicationStatus.PUBLISHED
-    return value or default
+    return filters.parse_status(request.query_params, errors) or default
 
 
 # ---------------------------------------------------------------- events
@@ -142,10 +141,8 @@ class EventDetailView(DawahView):
         return self.respond(self.readable_event(event_id), EventDetailSerializer, 'Event retrieved.')
 
     def _update(self, request, event_id, partial):
-        event = get_object_or_404(Event, pk=event_id)
-        serializer = EventWriteSerializer(event, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        event = services.update_event(
+            event_id, lambda locked: EventWriteSerializer(locked, data=request.data, partial=partial))
         return self.respond(event, EventDetailSerializer, 'Event updated.')
 
     @extend_schema(operation_id='dawah_events_update', request=EventWriteSerializer,
@@ -225,18 +222,15 @@ class EventResourceListView(DawahView):
                                  value=examples.RESOURCE_DRAFT)],
     )
     def post(self, request, event_id):
-        event = get_object_or_404(Event, pk=event_id)
+        get_object_or_404(Event, pk=event_id)  # 404 before field validation
         serializer = EventResourceWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        resource = serializer.save(event=event, created_by=request.user)
+        resource = services.create_resource(event_id, serializer, request.user)
         return self.respond(resource, EventResourceSerializer, 'Resource created.', status=201)
 
 
 class EventResourceDetailView(DawahView):
     serializer_class = EventResourceSerializer
-
-    def owned_resource(self, event_id, resource_id):
-        return get_object_or_404(EventResource.objects.select_related('event'), pk=resource_id, event_id=event_id)
 
     @extend_schema(operation_id='dawah_event_resources_retrieve', responses={200: EventResourceSerializer},
                    description='Visible resource that belongs to the URL event.')
@@ -251,10 +245,9 @@ class EventResourceDetailView(DawahView):
                    responses={200: EventResourceSerializer},
                    description='Admin: update title/type/duration. The parent cannot be changed.')
     def patch(self, request, event_id, resource_id):
-        resource = self.owned_resource(event_id, resource_id)
-        serializer = EventResourceWriteSerializer(resource, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        resource = services.update_resource(
+            event_id, resource_id,
+            lambda locked: EventResourceWriteSerializer(locked, data=request.data, partial=True))
         return self.respond(resource, EventResourceSerializer, 'Resource updated.')
 
     @extend_schema(operation_id='dawah_event_resources_destroy', responses={204: None},

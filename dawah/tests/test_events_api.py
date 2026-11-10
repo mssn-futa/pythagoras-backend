@@ -150,6 +150,10 @@ class EventPermissionTests(DawahAPITestCase, TestCase):
                 self.data(self.client.get(detail(published.pk)))
                 self.error(self.client.get(detail(draft.pk)), 404, 'NOT_FOUND')
                 self.error(self.client.get(detail(unpublished.pk)), 404, 'NOT_FOUND')
+                # Non-admin status values are ignored, never an error.
+                self.assertEqual(self.ids(self.client.get(EVENTS, {'status': 'bogus'})), [published.pk])
+                self.assertEqual(self.ids(self.client.get(f'/dawah/events/{published.pk}/resources/',
+                                                          {'status': 'bogus'})), [])
         self.as_user(self.inactive_admin)
         self.error(self.client.get(EVENTS), 403, 'ACCOUNT_INACTIVE')
         self.as_admin()
@@ -356,3 +360,19 @@ class DjangoAdminTests(TestCase):
             model_admin = django_admin.site._registry[model]
             self.assertFalse(model_admin.has_delete_permission(None))
             self.assertIn('status', model_admin.readonly_fields)
+        inline = django_admin.site._registry[Event].inlines[0]
+        self.assertIn('type', inline.readonly_fields)
+        self.assertFalse(inline(Event, django_admin.site).has_add_permission(None))
+        self.assertFalse(django_admin.site._registry[EventResource].has_add_permission(None))
+
+    def test_django_admin_event_form_validates_timing(self):
+        from dawah.admin import EventAdminForm
+
+        event = make_event()
+        data = {'title': 'T', 'category': 'c', 'tags': '', 'speakers': 's', 'location': 'l',
+                'start_time': '2026-10-09 12:00:00', 'end_time': '2026-10-09 12:00:00'}
+        form = EventAdminForm(data, instance=event)
+        self.assertFalse(form.is_valid())
+        self.assertIn('end_time', form.errors)
+        data['end_time'] = '2026-10-09 13:00:00'
+        self.assertTrue(EventAdminForm(data, instance=event).is_valid())

@@ -80,10 +80,28 @@ class ArchiveTests(DawahAPITestCase, TestCase):
     def test_invalid_date_filters(self):
         for params, field in [({'date_from': '06-03-2026'}, 'date_from'), ({'date_to': '2026-02-30'}, 'date_to'),
                               ({'date_from': '2026-03-06T00:00:00Z'}, 'date_from'),
-                              ({'date_from': '2026-03-07', 'date_to': '2026-03-06'}, 'date_to')]:
+                              ({'date_from': '2026-03-07', 'date_to': '2026-03-06'}, 'date_to'),
+                              ({'date_from': '2026-W01-1'}, 'date_from'),  # ISO week date
+                              ({'date_to': '20260306'}, 'date_to'),
+                              ({'date_to': '9999-12-31'}, 'date_to'),  # would overflow
+                              ({'date_from': '0001-01-01'}, 'date_from'),
+                              ({'date_from': '0001-01-01', 'date_to': '9999-12-31'}, 'date_from')]:
             with self.subTest(params=params):
                 fields = self.error(self.client.get(ARCHIVE, params), 400, 'VALIDATION_ERROR')['fields']
                 self.assertIn(field, fields)
+
+    def test_out_of_range_dates_rejected_on_events_too(self):
+        for params in ({'date_to': '9999-12-31'}, {'date_from': '0001-01-01'}):
+            with self.subTest(params=params):
+                self.error(self.client.get('/dawah/events/', params), 400, 'VALIDATION_ERROR')
+        self.data(self.client.get(ARCHIVE, {'date_from': '1900-01-01', 'date_to': '9998-12-31'}))
+
+    def test_null_characters_rejected(self):
+        for url in (ARCHIVE, '/dawah/events/'):
+            for name in ('search', 'speaker', 'category'):
+                with self.subTest(url=url, name=name):
+                    fields = self.error(self.client.get(url, {name: 'a\x00b'}), 400, 'VALIDATION_ERROR')['fields']
+                    self.assertEqual(fields, {name: ['Null characters are not allowed.']})
 
     def test_pagination_bounds(self):
         event = make_event(status=PUBLISHED, start=at(2026, 1, 1))

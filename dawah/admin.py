@@ -3,6 +3,7 @@
 Publication/storage state is read-only here and deletion is disabled, so the
 product API's publication rules and protected deletion cannot be bypassed.
 """
+from django import forms
 from django.contrib import admin
 
 from .models import Event, EventResource
@@ -19,13 +20,30 @@ class EventResourceInline(admin.TabularInline):
     model = EventResource
     extra = 0
     fields = ('title', 'type', 'duration', 'status', 'storage_status', 'file')
-    readonly_fields = ('status', 'storage_status', 'file')
+    readonly_fields = ('type', 'status', 'storage_status', 'file')
     can_delete = False
     show_change_link = True
+
+    def has_add_permission(self, request, obj=None):
+        return False  # resources are created through the API (type is fixed there)
+
+
+class EventAdminForm(forms.ModelForm):
+    class Meta:
+        model = Event
+        exclude = ('status', 'published_at', 'created_by', 'featured_image')
+
+    def clean(self):
+        cleaned = super().clean()
+        start, end = cleaned.get('start_time'), cleaned.get('end_time')
+        if start and end and end <= start:
+            self.add_error('end_time', 'End time must be after start time.')
+        return cleaned
 
 
 @admin.register(Event)
 class EventAdmin(ReadOnlyStateAdmin):
+    form = EventAdminForm
     list_display = ('id', 'title', 'category', 'start_time', 'status')
     list_filter = ('status', 'category')
     search_fields = ('title', 'speakers', 'tags')
@@ -40,3 +58,6 @@ class EventResourceAdmin(ReadOnlyStateAdmin):
     list_filter = ('type', 'status', 'storage_status')
     search_fields = ('title', 'event__title')
     readonly_fields = (*STATE_FIELDS, 'event', 'type', 'storage_status', 'file')
+
+    def has_add_permission(self, request):
+        return False  # parent and type are read-only here; create through the API

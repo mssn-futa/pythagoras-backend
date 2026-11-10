@@ -102,6 +102,51 @@ def unpublish_resource(event_id, resource_id):
     return resource
 
 
+def apply_update(instance, validated_data, extra_fields=()):
+    """Write only the validated fields, so state columns are never rewritten
+    from a stale copy (an overlapping publish/unpublish keeps its result)."""
+    for name, value in validated_data.items():
+        setattr(instance, name, value)
+    instance.save(update_fields=[*validated_data, *extra_fields, 'updated_at'])
+    return instance
+
+
+def update_event(event_id, serializer_factory):
+    """Validate against and update the locked current row."""
+    with transaction.atomic():
+        event = _lock_event(event_id)
+        serializer = serializer_factory(event)
+        serializer.is_valid(raise_exception=True)
+        apply_update(event, serializer.validated_data)
+    return event
+
+
+def update_resource(event_id, resource_id, serializer_factory):
+    with transaction.atomic():
+        event, resource = _lock_resource(event_id, resource_id)
+        serializer = serializer_factory(resource)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        extra = []
+        if 'type' in data and data['type'] != resource.type:
+            resource.storage_status = EventResource.initial_storage_status(data['type'])
+            extra.append('storage_status')
+        apply_update(resource, data, extra)
+    resource.event = event
+    return resource
+
+
+def create_resource(event_id, serializer, created_by):
+    """Create under the locked parent, so a racing event delete cannot leave a
+    dangling insert (it waits, then this request sees 404)."""
+    with transaction.atomic():
+        event = _lock_event(event_id)
+        data = serializer.validated_data
+        return EventResource.objects.create(
+            event=event, created_by=created_by,
+            storage_status=EventResource.initial_storage_status(data['type']), **data)
+
+
 def event_references(event):
     """Rows in other domains (e.g. quizzes) that point at this event.
 
