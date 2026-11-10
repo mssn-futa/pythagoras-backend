@@ -443,11 +443,17 @@ class AttemptTests(QuizAPITestMixin, TestCase):
         with self.assertRaises(AttemptExpired):
             lifecycle.finalize_attempt(attempt.pk, self.student, self.answers, now=attempt.expires_at)
         attempt.refresh_from_db()
-        self.assertEqual(attempt.status, 'expired')
+        # ASSESS-04: a late request reads expiry but never persists it, so it
+        # cannot reject an earlier arrival still waiting for the attempt lock.
+        self.assertEqual(attempt.status, 'in_progress')
+        self.assertEqual(lifecycle.effective_attempt_status(attempt, attempt.expires_at), 'expired')
         self.assertIsNone(attempt.finalized_at)
         self.assertFalse(Submission.objects.filter(attempt=attempt).exists())  # no invented grade
-        with self.assertRaises(AttemptExpired):  # stays expired, even "before" expiry
-            lifecycle.finalize_attempt(attempt.pk, self.student, self.answers, now=just_before)
+        # An arrival before expiry (e.g. one that waited behind the late request) is on time.
+        submission, created = lifecycle.finalize_attempt(attempt.pk, self.student, self.answers,
+                                                         now=just_before)
+        self.assertTrue(created)
+        self.assertEqual(submission.submitted_at, just_before)
 
     def test_replay_after_expiry_and_conflict(self):
         attempt, _ = self.start()
@@ -501,23 +507,6 @@ class AttemptTests(QuizAPITestMixin, TestCase):
         done = StudentAttemptSerializer(attempt).data  # server_time from the DB clock
         self.assertEqual((done['status'], done['submission_id']), ('submitted', submission.pk))
         self.assertIsNotNone(done['server_time'])
-
-    def test_direct_submit_creates_and_finalizes_the_attempt(self):
-        response = self.call(self.student, 'post', '/quiz/submissions/',
-                             {'quiz': self.quiz.pk, 'answers': self.answers})
-        self.assertEqual(response.status_code, 201, response.content)
-        submission = Submission.objects.get()
-        attempt = submission.attempt
-        self.assertEqual(attempt.status, 'submitted')
-        self.assertEqual(attempt.started_at, attempt.finalized_at)
-        self.assertEqual(submission.submitted_at, attempt.finalized_at)
-        self.assertEqual(submission.total_points, 5)
-        # An existing expired attempt cannot be finalized through the direct path.
-        other, _ = self.start(self.other_student)
-        lifecycle.mark_expired(other.pk, now=other.expires_at)
-        response = self.call(self.other_student, 'post', '/quiz/submissions/',
-                             {'quiz': self.quiz.pk, 'answers': self.answers})
-        self.assertEnvelopeError(response, 409, 'ATTEMPT_EXPIRED')
 
 
 class HistoryInvariantTests(QuizAPITestMixin, TestCase):

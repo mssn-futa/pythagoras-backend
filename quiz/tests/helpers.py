@@ -2,13 +2,14 @@
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.db import connection
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from quiz import lifecycle
-from quiz.models import Option, Question, Quiz, Submission
+from quiz.models import Option, Question, Quiz
 
 User = get_user_model()
 
@@ -36,6 +37,22 @@ def raw_update(table, pk, **columns):
     assignments = ', '.join(f'"{name}" = %s' for name in columns)
     with connection.cursor() as cursor:
         cursor.execute(f'UPDATE {table} SET {assignments} WHERE id = %s', [*columns.values(), pk])
+
+
+def insert_legacy_submission(quiz_id, student_id, score=1, submitted_at=None, answers='{}'):
+    """A pre-ASSESS-02 (legacy) result row: only the migration creates these, so
+    insert it with the history trigger off inside the (rolled back) test
+    transaction. Returns its ID."""
+    with connection.cursor() as cursor:
+        cursor.execute('SET CONSTRAINTS ALL IMMEDIATE')
+        cursor.execute('ALTER TABLE quiz_submission DISABLE TRIGGER quiz_submission_history_guard')
+        cursor.execute('INSERT INTO quiz_submission (quiz_id, student_id, answers, score, '
+                       'is_legacy, submitted_at) VALUES (%s, %s, %s, %s, true, %s) RETURNING id',
+                       [quiz_id, student_id, answers, score, submitted_at or timezone.now()])
+        pk = cursor.fetchone()[0]
+        cursor.execute('ALTER TABLE quiz_submission ENABLE TRIGGER quiz_submission_history_guard')
+        cursor.execute('SET CONSTRAINTS ALL DEFERRED')
+    return pk
 
 
 def make_quiz(title, *, active=True, points=(2, 3), legacy_text_question=False, deadline=None,
@@ -80,6 +97,7 @@ class QuizAPITestMixin:
 
     def setUp(self):
         super().setUp()
+        cache.clear()  # per-student throttle counters
         self.admin = self.make_user('admin@example.test', role='admin')
         self.student = self.make_user('student@example.test')
         self.other_student = self.make_user('other@example.test')
@@ -116,6 +134,19 @@ class QuizAPITestMixin:
         if body is None:
             return getattr(client, method)(path)
         return getattr(client, method)(path, body, format='json')
+
+    def add_student(self, email):
+        """A further active student with a bearer token."""
+        user = self.make_user(email)
+        self._tokens[user.pk] = self.access(user)
+        return user
+
+    def start_api(self, user, quiz_id):
+        return self.call(user, 'post', f'/quiz/quizzes/{quiz_id}/attempts/', {})
+
+    def submit_api(self, user, attempt_id, answers):
+        return self.call(user, 'post', '/quiz/submissions/',
+                         {'attempt_id': attempt_id, 'answers': answers})
 
     def submission(self, quiz, student, answers=None):
         """A finalized result through the lifecycle services (attempt + snapshot)."""
