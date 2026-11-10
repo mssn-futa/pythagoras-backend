@@ -82,6 +82,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
     'drf_spectacular',
     'corsheaders',
 
@@ -189,8 +190,9 @@ TEST_RUNNER = 'pythagoras.test_runner.IsolatedTestRunner'
 
 
 REST_FRAMEWORK = {
+    # SimpleJWT bearer authentication that rejects inactive accounts with 403.
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'accounts.authentication.ActiveUserJWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
@@ -201,6 +203,16 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'pythagoras.pagination.StandardPagination',
     'PAGE_SIZE': 20,
     'DATETIME_FORMAT': 'iso-8601',
+    # D5 engineering starting limits, per client IP. Counters use the default
+    # cache; a shared cache is required for deployment-wide enforcement.
+    'DEFAULT_THROTTLE_RATES': {
+        'auth_register': '5/min',
+        'auth_login': '10/min',
+        'auth_refresh': '10/min',
+    },
+    # Client IP is REMOTE_ADDR unless the verified Cloudflare router is trusted,
+    # in which case the address it appends to X-Forwarded-For is used.
+    'NUM_PROXIES': 1 if TRUST_CLOUDFLARE_PROXY else 0,
 }
 
 

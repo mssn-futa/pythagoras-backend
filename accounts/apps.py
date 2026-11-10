@@ -7,3 +7,4 @@ class AccountsConfig(AppConfig):
 
     def ready(self):
         from pythagoras.mail import checks  # noqa: F401  (registers deploy checks)
+        from . import schema  # noqa: F401  (registers the OpenAPI auth extension)
