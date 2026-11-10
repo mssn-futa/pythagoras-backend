@@ -1,0 +1,57 @@
+{
+  // Pythagoras API runtime-proof Worker (RELEASE-09). Contains NO secret values and NO account ids.
+  // Account/zone/domain values are supplied at deploy time (see docs/cloudflare-runtime.md).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pythagoras-api-runtime",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+
+  // One-minute UTC Cron Trigger -> JobContainer.tick() (never a public HTTP endpoint).
+  "triggers": { "crons": ["* * * * *"] },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "WEB", "class_name": "WebContainer" },
+      { "name": "JOB", "class_name": "JobContainer" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WebContainer", "JobContainer"] }],
+
+  // Same Dockerfile/image for both applications; the role is chosen by the controller via env.
+  "containers": [
+    {
+      "name": "pythagoras-web",
+      "class_name": "WebContainer",
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      "instance_type": "basic",
+      "max_instances": 2
+    },
+    {
+      "name": "pythagoras-job",
+      "class_name": "JobContainer",
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+
+  // Non-secret configuration. Placeholders: replace per environment via `--var` or a private override.
+  "vars": {
+    "PUBLIC_API_HOST": "api.staging.invalid",
+    "ALLOWED_HOSTS": "api.staging.invalid",
+    "CSRF_TRUSTED_ORIGINS": "https://api.staging.invalid",
+    "CORS_ALLOWED_ORIGINS": "https://app.staging.invalid",
+    "DEBUG": "false",
+    "TRUST_CLOUDFLARE_PROXY": "true",
+    "SECURE_SSL_REDIRECT": "true",
+    "WEB_CONCURRENCY": "2"
+  },
+
+  // Names only. Values: `wrangler secret put <NAME>` (or `secret bulk`). Never committed.
+  "secrets": { "required": ["SECRET_KEY", "DATABASE_URL"] }
+}

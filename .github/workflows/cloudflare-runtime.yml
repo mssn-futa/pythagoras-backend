@@ -1,0 +1,99 @@
+name: Cloudflare runtime (image and controller)
+
+# RELEASE-09 lane. Separate from backend-checks.yml. No deploy steps, no secrets,
+# no Cloudflare credentials: it only proves the image/entrypoint contract and the
+# controller unit tests/config validation. Staged Cloudflare proof is manual.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  controller:
+    name: Controller tests and Wrangler config validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - name: Wrangler offline dry run (builds both container apps; no login, no upload)
+        run: npm run dryrun
+
+  image:
+    name: Image build, fixed roles, job probe on PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-only-postgres
+          POSTGRES_DB: pythagoras_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d pythagoras_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IMAGE: pythagoras-backend:ci
+      CI_SECRET_KEY: test-only-ci-image-key-not-for-deployment-123456789012
+      CI_DATABASE_URL: postgresql://ci:ci-only-postgres@127.0.0.1:5432/pythagoras_ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build linux/amd64 image
+        run: docker build --platform linux/amd64 -t "$IMAGE" .
+      - name: Unknown role and argument passthrough are rejected
+        run: |
+          set +e
+          docker run --rm "$IMAGE" bogus; test $? -eq 64
+          docker run --rm "$IMAGE" web id; test $? -eq 64
+          docker run --rm "$IMAGE" sh; test $? -eq 64
+      - name: Migrate role refuses without explicit opt-in
+        run: |
+          set +e
+          docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" "$IMAGE" migrate
+          test $? -eq 78
+      - name: Operator-opt-in migrate, then bounded job probe
+        run: |
+          docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" \
+            -e PYTHAGORAS_ALLOW_MIGRATE=yes "$IMAGE" migrate
+          docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" "$IMAGE" job-probe
+      - name: Job probe fails nonzero when the database is unreachable
+        run: |
+          set +e
+          docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e PGCONNECT_TIMEOUT=3 \
+            -e DATABASE_URL=postgresql://ci:x@127.0.0.1:1/none "$IMAGE" job-probe
+          test $? -eq 1
+      - name: Web role serves liveness and DB readiness behind trusted proxy headers
+        run: |
+          docker run -d --name web --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" \
+            -e DEBUG=false -e ALLOWED_HOSTS=api.ci.example -e TRUST_CLOUDFLARE_PROXY=true -e PORT=8000 "$IMAGE" web
+          for i in $(seq 30); do curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: api.ci.example' http://127.0.0.1:8000/healthz/ && break; sleep 1; done
+          curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: api.ci.example' http://127.0.0.1:8000/readyz/
+          curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: api.ci.example' http://127.0.0.1:8000/admin/login/ | grep -q 'Log in'
+          docker logs web 2>&1 | grep -F -e "$CI_SECRET_KEY" -e ci-only-postgres && exit 1 || true
