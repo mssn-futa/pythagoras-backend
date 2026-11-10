@@ -1,0 +1,25 @@
+# Keep the build context minimal and free of local secrets/state.
+.git
+.github
+.env
+.env.*
+!.env.example
+.venv*
+venv
+env
+**/__pycache__
+**/*.pyc
+db.sqlite3*
+staticfiles
+.static-*
+cloudflare
+docs
+*.md
+*.png
+render.yaml
+build.sh
+Dockerfile
+.dockerignore
+.pytest_cache
+htmlcov
+.coverage

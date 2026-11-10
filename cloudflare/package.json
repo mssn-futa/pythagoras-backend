@@ -1,0 +1,24 @@
+{
+  "name": "pythagoras-cloudflare-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dryrun": "wrangler deploy --dry-run --outdir .wrangler-dryrun"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261110.1",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "vitest": "5.1.0",
+    "wrangler": "4.160.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  }
+}
