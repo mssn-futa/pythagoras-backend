@@ -184,6 +184,9 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AUTH_USER_MODEL = 'accounts.CustomUser'
 
+# Forces the in-memory email transport and a blank provider key under tests.
+TEST_RUNNER = 'pythagoras.test_runner.IsolatedTestRunner'
+
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
@@ -222,8 +225,12 @@ SPECTACULAR_SETTINGS = {
 }
 
 
-# Legacy welcome delivery remains non-networked until PLAT-03 adopts Resend.
+# All application mail uses pythagoras.mail (D0 A05). Django's own mail
+# backend stays in-memory so nothing can fall back to SMTP.
 EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+EMAIL_TRANSPORT = os.getenv('EMAIL_TRANSPORT', 'resend').strip().lower()
+if EMAIL_TRANSPORT not in {'resend', 'memory'}:
+    raise ImproperlyConfigured('EMAIL_TRANSPORT must be resend or memory.')
 RESEND_API_KEY = os.getenv('RESEND_API_KEY', '')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '')
 EMAIL_REPLY_TO = os.getenv('EMAIL_REPLY_TO', '')
