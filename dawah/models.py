@@ -15,6 +15,8 @@ from django.conf import settings
 from django.db import models
 from django.db.models import Q
 
+from . import youtube
+
 
 class PublicationStatus(models.TextChoices):
     DRAFT = 'draft', 'Draft'
@@ -84,13 +86,12 @@ class EventResourceQuerySet(models.QuerySet):
         and a deliverable asset/reference. Unpublishing the parent hides them
         without rewriting their own status."""
         # Uploaded types need a ready validated asset that was promoted to the
-        # public bucket. Video is never deliverable until DAWAH-05 adds the
-        # validated reference condition
-        # (``| Q(type=VIDEO, youtube_video_id__isnull=False)``).
+        # public bucket. Video needs a validated YouTube video ID (DAWAH-05).
+        uploaded = (Q(type__in=EventResource.UPLOADED_TYPES, storage_status=EventResource.StorageStatus.READY)
+                    & ~Q(private_object_key='') & ~Q(public_media_url=''))
+        video = Q(type=EventResource.Type.VIDEO) & ~Q(youtube_video_id='')
         return self.filter(
-            Q(type__in=EventResource.UPLOADED_TYPES,
-              storage_status=EventResource.StorageStatus.READY)
-            & ~Q(private_object_key='') & ~Q(public_media_url=''),
+            uploaded | video,
             status=PublicationStatus.PUBLISHED,
             event__status=PublicationStatus.PUBLISHED,
         )
@@ -143,6 +144,11 @@ class EventResource(models.Model):
     public_media_url = models.CharField(max_length=1024, blank=True, default='',
                                         help_text='Canonical public delivery URL of the promoted copy.')
 
+    # External video reference (DAWAH-05): only the validated ID is stored; the
+    # watch/embed URLs are constructed from it.
+    youtube_video_id = models.CharField(max_length=11, blank=True, default='',
+                                        help_text='Validated YouTube video ID (video resources only).')
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -150,6 +156,9 @@ class EventResource(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=['event', 'status'], name='dawah_resource_event_status')]
+        constraints = [models.CheckConstraint(
+            condition=Q(youtube_video_id='') | Q(youtube_video_id__regex=r'^[A-Za-z0-9_-]{11}$'),
+            name='dawah_resource_youtube_id_format')]
 
     def __str__(self):
         return self.title
@@ -173,18 +182,19 @@ class EventResource(models.Model):
 
     @property
     def playback(self):
-        """Typed playback metadata. DAWAH-05 supplies it for validated video."""
-        return None
+        """Typed playback metadata for a video with a validated YouTube ID, else None."""
+        if self.type != self.Type.VIDEO:
+            return None
+        return youtube.playback_for(self.youtube_video_id)
 
     def media_ready(self):
         """Whether the resource has a deliverable asset/reference.
 
         Audio/documents need a validated ready upload (DAWAH-02/07). Video needs
-        a validated YouTube reference, which DAWAH-05 adds; until then no video
-        resource can be published.
+        a validated YouTube video ID.
         """
         if self.type == self.Type.VIDEO:
-            return False
+            return self.playback is not None
         return self.has_asset
 
 

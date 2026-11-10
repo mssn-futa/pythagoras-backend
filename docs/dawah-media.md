@@ -134,3 +134,18 @@ the flag exactly those 5 fail):
 
 The fake-adapter suite covers the skipped properties at the protocol level. The provider-level
 proof for them remains RELEASE-07 on R2.
+
+## YouTube video links (DAWAH-05)
+
+Video resources reference an existing YouTube video; nothing is uploaded and no
+YouTube API/credential/network call is made. `youtube_url` is accepted on
+resource create/PATCH (admin), parsed structurally (`dawah/youtube.py`) and only
+the 11-character video ID is stored (`youtube_video_id`). The payload exposes
+`playback` = `{provider, video_id, watch_url, embed_url}` built server-side
+(`https://www.youtube.com/watch?v=<id>`, `https://www.youtube-nocookie.com/embed/<id>`)
+(null without a valid ID).
+Accepted: HTTPS on youtube.com, www./m.youtube.com (`/watch?v=`, `/embed/`,
+`/shorts/`), youtu.be/`<id>`, www.youtube-nocookie.com/embed/`<id>`; other query
+parameters and fragments are discarded. A video is publishable/visible only once
+it has an ID. Changing the link of a published video is `409 UNPUBLISH_REQUIRED`.
+A valid link does not guarantee the video exists or allows embedding.
