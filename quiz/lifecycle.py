@@ -334,7 +334,10 @@ def start_attempt(quiz_id, student, *, now=None):
 def mark_expired(attempt_id, *, now=None):
     """Persist ``expired`` for an in-progress attempt past expiry; returns the attempt.
 
-    Never creates a grade. Safe to call repeatedly or for any attempt.
+    Never creates a grade. Safe to call repeatedly or for any attempt. No API
+    path calls it (ASSESS-04 reads ``effective_attempt_status``); an operator
+    job may, well past expiry, because a commit here makes any finalization
+    still waiting for the attempt lock fail with ``AttemptExpired``.
     """
     with transaction.atomic():
         now = now or server_now()
@@ -387,11 +390,18 @@ def finalize_attempt(attempt_id, student, answers, *, now=None):
     Order (D3): ownership (``Attempt.DoesNotExist`` for a foreign/missing
     attempt), then replay of an existing finalization (identical -> returned,
     even after expiry/closing; changed -> ``SubmissionConflict``), then expiry
-    at arrival (``AttemptExpired``; the attempt is persisted as expired, no
-    grade), then answer validation (``InvalidAnswers``) and atomic grading.
-    Closing the quiz does not block an unexpired attempt.
+    at arrival (``AttemptExpired``, no grade), then answer validation
+    (``InvalidAnswers``) and atomic grading. Closing the quiz does not block an
+    unexpired attempt.
+
+    A late request never *persists* ``expired`` (ASSESS-04): the attempt stays
+    ``in_progress`` in the database and reads as expired through
+    ``effective_attempt_status``. Persisting it here would let a late arrival
+    that wins the attempt lock reject an earlier, on-time arrival still waiting
+    for that lock (the ``mark_expired`` edge in docs/assessment-lifecycle.md).
+    An attempt already persisted as ``expired`` (``mark_expired``) stays
+    rejected.
     """
-    expired = False
     with transaction.atomic():
         now = now or server_now()  # arrival, before any lock wait
         quiz_id = Attempt.objects.filter(pk=attempt_id, student=student).values_list(
@@ -404,11 +414,5 @@ def finalize_attempt(attempt_id, student, answers, *, now=None):
         if existing is not None:
             return replay_or_conflict(existing, answers), False
         if attempt.status != Attempt.Status.IN_PROGRESS or is_expired(attempt, now):
-            if attempt.status == Attempt.Status.IN_PROGRESS:
-                attempt.status = Attempt.Status.EXPIRED
-                attempt.save(update_fields=['status'])
-            expired = True
-        else:
-            return finalize_locked(quiz, attempt, answers, now), True
-    if expired:
-        raise AttemptExpired()
+            raise AttemptExpired()
+        return finalize_locked(quiz, attempt, answers, now), True

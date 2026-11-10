@@ -412,31 +412,72 @@ def is_admin_context(context):
     return bool(request is not None and is_admin(request.user))
 
 
-class AdminSubmissionSerializer(serializers.ModelSerializer):
-    """Result row for admins, including the student's identity. Admin only."""
-    quiz_title = serializers.CharField(source='quiz.title', read_only=True)
-    student_email = serializers.EmailField(source='student.email', read_only=True)
+def result_quiz_title(submission) -> str:
+    """The quiz title recorded at grading (snapshot), or the current title for a
+    legacy row without a snapshot. Metadata corrections never rewrite results."""
+    snapshot = submission.grading_snapshot
+    if isinstance(snapshot, dict) and isinstance(snapshot.get('quiz_title'), str):
+        return snapshot['quiz_title']
+    return submission.quiz.title
+
+
+RESULT_FIELDS = ['id', 'quiz_id', 'quiz_title', 'attempt_id', 'status', 'score', 'total_points',
+                 'submitted_at', 'graded_at']
+
+
+class _ResultMixin(serializers.Serializer):
+    """Fields every result payload shares (student and admin).
+
+    ``status`` is always ``submitted``: a submission is a finalized result;
+    expired attempts have no result row. ``total_points`` (and ``attempt_id``)
+    are null for legacy rows whose denominator cannot be reconstructed.
+    """
+    quiz_id = serializers.IntegerField(read_only=True)
+    quiz_title = serializers.SerializerMethodField()
+    attempt_id = serializers.IntegerField(read_only=True, allow_null=True)
+    status = serializers.SerializerMethodField()
+
+    def get_quiz_title(self, obj) -> str:
+        return result_quiz_title(obj)
+
+    @extend_schema_field({'type': 'string', 'description': 'Always "submitted" (a finalized '
+                                                         'result).'})
+    def get_status(self, obj):
+        return Attempt.Status.SUBMITTED.value
+
+
+class AdminSubmissionSerializer(_ResultMixin, serializers.ModelSerializer):
+    """Flat admin result row (lead decision after ASSESS-05). Admin only.
+
+    The result fields plus the student's identity and whether the row is a
+    pre-ASSESS-02 legacy record.
+    """
+    student_id = serializers.IntegerField(read_only=True)
     student_name = serializers.SerializerMethodField()
-    is_graded = serializers.SerializerMethodField()
+    student_email = serializers.EmailField(source='student.email', read_only=True)
 
     class Meta:
         model = Submission
-        fields = [
-            'id', 'quiz', 'quiz_title', 'student', 'student_email', 'student_name',
-            'answers', 'score', 'submitted_at', 'graded_at', 'is_graded',
-        ]
+        fields = [*RESULT_FIELDS, 'student_id', 'student_name', 'student_email', 'is_legacy']
         read_only_fields = fields
 
     def get_student_name(self, obj) -> str:
         return f'{obj.student.first_name} {obj.student.last_name}'.strip()
 
-    def get_is_graded(self, obj) -> bool:
-        return obj.graded_at is not None
-
 
 class AdminSubmissionDetailSerializer(AdminSubmissionSerializer):
-    """Admin result with the nested quiz (including keys) for review."""
-    quiz = AdminQuizSerializer(read_only=True)
+    """Admin result review: the row plus the stored answers, the immutable
+    grading snapshot (per-question points, selected and awarded) and the
+    attempt's server timing. Correct options are read from the quiz detail."""
+    started_at = serializers.DateTimeField(source='attempt.started_at', read_only=True,
+                                           allow_null=True)
+    expires_at = serializers.DateTimeField(source='attempt.expires_at', read_only=True,
+                                           allow_null=True)
+
+    class Meta(AdminSubmissionSerializer.Meta):
+        fields = [*AdminSubmissionSerializer.Meta.fields, 'answers', 'grading_snapshot',
+                  'started_at', 'expires_at']
+        read_only_fields = fields
 
 
 # ----------------------------------------------------------------------------
@@ -480,19 +521,31 @@ class StudentQuizSerializer(_QuizSummaryMixin, serializers.ModelSerializer):
         return StudentQuestionSerializer(_ordered(self.audience_questions(obj)), many=True).data
 
 
-class StudentSubmissionSerializer(serializers.ModelSerializer):
-    """A student's own result: selected option IDs and score, no keys."""
-    quiz_title = serializers.CharField(source='quiz.title', read_only=True)
-    is_graded = serializers.SerializerMethodField()
+class StudentSubmissionSerializer(_ResultMixin, serializers.ModelSerializer):
+    """A student's own result (lead decision after ASSESS-06): score and
+    denominator only, no answers, snapshot or keys."""
 
     class Meta:
         model = Submission
-        fields = ['id', 'quiz', 'quiz_title', 'answers', 'score',
-                  'submitted_at', 'graded_at', 'is_graded']
+        fields = RESULT_FIELDS
         read_only_fields = fields
 
-    def get_is_graded(self, obj) -> bool:
-        return obj.graded_at is not None
+
+class AttemptOptionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Option
+        fields = ['id', 'text', 'order']
+        read_only_fields = fields
+
+
+class AttemptQuestionSerializer(serializers.ModelSerializer):
+    """D3 attempt question: ``id, text, points, order, options[id, text, order]``."""
+    options = AttemptOptionSerializer(source='option_set', many=True, read_only=True)
+
+    class Meta:
+        model = Question
+        fields = ['id', 'text', 'points', 'order', 'options']
+        read_only_fields = fields
 
 
 class StudentAttemptSerializer(serializers.ModelSerializer):
@@ -544,15 +597,42 @@ class AnswersField(serializers.JSONField):
     pass
 
 
-class SubmissionCreateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
-    """Legacy submission input. Student and score are server-owned (D0, D3).
+class StudentAttemptDetailSerializer(StudentAttemptSerializer):
+    """The frozen attempt contract plus the attempt's MCQ questions in persisted
+    order with options (IDs, text, order) and never a key. Questions come from
+    the published, content-locked graph, so they never change for an attempt."""
+    questions = serializers.SerializerMethodField()
 
-    Only the structure is checked here; quiz availability and answer membership
-    are checked by ``QuizService.submit`` under the quiz row lock. Temporary
-    until the ASSESS-04 attempt contract (``attempt_id``) replaces it.
+    class Meta(StudentAttemptSerializer.Meta):
+        fields = [*StudentAttemptSerializer.Meta.fields, 'questions']
+        read_only_fields = fields
+
+    @extend_schema_field(AttemptQuestionSerializer(many=True))
+    def get_questions(self, obj):
+        from .lifecycle import ordered_questions
+        return AttemptQuestionSerializer(ordered_questions(obj.quiz), many=True).data
+
+
+RETIRED_SUBMIT_MESSAGE = ('Direct quiz submission was retired. Start an attempt with POST '
+                          '/quiz/quizzes/{id}/attempts/ and submit its attempt_id.')
+
+
+class SubmissionCreateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
+    """``{"attempt_id": 123, "answers": {"10": 102}}``. Structure only.
+
+    Student, score and timing are server-owned (D0, D3): every other key is
+    rejected. Ownership, replay, expiry and answer membership are checked by
+    ``quiz.lifecycle.finalize_attempt`` under the quiz/attempt locks. The
+    ASSESS-01 ``{"quiz", "answers"}`` body is refused with a pointer to the
+    attempt flow.
     """
-    quiz = StrictIntegerField(min_value=1)
+    attempt_id = StrictIntegerField(min_value=1)
     answers = AnswersField()
+
+    def to_internal_value(self, data):
+        if isinstance(data, Mapping) and 'quiz' in data:
+            raise serializers.ValidationError({'quiz': [RETIRED_SUBMIT_MESSAGE]})
+        return super().to_internal_value(data)
 
     def validate_answers(self, value):
         if not isinstance(value, dict):

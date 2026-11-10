@@ -5,6 +5,11 @@ object whose keys are canonical decimal question-ID strings of the quiz and
 whose values are integer option IDs of that question. Grading happens only on
 the server against the persisted correct option and question points.
 
+Finalization (locking, timing, replay) lives in ``quiz.lifecycle``; the
+ASSESS-01/02 direct submission (``QuizService.submit``, which created and
+finalized an attempt in one step) was retired by ASSESS-04 so no path bypasses
+the timed attempt.
+
 ``QuizService.grade_submission`` is the historical text/multi-answer grader.
 It is retained only as legacy coverage for records stored in that shape and is
 not used by any release endpoint.
@@ -12,11 +17,10 @@ not used by any release endpoint.
 import re
 from dataclasses import dataclass
 
-from django.db import transaction
 from django.db.models import Prefetch
 
 from .errors import AttemptExpired, InvalidAnswers, SubmissionConflict  # noqa: F401 (re-exported)
-from .models import MAX_STORED_POINTS, Attempt, Option, Question, Quiz, Submission
+from .models import MAX_STORED_POINTS, Option, Question, Submission
 
 # Capacity of Submission.score/total_points (widened to integer by ASSESS-02).
 MAX_STORED_SCORE = MAX_STORED_POINTS
@@ -122,53 +126,6 @@ class QuizService:
     @staticmethod
     def available_points(quiz):
         return sum(quiz.question_set.filter(type=Question.Type.mcq).values_list('points', flat=True))
-
-    @classmethod
-    def submit(cls, *, quiz_id, student, answers):
-        """Temporary direct submission (until ASSESS-04); returns ``(submission, created)``.
-
-        Same promises as ASSESS-01, stored in the ASSESS-02 shape, with the
-        lifecycle locking (quiz ``FOR SHARE``, attempt row, unique-constraint
-        race resolution) and arrival time of ``quiz.lifecycle``: an existing submission by this student (legacy or not)
-        is returned unchanged for an identical answer map (replay, also after
-        closing/deadline) or is a ``SubmissionConflict``. Otherwise the quiz
-        must be available (published, deadline in the future); the student's
-        attempt is created at this server instant (``started_at`` =
-        ``finalized_at`` = ``submitted_at`` = ``graded_at``; this path has no
-        separate start) or, if one exists, finalized subject to its expiry
-        (``AttemptExpired``). Answers are validated (``InvalidAnswers``) and
-        graded with a snapshot via ``quiz.lifecycle``. Any failure rolls back
-        the attempt too, so a rejected request never consumes the attempt.
-        """
-        from . import lifecycle  # lifecycle imports this module
-
-        with transaction.atomic():
-            now = lifecycle.server_now()  # arrival, before any lock wait
-            try:
-                quiz = lifecycle.share_lock_quiz(quiz_id)
-            except Quiz.DoesNotExist:
-                raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
-            existing = Submission.objects.filter(quiz=quiz, student=student).first()
-            if existing is not None:
-                return lifecycle.replay_or_conflict(existing, answers), False
-            attempt = Attempt.objects.filter(quiz=quiz, student=student).first()
-            if attempt is None:
-                if not lifecycle.quiz_is_available(quiz, now):
-                    raise InvalidAnswers({'quiz': ['This quiz is not available.']}, field=None)
-                attempt, _ = lifecycle.create_attempt(quiz, student, now)
-            else:
-                attempt = lifecycle.lock_attempt(pk=attempt.pk)
-            # A concurrent request may have finalized it while we waited.
-            existing = Submission.objects.filter(attempt=attempt).first()
-            if existing is not None:
-                return lifecycle.replay_or_conflict(existing, answers), False
-            if attempt.status != Attempt.Status.IN_PROGRESS or lifecycle.is_expired(attempt, now):
-                raise AttemptExpired()
-            if cls.available_points(quiz) > MAX_STORED_SCORE:
-                raise InvalidAnswers({'quiz': ['This quiz cannot be graded until its points '
-                                               'are reduced.']}, field=None)
-            submission = lifecycle.finalize_locked(quiz, attempt, answers, now)
-        return submission, True
 
     # ------------------------------------------------------------------
     # Legacy grader (text / multiple-answer, option text comparison).
