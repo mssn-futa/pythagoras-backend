@@ -151,8 +151,8 @@ unimplemented; filling them does not enable a provider or prove its readiness.
 | `RESEND_API_KEY` | Backend-only send key; blank default |
 | `DEFAULT_FROM_EMAIL` | Verified sender/domain; blank default |
 | `EMAIL_REPLY_TO` | Optional reply-to; blank default |
-| `RESEND_TIMEOUT_SECONDS` | 30-second bounded HTTPS setting |
-| `RESEND_REQUESTS_PER_SECOND`, `RESEND_DAILY_REQUEST_BUDGET` | 2 / 100 starting budgets; configure to actual account limits |
+| `RESEND_TIMEOUT_SECONDS` | 30-second total wall-clock bound per HTTPS request |
+| `WELCOME_EMAIL_TIMEOUT_SECONDS`, `EMAIL_IDEMPOTENCY_NAMESPACE` | 10 s welcome bound / `local` key namespace; see `identity-auth.md` |
 | `R2_ACCOUNT_ID`, `R2_S3_ENDPOINT_URL` | Account and S3 API endpoint |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Bucket-scoped backend-only credentials |
 | `R2_PRIVATE_BUCKET`, `R2_PUBLIC_BUCKET` | Private staging/ready and separate public delivery buckets |
@@ -167,7 +167,7 @@ All provider values are backend-only; no `VITE_` secrets. Public GA4 measurement
 configuration belongs to the frontend. No YouTube credentials are needed.
 PLAT-03 adopted the shared `pythagoras.mail` transport (see `identity-auth.md`);
 Django's own email backend stays in-memory, so there is no SMTP fallback.
-PLAT-03 owns the welcome adapter, COMM-02/06 own budget enforcement/automation,
+PLAT-03 owns the welcome adapter, COMM-02/06 own rate budgeting (and its settings)/automation,
 and DAWAH-02 owns storage/URL validation and TTL enforcement.
 
 ## Production trust boundary and downstream handoff

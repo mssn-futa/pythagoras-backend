@@ -21,7 +21,7 @@ class WelcomeEmailTests(APITestMixin, TestCase):
         callbacks[0]()
         user = User.objects.get()
         [sent] = memory.outbox
-        self.assertEqual(sent.idempotency_key, f'welcome/{user.pk}/v1')
+        self.assertEqual(sent.idempotency_key, f'local/welcome/{user.pk}/v1')
         self.assertEqual(sent.idempotency_key, welcome_idempotency_key(user.pk))
         self.assertEqual(sent.to, 'student@example.test')
         self.assertEqual(sent.from_email, 'Pythagoras <noreply@example.test>')
@@ -60,11 +60,20 @@ class WelcomeEmailTests(APITestMixin, TestCase):
         self.assertEqual(result, SendResult.failed('INVALID_MESSAGE'))
         self.assertNotIn('student@example.test', '\n'.join(logs.output))
 
-    def test_resend_transport_receives_the_welcome_key(self):
+    def test_resend_transport_receives_namespaced_key_and_welcome_bound(self):
         user = make_user()
-        with override_settings(EMAIL_TRANSPORT='resend', RESEND_API_KEY='re_sentinel'), \
-                mock.patch('pythagoras.mail.resend.ResendTransport._send',
-                           return_value=SendResult.accepted('provider-id-1')) as send:
+        seen = {}
+
+        def fake_send(transport, msg, deadline):
+            seen['timeout'] = transport._timeout
+            return SendResult.accepted('provider-id-1')
+
+        with override_settings(EMAIL_TRANSPORT='resend', RESEND_API_KEY='re_sentinel',
+                               RESEND_TIMEOUT_SECONDS=30, WELCOME_EMAIL_TIMEOUT_SECONDS=10,
+                               EMAIL_IDEMPOTENCY_NAMESPACE='staging'), \
+                mock.patch('pythagoras.mail.resend.ResendTransport._send', autospec=True,
+                           side_effect=fake_send) as send:
             result = EmailService.send_welcome_email(user)
         self.assertEqual(result, SendResult.accepted('provider-id-1'))
-        self.assertEqual(send.call_args.args[0].idempotency_key, f'welcome/{user.pk}/v1')
+        self.assertEqual(send.call_args.args[1].idempotency_key, f'staging/welcome/{user.pk}/v1')
+        self.assertEqual(seen['timeout'], 10)
