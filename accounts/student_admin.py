@@ -33,18 +33,28 @@ def lock_status_scope(target_pk):
     return next((row for row in rows if row.pk == target_pk), None)
 
 
-def assert_status_change_allowed(target, actor, make_active):
-    """Raise a 409 APIError if the change would deactivate the acting admin or
-    the last active product admin. Call with rows locked by lock_status_scope."""
-    if make_active or not target.is_active:
+SELF_DEMOTION = "SELF_DEMOTION"
+
+
+def assert_status_change_allowed(target, actor, make_active, new_role=None):
+    """Raise a 409 APIError if the change would deactivate the acting admin, demote
+    the acting admin, or remove the last active product admin (by deactivation or
+    by changing its role). ``target`` is the locked, currently stored row; call
+    with rows locked by lock_status_scope."""
+    demoting = new_role is not None and new_role != User.Role.ADMIN
+    if not target.is_active:
         return
-    if actor is not None and target.pk == actor.pk:
+    if not make_active and actor is not None and target.pk == actor.pk:
         raise APIError(SELF_DEACTIVATION, "You cannot deactivate your own account.", status_code=409)
-    if target.role == User.Role.ADMIN:
+    if demoting and target.role == User.Role.ADMIN and actor is not None and target.pk == actor.pk:
+        raise APIError(SELF_DEMOTION, "You cannot remove your own administrator role.", status_code=409)
+    leaving = target.role == User.Role.ADMIN and (not make_active or demoting)
+    if leaving:
         others = User.objects.filter(role=User.Role.ADMIN, is_active=True).exclude(pk=target.pk)
         if not others.exists():
             raise APIError(
-                LAST_ADMIN, "The last active administrator cannot be deactivated.", status_code=409
+                LAST_ADMIN, "The last active administrator cannot be deactivated or demoted.",
+                status_code=409,
             )
 
 

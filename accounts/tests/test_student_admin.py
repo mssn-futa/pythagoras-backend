@@ -362,20 +362,39 @@ class StatusConcurrencyTests(StudentAdminBase, TransactionTestCase):
         self.assertTrue(self.admin.is_active)
 
     def test_concurrent_student_status_patches_via_api_stay_consistent(self):
+        from django.db.models.signals import post_save
+
         student = self.student(1)
         access = self.tokens("admin@example.test")["access"]
+        saves, saves_lock, results = [], threading.Lock(), []
 
-        def patch(value):
+        def record(sender, instance, **kwargs):
+            # Runs inside the PATCH transaction while the student row is locked,
+            # so this order is exactly the commit order of the writers.
+            if instance.pk == student.pk:
+                with saves_lock:
+                    saves.append((instance.last_name, instance.is_active))
+
+        post_save.connect(record, sender=User)
+        self.addCleanup(post_save.disconnect, record, sender=User)
+
+        def patch(i):
             def job():
                 client = APIClient()
                 client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
-                response = client.patch(detail(student.pk), {"is_active": value}, format="json")
-                assert response.status_code == 200, response.content
+                response = client.patch(
+                    detail(student.pk), {"is_active": i % 2 == 0, "last_name": f"W{i}"},
+                    format="json")
+                results.append(response.status_code)
             return job
 
-        self.run_threads([patch(i % 2 == 0) for i in range(self.workers)])
+        self.run_threads([patch(i) for i in range(self.workers)])
+        self.assertEqual(results, [200] * self.workers)
+        self.assertEqual(len(saves), self.workers)
+        self.assertEqual(sorted(name for name, _ in saves), sorted(f"W{i}" for i in range(self.workers)))
         student.refresh_from_db()
-        self.assertIn(student.is_active, (True, False))
+        # No lost or torn update: the stored row is exactly the last committed write.
+        self.assertEqual((student.last_name, student.is_active), saves[-1])
         self.assertEqual(User.objects.filter(role="admin", is_active=True).count(), 2)
 
     def test_concurrent_identity_collision_is_field_error_not_500(self):
@@ -401,3 +420,78 @@ class StatusConcurrencyTests(StudentAdminBase, TransactionTestCase):
         for t in threads:
             t.join(30)
         self.assertEqual(sorted(statuses), [200, 400])
+
+
+class DjangoAdminRetentionTests(StudentAdminBase, TestCase):
+    """The Django admin change view uses the same admin-retention protection."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin.is_staff = self.admin.is_superuser = True
+        self.admin.save()
+        self.client.force_login(self.admin)
+
+    def post_change(self, user, **overrides):
+        from django import forms as dj_forms
+        url = f"/admin/accounts/customuser/{user.pk}/change/"
+        form = self.client.get(url).context["adminform"].form
+        data = {}
+        for name, field in form.fields.items():
+            value = form.initial.get(name)
+            if isinstance(field, dj_forms.SplitDateTimeField):
+                data[f"{name}_0"] = value.strftime("%Y-%m-%d") if value else ""
+                data[f"{name}_1"] = value.strftime("%H:%M:%S") if value else ""
+            elif isinstance(field, dj_forms.ModelMultipleChoiceField):
+                data[name] = [obj.pk for obj in value or []]
+            elif isinstance(field, dj_forms.BooleanField):
+                if value:
+                    data[name] = "on"
+            elif value is not None:
+                data[name] = value
+        for key, value in overrides.items():
+            if value is False:
+                data.pop(key, None)
+            else:
+                data[key] = "on" if value is True else value
+        return self.client.post(url, data)
+
+    def assert_refused(self, response, user, message):
+        self.assertEqual(response.status_code, 200, "form is redisplayed with an error")
+        self.assertContains(response, message)
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+        self.assertEqual(user.role, "admin")
+
+    def test_self_deactivation_and_self_demotion_refused(self):
+        self.assert_refused(self.post_change(self.admin, is_active=False), self.admin,
+                            "cannot deactivate your own account")
+        self.assert_refused(self.post_change(self.admin, role="student"), self.admin,
+                            "cannot remove your own administrator role")
+
+    def test_last_active_admin_cannot_be_deactivated_or_demoted(self):
+        self.other_admin.is_active = False
+        self.other_admin.save()
+        other = make_user("peer@example.test", role="admin")
+        # Deactivate/demote the only other active admin while self remains: allowed once...
+        ok = self.post_change(other, is_active=False)
+        self.assertEqual(ok.status_code, 302)
+        # ...but now `admin` is the last active admin; a different (inactive) staff
+        # superuser acting on it is refused too.
+        actor = make_user("root@example.test", role="student", is_staff=True, is_superuser=True)
+        self.client.force_login(actor)
+        self.assert_refused(self.post_change(self.admin, is_active=False), self.admin,
+                            "last active administrator")
+        self.assert_refused(self.post_change(self.admin, role="student"), self.admin,
+                            "last active administrator")
+
+    def test_allowed_changes_still_work(self):
+        response = self.post_change(self.other_admin, role="student")
+        self.assertEqual(response.status_code, 302)
+        self.other_admin.refresh_from_db()
+        self.assertEqual(self.other_admin.role, "student")
+        student = self.student(1)
+        self.assertEqual(self.post_change(student, is_active=False).status_code, 302)
+        student.refresh_from_db()
+        self.assertFalse(student.is_active)
+        self.assertEqual(self.post_change(student, first_name="Renamed").status_code, 302)
+        self.assertEqual(self.post_change(self.admin, first_name="Ada2").status_code, 302)

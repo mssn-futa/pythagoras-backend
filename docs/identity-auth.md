@@ -130,7 +130,9 @@ tokens get 403, refresh fails 403).
 and all active admin rows are locked (`select_for_update`, pk order) and a
 change that would deactivate the acting admin (409 `SELF_DEACTIVATION`) or the
 last active admin (409 `LAST_ADMIN`) is refused. Use them for any future
-operation that can change an admin's status.
+operation that can change an admin's status. The Django admin user change form
+uses the same protection (also for `role` changes, plus 409-equivalent
+`SELF_DEMOTION`), showing a form error instead of saving.
 
 ## Shared permissions for domain apps
 

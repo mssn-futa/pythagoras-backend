@@ -16,6 +16,12 @@ class CustomUserAdmin(UserAdmin):
     form = CustomUserChangeForm
     model = CustomUser
 
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if obj is None:
+            return form
+        return type(form.__name__, (form,), {"actor": request.user})
+
     list_display = (
         "email",
         "first_name",
