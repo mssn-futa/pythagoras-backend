@@ -20,9 +20,14 @@ Raises ``quiz.errors`` (``QuizImmutable``, ``AuthoringInvalid``) or
 ``Question.DoesNotExist``/``Quiz.DoesNotExist``. No HTTP imports.
 """
 from django.db import transaction
+from django.db.models import Max
 
 from .errors import AuthoringInvalid
 from .models import Option, Question, Quiz, assert_content_editable
+
+# Authoring limit for question/option ``order`` (D3 engineering limit; far
+# below the integer column so an appended order can never overflow it).
+MAX_ORDER = 10000
 
 QUESTION_FIELDS = ('type', 'text', 'points', 'order')
 OPTION_FIELDS = ('text', 'is_correct', 'order')
@@ -50,7 +55,16 @@ def create_question(quiz_id, data):
         assert_content_editable(quiz_id)
         if not Quiz.objects.filter(pk=quiz_id).exists():
             raise Quiz.DoesNotExist()
-        _check_question_order(quiz_id, data.get('order'))
+        if data.get('order') is None:
+            # Appended under the quiz lock, so the next order is stable.
+            last = Question.objects.filter(quiz_id=quiz_id).aggregate(last=Max('order'))['last']
+            data['order'] = (last or 0) + 1
+            if data['order'] > MAX_ORDER:
+                raise AuthoringInvalid(fields={'order': [
+                    f'The quiz already uses question order {MAX_ORDER}; set an order '
+                    f'between 1 and {MAX_ORDER} that is free.']})
+        else:
+            _check_question_order(quiz_id, data['order'])
         question = Question.objects.create(
             quiz_id=quiz_id, **{name: data[name] for name in QUESTION_FIELDS if name in data})
         Option.objects.bulk_create(
@@ -122,15 +136,22 @@ def publication_fields(errors):
     """``publication_errors`` output as flat dotted field paths for the D0 envelope.
 
     ``{'questions': ['A quiz needs...', {'10': ['...']}]}`` becomes
-    ``{'questions': ['A quiz needs...'], 'questions.10': ['...']}``; every value
-    is a list of strings.
+    ``{'questions': ['A quiz needs...'], 'questions.10': ['Question 2: ...']}``
+    (the prefix is the question's persisted order, what the admin sees); every
+    value is a list of strings.
     """
+    question_ids = [int(key) for messages in errors.values() for message in messages
+                    if isinstance(message, dict) for key in message if str(key).isdigit()]
+    orders = dict(Question.objects.filter(pk__in=question_ids).values_list('pk', 'order'))
     fields = {}
     for name, messages in errors.items():
         for message in messages:
             if isinstance(message, dict):
                 for key, nested in message.items():
-                    fields.setdefault(f'{name}.{key}', []).extend(str(m) for m in nested)
+                    order = orders.get(int(key)) if str(key).isdigit() else None
+                    prefix = f'Question {order}: ' if order is not None else ''
+                    fields.setdefault(f'{name}.{key}', []).extend(
+                        f'{prefix}{m}' for m in nested)
             else:
                 fields.setdefault(name, []).append(str(message))
     return fields

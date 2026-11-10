@@ -166,7 +166,7 @@ PUBLISH_INVALID_EXAMPLE = OpenApiExample(
     'Not publishable', response_only=True, status_codes=['400'],
     value=error('VALIDATION_ERROR', 'Correct the highlighted fields.', {
         'deadline': ['The deadline must be in the future.'],
-        'questions.10': ['Exactly 4 options are required.']}))
+        'questions.10': ['Question 1: Exactly 4 options are required.']}))
 TRANSITION_EXAMPLE = OpenApiExample(
     'Not a draft', response_only=True, status_codes=['409'],
     value=error('INVALID_TRANSITION', 'Only a draft quiz can be published.'))
@@ -322,7 +322,7 @@ class QuizDetail(AdminOrReadView):
 
 QUESTION_RULES = (
     'Body: `type` ("mcq", default), `text`, `points` (positive integer, default 1), `order` '
-    '(optional, unique in the quiz; omitted = appended) and `options`: exactly four '
+    '(optional, 1-10000, unique in the quiz; omitted = appended) and `options`: exactly four '
     '`{text, order, is_correct}` objects (no IDs) with non-empty texts distinct after trim + '
     'whitespace collapse + casefold, exactly one `is_correct: true`, unique option orders '
     '(omitted ones fill free positions). Only while the quiz is content-editable (a draft '

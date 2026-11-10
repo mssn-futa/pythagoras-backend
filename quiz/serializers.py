@@ -24,6 +24,7 @@ from rest_framework import serializers
 
 from dawah.models import Event
 
+from .authoring import MAX_ORDER
 from .lifecycle import OPTIONS_PER_QUESTION, assert_quiz_changes_allowed, normalized_text
 from .models import (
     MAX_TIME_LIMIT, MIN_TIME_LIMIT, Attempt, Course, Enrollment, Option, Question, Quiz,
@@ -45,9 +46,8 @@ class RejectUnknownFieldsMixin:
         return super().to_internal_value(data)
 
 
-# PostgreSQL limits of Question.points (smallint) and the order columns (integer).
+# PostgreSQL limit of Question.points (smallint).
 MAX_QUESTION_POINTS = 32767
-MAX_ORDER = 2147483647
 
 
 def _ordered(queryset):
@@ -94,6 +94,15 @@ class StrictIntegerField(serializers.IntegerField):
 
     def to_internal_value(self, data):
         if type(data) is not int:
+            self.fail('invalid')
+        return super().to_internal_value(data)
+
+
+class StrictCharField(serializers.CharField):
+    """JSON string only: rejects numbers and booleans DRF would coerce to text."""
+
+    def to_internal_value(self, data):
+        if type(data) is not str:
             self.fail('invalid')
         return super().to_internal_value(data)
 
@@ -159,7 +168,7 @@ class ReleaseQuestionTypeField(serializers.ChoiceField):
 
 class AuthoringOptionSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
     """One option of the D3 question body. Option IDs are never accepted."""
-    text = serializers.CharField(max_length=250)
+    text = StrictCharField(max_length=250)
     is_correct = StrictBooleanField(required=False, default=False)
     order = StrictIntegerField(required=False, min_value=1, max_value=MAX_ORDER)
 
@@ -182,7 +191,7 @@ class AdminQuestionWriteSerializer(RejectUnknownFieldsMixin, serializers.Seriali
     """
     quiz = StrictPrimaryKeyRelatedField(queryset=Quiz.objects.all(), required=False)
     type = ReleaseQuestionTypeField()
-    text = serializers.CharField()
+    text = StrictCharField()
     points = StrictIntegerField(required=False, min_value=1, max_value=MAX_QUESTION_POINTS)
     order = StrictIntegerField(required=False, min_value=1, max_value=MAX_ORDER)
     options = AuthoringOptionSerializer(many=True, required=False)
@@ -311,9 +320,9 @@ class AdminQuizWriteSerializer(RejectUnknownFieldsMixin, serializers.ModelSerial
     """
     ECHO_FIELDS = ('status', 'is_active')
 
-    title = serializers.CharField(max_length=250)
-    description = serializers.CharField(max_length=250, required=False, allow_blank=True)
-    type = serializers.CharField(max_length=250, required=False)
+    title = StrictCharField(max_length=250)
+    description = StrictCharField(max_length=250, required=False, allow_blank=True)
+    type = StrictCharField(max_length=250, required=False)
     time_limit = StrictIntegerField(required=False, allow_null=True, min_value=MIN_TIME_LIMIT,
                                     max_value=MAX_TIME_LIMIT)
     deadline = serializers.DateTimeField(required=False, allow_null=True)

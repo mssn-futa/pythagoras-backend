@@ -106,6 +106,10 @@ class QuizDraftAPITests(AuthoringTestCase):
             'string event': ({'related_event': str(event.pk)}, 'related_event'),
             'boolean event': ({'related_event': True}, 'related_event'),
             'unknown key': ({'questions': []}, 'questions'),
+            'numeric title': ({'title': 12345}, 'title'),
+            'boolean title': ({'title': True}, 'title'),
+            'numeric description': ({'description': 7}, 'description'),
+            'numeric type': ({'type': 1}, 'type'),
             'read-only key': ({'published_at': iso(future())}, 'published_at'),
             'id key': ({'id': 5}, 'id'),
             'status change': ({'status': 'published'}, 'status'),
@@ -149,6 +153,8 @@ class QuizDraftAPITests(AuthoringTestCase):
                                               'related_event': None})
         self.assertEqual(response.status_code, 200, response.content)
         self.assertFields(self.as_admin('patch', path, {'title': ''}), 'title')
+        self.assertFields(self.as_admin('patch', path, {'description': 5}), 'description')
+        self.assertEqual(Quiz.objects.get(pk=data['id']).description, 'New')
         self.assertFields(self.as_admin('patch', path, {'status': 'closed'}), 'status')
         self.assertFields(self.as_admin('patch', path, {'questions': []}), 'questions')
 
@@ -251,6 +257,43 @@ class QuestionAuthoringAPITests(AuthoringTestCase):
             with self.subTest(name):
                 self.assertFields(self.as_admin('post', self.path, body), path)
         self.assertEqual((Question.objects.count(), Option.objects.count()), before)
+
+    def test_appended_order_cannot_overflow(self):
+        self.add_question(self.quiz_id, order=10000)
+        body = question_body(text='Appended')
+        body.pop('order')
+        fields = self.assertFields(self.as_admin('post', self.path, body), 'order')
+        self.assertIn('10000', fields['order'][0])
+        self.assertFields(self.as_admin('post', self.path, question_body(order=10001)), 'order')
+        self.assertFields(self.as_admin('post', self.path, question_body(
+            order=2, options=[{**option_bodies()[0], 'order': 10001}, *option_bodies()[1:]])),
+            'options.0.order')
+        # A stored order beyond the authoring limit (raw/legacy data) is still a 400, not a 500.
+        Question.objects.filter(quiz_id=self.quiz_id, order=10000).update(order=2147483647)
+        self.assertFields(self.as_admin('post', self.path, body), 'order')
+        self.assertEqual(Question.objects.filter(quiz_id=self.quiz_id).count(), 1)
+        Question.objects.filter(quiz_id=self.quiz_id).update(order=9999)
+        response = self.as_admin('post', self.path, body)
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()['data']['order'], 10000)
+
+    def test_text_fields_must_be_json_strings(self):
+        for name, change, path in (
+                ('numeric text', {'text': 123}, 'text'),
+                ('boolean text', {'text': True}, 'text'),
+                ('list text', {'text': ['Q']}, 'text'),
+                ('numeric option', {'options': option_bodies(texts=[1, 2, 3, 4])},
+                 'options.0.text'),
+                ('boolean option', {'options': [{**option_bodies()[0], 'text': False},
+                                                *option_bodies()[1:]]}, 'options.0.text')):
+            with self.subTest(name):
+                fields = self.assertFields(self.as_admin('post', self.path, question_body(**change)),
+                                           path)
+                self.assertEqual(fields[path], ['Not a valid string.'])
+        created = self.add_question(self.quiz_id)
+        self.assertFields(self.as_admin('patch', f"/quiz/question/{created['id']}/", {'text': 7}),
+                          'text')
+        self.assertEqual(Question.objects.filter(quiz_id=self.quiz_id).count(), 1)
 
     def test_patch_replaces_options_and_keeps_ids_by_position(self):
         created = self.add_question(self.quiz_id)
@@ -440,7 +483,15 @@ class PublicationAPITests(AuthoringTestCase):
             Option.objects.create(question=three, text=text, is_correct=index == 0)
         fields = self.assertFields(self.as_admin('post', f'/quiz/quizzes/{broken}/publish/'),
                                    f'questions.{legacy.pk}', f'questions.{three.pk}')
-        self.assertIn('Exactly 4 options are required.', fields[f'questions.{three.pk}'])
+        three.refresh_from_db()
+        legacy.refresh_from_db()
+        self.assertIn(f'Question {three.order}: Exactly 4 options are required.',
+                      fields[f'questions.{three.pk}'])
+        self.assertIn(f'Question {legacy.order}: Only multiple-choice questions can be published.',
+                      fields[f'questions.{legacy.pk}'])
+        self.assertTrue(all(message.startswith('Question ')
+                            for path, messages in fields.items() if path.startswith('questions.')
+                            for message in messages), fields)
         self.assertEqual(Quiz.objects.filter(status='draft', pk__in=[empty, past, broken]).count(),
                          3)
 

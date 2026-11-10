@@ -45,7 +45,8 @@ the same serializers, locks and services, so none bypasses a rule.
 Unknown keys are rejected at every level with 400
 `"<key>": ["This field cannot be set or changed here."]` (for example `id`,
 `questions`, `published_at`, an option `id`). Numbers and booleans must be JSON
-integers/booleans (`"30"`, `30.0`, `true` for an integer are rejected).
+integers/booleans/strings (`"30"`, `30.0`, `true` for an integer, or `123` for a
+text field are rejected; text fields answer `Not a valid string.`).
 
 Quiz (create/PATCH):
 
@@ -66,11 +67,12 @@ Question (create/PATCH), the D3 body without option IDs:
 ```
 
 - `type` only `mcq` (default). `text` non-empty. `points` integer 1-32767, default 1.
-- `order` optional positive integer, unique within the quiz (400 `order`); omitted = appended.
+- `order` optional integer 1-10000, unique within the quiz (400 `order`); omitted =
+  appended (max + 1, computed under the quiz lock; 400 `order` if that would exceed 10000).
 - `options` (required on create): exactly four, non-empty texts (max 250),
   distinct after trim + collapse internal whitespace + casefold, exactly one
-  `is_correct: true` (default false), unique option orders (omitted ones fill
-  free positions).
+  `is_correct: true` (default false), unique option orders 1-10000 (omitted ones
+  fill free positions).
 - PATCH replaces the option set when `options` is sent; persisted option IDs
   are kept by position (n-th option by order keeps the n-th existing row).
   A question never moves between quizzes. Legacy text/multi questions cannot be
@@ -91,10 +93,11 @@ paths with lists of strings (the admin UI joins them):
 Option-set rules (count, single correct, distinct, unique orders) are reported
 under `options` once every option is individually valid. Publication errors use
 `time_limit`, `deadline`, `questions` (empty quiz), `questions.<question id>`
-and `total_points`:
+and `total_points`; each `questions.<id>` message is prefixed with the
+question's persisted order (`Question <order>: ...`):
 
 ```json
-{"success":false,"data":{"code":"VALIDATION_ERROR","fields":{"deadline":["The deadline must be in the future."],"questions.10":["Exactly 4 options are required."]}},"message":"Correct the highlighted fields."}
+{"success":false,"data":{"code":"VALIDATION_ERROR","fields":{"deadline":["The deadline must be in the future."],"questions.10":["Question 1: Exactly 4 options are required."]}},"message":"Correct the highlighted fields."}
 ```
 
 Conflicts (409):
