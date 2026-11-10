@@ -5,12 +5,18 @@ assigning ``permission_classes`` inside a handler), and every object lookup goes
 through a role-aware queryset from ``quiz.permissions`` before any serializer
 or mutation runs. Student responses use only ``Student*`` serializers.
 
-Temporary legacy behaviour (until ASSESS-02/03/04): quiz availability is the
-``is_active`` flag, and ``POST /quiz/submissions/`` grades an MCQ answer map
-directly instead of an attempt. It is limited to one submission per student
-and quiz; an identical replay returns the saved result.
+ASSESS-02: student availability is ``published`` with a future deadline.
+Quiz/question writes are draft authoring only; published content returns 409
+``QUIZ_IMMUTABLE`` (title/description corrections excepted). Temporary until
+ASSESS-04: ``POST /quiz/submissions/`` grades an MCQ answer map directly,
+creating and finalizing the student's single attempt in one step; one
+submission per student and quiz, and an identical replay returns the saved
+result.
 """
-from django.db import transaction
+from contextlib import contextmanager
+
+from django.db import IntegrityError, transaction
+from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import PolymorphicProxySerializer, extend_schema
 from rest_framework import serializers, status
@@ -29,7 +35,30 @@ from quiz.serializers import (
     QuizListSerializer, StudentQuestionSerializer, StudentQuizSerializer,
     StudentSubmissionSerializer, SubmissionCreateSerializer,
 )
-from quiz.services import InvalidAnswers, QuizService, SubmissionConflict
+from quiz import lifecycle
+from quiz.errors import AssessmentError, PublicationInvalid, QuizImmutable, is_immutable_db_error
+from quiz.services import InvalidAnswers, QuizService
+
+
+@contextmanager
+def domain_errors():
+    """Translate ``quiz.errors`` domain errors into the shared D0 error envelope."""
+    try:
+        yield
+    except PublicationInvalid as exc:
+        raise serializers.ValidationError(exc.fields or {'non_field_errors': [exc.message]})
+    except AssessmentError as exc:
+        raise APIError(exc.code, exc.message, fields=exc.fields)
+    except InvalidAnswers as exc:
+        raise serializers.ValidationError(exc.as_fields())
+    except ProtectedError:
+        raise APIError('RESOURCE_REFERENCED',
+                       'This record is referenced by assessment history and cannot be deleted.')
+    except IntegrityError as exc:
+        # A quiz.0007 trigger refusal (a path the Python guards did not cover).
+        if is_immutable_db_error(exc):
+            raise APIError(QuizImmutable.code, QuizImmutable.default_message)
+        raise
 
 
 def role_specific(name, admin, student):
@@ -71,7 +100,8 @@ class QuizList(AdminOrReadView):
 
     @extend_schema(
         responses={200: QuizListSerializer(many=True)},
-        description="Admins list every quiz; students list active quizzes."
+        description="Admins list every quiz; students list published quizzes whose "
+                    "deadline has not passed."
     )
     def get(self, request):
         queryset = visible_quizzes(request.user).select_related(
@@ -87,7 +117,8 @@ class QuizList(AdminOrReadView):
     def post(self, request):
         serializer = AdminQuizSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        with domain_errors():
+            serializer.save()
         return success_response(serializer.data, "Quiz Created Successfully",
                                 status=status.HTTP_201_CREATED)
 
@@ -99,8 +130,9 @@ class QuizDetail(AdminOrReadView):
 
     @extend_schema(
         responses={200: role_specific('QuizDetail', AdminQuizSerializer, StudentQuizSerializer)},
-        description='Retrieve a quiz. Admins receive answer keys; students receive an active '
-                    'quiz with MCQ questions and options only, never keys.'
+        description='Retrieve a quiz. Admins receive answer keys; students receive an available '
+                    '(published, before deadline) quiz with MCQ questions and options only, '
+                    'never keys.'
     )
     def get(self, request, quiz_id):
         quiz = self.get_quiz(quiz_id)
@@ -110,27 +142,29 @@ class QuizDetail(AdminOrReadView):
     @extend_schema(
         request=AdminQuizSerializer,
         responses={200: AdminQuizSerializer},
-        description='Update an existing Quiz (admin only).'
+        description='Update a quiz (admin only). A draft accepts every authoring field; a '
+                    'published or closed quiz only title/description (other changes are 409 '
+                    'QUIZ_IMMUTABLE). status/is_active change only through publish/close.'
     )
     def put(self, request, quiz_id):
-        quiz = self.get_quiz(quiz_id)
-        serializer = AdminQuizSerializer(quiz, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        with transaction.atomic(), domain_errors():
+            quiz = get_object_or_404(visible_quizzes(request.user).select_for_update(),
+                                     pk=quiz_id)
+            serializer = AdminQuizSerializer(quiz, data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         return success_response(serializer.data, "Quiz Updated Successfully")
 
     @extend_schema(
         responses={204: None},
-        description="Delete a quiz without submissions (admin only). A quiz with "
-                    "submissions returns 409 RESOURCE_REFERENCED so results are never cascaded."
+        description="Delete a draft quiz without attempts or submissions (admin only). A quiz "
+                    "with attempts/submissions returns 409 RESOURCE_REFERENCED so results are "
+                    "never cascaded; a published/closed quiz returns 409 QUIZ_IMMUTABLE."
     )
     def delete(self, request, quiz_id):
-        with transaction.atomic():
-            quiz = get_object_or_404(visible_quizzes(request.user).select_for_update(), pk=quiz_id)
-            if Submission.objects.filter(quiz=quiz).exists():
-                raise APIError('RESOURCE_REFERENCED',
-                               'This quiz has submissions and cannot be deleted.')
-            quiz.delete()
+        quiz = self.get_quiz(quiz_id)
+        with domain_errors():
+            lifecycle.delete_draft_quiz(quiz.pk)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -151,12 +185,13 @@ class QuestionList(APIView):
     @extend_schema(
         request=AdminQuestionWriteSerializer,
         responses={201: AdminQuestionSerializer},
-        description="Create an MCQ question with options (admin only)."
+        description="Create an MCQ question with options in a draft quiz (admin only). "
+                    "A published/closed quiz returns 409 QUIZ_IMMUTABLE."
     )
     def post(self, request):
         serializer = AdminQuestionWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
+        with transaction.atomic(), domain_errors():
             serializer.save()
         return success_response(serializer.data, "Question Created Successfully",
                                 status=status.HTTP_201_CREATED)
@@ -182,22 +217,25 @@ class QuestionDetail(AdminOrReadView):
     @extend_schema(
         request=AdminQuestionWriteSerializer,
         responses={200: AdminQuestionSerializer},
-        description='Replace an existing question and its options (admin only).'
+        description='Replace a draft question and its options (admin only). A question of a '
+                    'published/closed quiz returns 409 QUIZ_IMMUTABLE.'
     )
     def put(self, request, question_id):
         question = self.get_question(question_id)
         serializer = AdminQuestionWriteSerializer(question, data=request.data)
         serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
+        with transaction.atomic(), domain_errors():
             serializer.save()
         return success_response(serializer.data, "Question Updated Successfully")
 
     @extend_schema(
         responses={204: None},
-        description="Delete a Question (admin only)."
+        description="Delete a draft question (admin only); 409 QUIZ_IMMUTABLE once published."
     )
     def delete(self, request, question_id):
-        self.get_question(question_id).delete()
+        question = self.get_question(question_id)
+        with transaction.atomic(), domain_errors():
+            question.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -240,7 +278,9 @@ class UserSubmissionView(APIView):
     @extend_schema(
         summary="Submit a Quiz (student only)",
         description=(
-            "Legacy submission of an active quiz, graded on the server. `answers` maps "
+            "Temporary direct submission of an available quiz (published, before its "
+            "deadline), graded on the server; it creates and finalizes the student's single "
+            "attempt. `answers` maps "
             "decimal question-ID strings to the selected option ID. The student and score "
             "come from the server; `student`, `score` and other keys are rejected. One "
             "submission per quiz: an identical replay returns 200 with the saved result, "
@@ -260,9 +300,12 @@ class UserSubmissionView(APIView):
             )
         except InvalidAnswers as exc:
             raise serializers.ValidationError(exc.as_fields())
-        except SubmissionConflict:
-            raise APIError('SUBMISSION_CONFLICT',
-                           'You have already submitted different answers for this quiz.')
+        except AssessmentError as exc:
+            # SUBMISSION_CONFLICT, or ATTEMPT_EXPIRED for an existing expired attempt.
+            message = exc.message
+            if exc.code == 'SUBMISSION_CONFLICT':
+                message = 'You have already submitted different answers for this quiz.'
+            raise APIError(exc.code, message)
         data = StudentSubmissionSerializer(submission).data
         if not created:
             return success_response(data, "Submission already saved.")

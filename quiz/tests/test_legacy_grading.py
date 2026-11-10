@@ -15,8 +15,11 @@ class TestQuizService(TestCase):
     """
 
     def setUp(self):
-        student = CustomUser.objects.create_user(
-            email="django@email.com", password="DjangoBoy!!"
+        # Legacy-shaped records are graded unsaved: new legacy rows cannot be
+        # stored (quiz.0007), and each belongs to its own student.
+        student, student2, student3 = (
+            CustomUser.objects.create_user(email=email, password=None)
+            for email in ("django@email.com", "django2@email.com", "django3@email.com")
         )
 
         event = Event.objects.create(
@@ -70,7 +73,7 @@ class TestQuizService(TestCase):
             is_correct=True,
         )
         # Submission 1
-        self.submission1 = Submission.objects.create(
+        self.submission1 = Submission(
             quiz=quiz,
             student=student,
             answers={
@@ -84,9 +87,9 @@ class TestQuizService(TestCase):
             score=0,
         )
         # Submission 2
-        self.submission2 = Submission.objects.create(
+        self.submission2 = Submission(
             quiz=quiz,
-            student=student,
+            student=student2,
             answers={
                 str(q1.id): "true",
                 str(q2.id): "runtime environment",
@@ -99,9 +102,9 @@ class TestQuizService(TestCase):
             score=0,
         )
         # Submission 3
-        self.submission3 = Submission.objects.create(
+        self.submission3 = Submission(
             quiz=quiz,
-            student=student,
+            student=student3,
             answers={
                 str(q1.id): "true",
                 str(q2.id): "web framework",

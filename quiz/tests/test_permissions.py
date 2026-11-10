@@ -22,8 +22,8 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
                 'options': [{'text': label, 'is_correct': label == 'A'} for label in 'ABCD']}
 
     def quiz_body(self):
-        return {'title': 'Changed', 'type': 'arabic', 'description': 'd', 'time_limit': 10,
-                'is_active': True}
+        # ASSESS-02: is_active/status are derived lifecycle state, not writable.
+        return {'title': 'Changed', 'type': 'arabic', 'description': 'd', 'time_limit': 10}
 
     def submit_body(self):
         question, correct, _ = self.questions[0]
@@ -174,11 +174,13 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
         for path in self.detail_paths('/quiz/quizzes/', created_quiz):
             response = self.call(self.admin, 'put', path, self.quiz_body())
             self.assertEqual(response.status_code, 200, response.content)
-        response = self.call(self.admin, 'post', '/quiz/question/', self.question_body())
+        # Questions are authored in a draft quiz (the fixture quiz is published).
+        question_body = {**self.question_body(), 'quiz': created_quiz}
+        response = self.call(self.admin, 'post', '/quiz/question/', question_body)
         self.assertEqual(response.status_code, 201, response.content)
         created_question = response.json()['data']['id']
         for path in self.detail_paths('/quiz/question/', created_question):
-            response = self.call(self.admin, 'put', path, self.question_body())
+            response = self.call(self.admin, 'put', path, question_body)
             self.assertEqual(response.status_code, 200, response.content)
         response = self.call(self.admin, 'delete', f'/quiz/question/{created_question}')
         self.assertEqual(response.status_code, 204)
