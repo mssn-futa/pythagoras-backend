@@ -12,12 +12,15 @@ from rest_framework.permissions import SAFE_METHODS, AllowAny
 from accounts.permissions import IsActiveAdmin
 from pythagoras.utils import success_response
 
-from . import examples, filters, services
+from . import examples, filters, services, uploads
+from .media import MP3_CONTENT_TYPE, MP3_MAX_BYTES
 from .models import Event, EventResource, PublicationStatus
 from .serializers import (
-    EventDetailSerializer, EventResourceSerializer, EventResourceWriteSerializer, EventSerializer,
-    EventWriteSerializer,
+    AudioUploadIntentSerializer, EventDetailSerializer, EventResourceSerializer, EventResourceWriteSerializer,
+    EventSerializer, EventWriteSerializer, FinalizeResponseSerializer, UploadIntentResponseSerializer,
+    upload_state,
 )
+from .throttles import UploadIntentRateThrottle
 
 
 def reader_is_admin(request):
@@ -262,9 +265,11 @@ class EventResourcePublishView(DawahView):
 
     @extend_schema(operation_id='dawah_event_resources_publish', request=None,
                    responses={200: EventResourceSerializer},
-                   description='Admin: publish a resource of a published event. 409 EVENT_NOT_PUBLISHED, '
-                               'MEDIA_NOT_READY (no ready asset / validated video reference), '
-                               'INVALID_STATE_TRANSITION.')
+                   description='Admin: publish a resource of a published event. Uploaded audio is first copied '
+                               '(at its validated ETag) to a new unique public key; `media_url` is its canonical '
+                               'custom-domain URL. 409 EVENT_NOT_PUBLISHED, MEDIA_NOT_READY (no ready asset / '
+                               'validated video reference), MEDIA_CHANGED, INVALID_STATE_TRANSITION; '
+                               '503 PROVIDER_UNAVAILABLE (provider failure; the resource stays unpublished).')
     def post(self, request, event_id, resource_id):
         resource = services.publish_resource(event_id, resource_id)
         return self.respond(resource, EventResourceSerializer, 'Resource published.')
@@ -275,7 +280,9 @@ class EventResourceUnpublishView(DawahView):
 
     @extend_schema(operation_id='dawah_event_resources_unpublish', request=None,
                    responses={200: EventResourceSerializer},
-                   description='Admin: published → unpublished. 409 INVALID_STATE_TRANSITION.')
+                   description='Admin: published → unpublished. Hidden immediately; the public copy is '
+                               'recorded for deletion (already shared/cached bytes cannot be recalled). '
+                               '409 INVALID_STATE_TRANSITION.')
     def post(self, request, event_id, resource_id):
         resource = services.unpublish_resource(event_id, resource_id)
         return self.respond(resource, EventResourceSerializer, 'Resource unpublished.')
@@ -318,3 +325,74 @@ class ArchiveView(DawahView):
         queryset = filters.apply_content_filters(queryset, content, prefix='event__', search_resource_title=True)
         return self.paginated(queryset.order_by('-event__start_time', '-id'), EventResourceSerializer,
                               'Archive retrieved.')
+
+
+# ---------------------------------------------------------------- uploads
+
+class AdminOnlyView(DawahView):
+    def get_permissions(self):
+        return [IsActiveAdmin()]
+
+
+class AudioUploadIntentView(AdminOnlyView):
+    serializer_class = AudioUploadIntentSerializer
+    throttle_classes = [UploadIntentRateThrottle]
+
+    @extend_schema(
+        operation_id='dawah_event_resources_audio_intent',
+        request=AudioUploadIntentSerializer,
+        responses={201: UploadIntentResponseSerializer},
+        description='Admin: request a direct-to-storage upload for an audio resource (metadata only, no bytes). '
+                    'Only `audio/mpeg`, `.mp3`, 1 byte to 100 MiB. Returns a short-lived signed PUT URL on the '
+                    'R2 S3 API host: PUT the bytes with exactly the returned `headers` and **no** Authorization '
+                    'header or cookies, then call finalize. A new intent replaces earlier unfinished intents of '
+                    'the resource. 409 RESOURCE_TYPE_MISMATCH, UNPUBLISH_REQUIRED (published resource); '
+                    '429 THROTTLED (5/min per admin); 503 PROVIDER_UNAVAILABLE.',
+        examples=[OpenApiExample('Intent', request_only=True, value=examples.UPLOAD_INTENT_REQUEST),
+                  OpenApiExample('Issued', response_only=True, status_codes=['201'],
+                                 value=examples.UPLOAD_INTENT_RESPONSE)],
+    )
+    def post(self, request, event_id, resource_id):
+        get_object_or_404(EventResource, pk=resource_id, event_id=event_id)  # 404 before field validation
+        serializer = AudioUploadIntentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        intent, upload_url = uploads.create_audio_intent(event_id, resource_id, serializer.validated_data,
+                                                         request.user)
+        data = {
+            'upload_id': intent.pk, 'resource_id': intent.resource_id, 'method': 'PUT',
+            'upload_url': upload_url, 'headers': {'Content-Type': MP3_CONTENT_TYPE},
+            'expires_at': upload_state(intent)['expires_at'], 'max_size_bytes': MP3_MAX_BYTES,
+        }
+        return success_response(data, 'Upload ready. Send the file to upload_url, then finalize.', status=201)
+
+
+FINALIZE_MESSAGES = {
+    'ready': 'Upload validated. The audio is ready to publish.',
+    'rejected': 'The uploaded file was rejected.',
+    'failed': 'The upload could not be attached.',
+    'expired': 'The upload expired before it was finalized.',
+}
+
+
+class UploadFinalizeView(AdminOnlyView):
+    serializer_class = FinalizeResponseSerializer
+
+    @extend_schema(
+        operation_id='dawah_uploads_finalize',
+        request=None,
+        responses={200: FinalizeResponseSerializer},
+        description='Admin (the intent owner only; others get 404): validate what storage actually holds. '
+                    'The server observes the staged object size/type/ETag, copies it at that ETag to a '
+                    'server-only key and validates the copy as MP3. 200 returns the outcome in `upload.status` '
+                    '(`ready`, `rejected`, `failed`, `expired`); a replay returns the saved outcome. '
+                    'Retryable: 409 UPLOAD_IN_PROGRESS (another validation holds the lease), UPLOAD_INCOMPLETE '
+                    '(no object yet), UPLOAD_CHANGED (overwritten during copy); 503 PROVIDER_UNAVAILABLE.',
+        examples=[OpenApiExample('Ready', response_only=True, value=examples.FINALIZE_READY)],
+    )
+    def post(self, request, upload_id):
+        result = uploads.finalize_upload(upload_id, request.user)
+        resource = EventResource.objects.select_related('event').get(pk=result.resource.pk)
+        resource_data = EventResourceSerializer(resource, context=self.get_serializer_context()).data
+        data = {'upload': upload_state(result.intent), 'resource': resource_data,
+                'preview_url': resource_data['preview_url']}
+        return success_response(data, FINALIZE_MESSAGES.get(result.intent.status, 'Upload state retrieved.'))

@@ -1,7 +1,8 @@
 """Publication state transitions and safe deletion (D2).
 
 Transitions lock rows with ``select_for_update`` inside a transaction. Lock
-order is always event, then resource.
+order is always event, then resource (then upload intent, see ``uploads``).
+Provider I/O (publication promotion, cleanup) never runs while rows are locked.
 """
 from django.db import transaction
 from django.db.models import ProtectedError, RestrictedError
@@ -10,6 +11,7 @@ from django.utils import timezone
 
 from pythagoras.utils import APIError
 
+from . import uploads
 from .models import Event, EventResource, PublicationStatus
 
 PUBLISHED = PublicationStatus.PUBLISHED
@@ -66,38 +68,79 @@ def _lock_resource(event_id, resource_id):
     return event, resource
 
 
+def _check_resource_publishable(event, resource):
+    if resource.status == PUBLISHED:
+        raise invalid_transition('resource', resource.status, 'published')
+    if event.status != PUBLISHED:
+        raise APIError('EVENT_NOT_PUBLISHED',
+                       'Publish the parent event before publishing its resources.',
+                       status_code=409)
+    if not resource.title.strip():
+        raise APIError('RESOURCE_NOT_PUBLISHABLE', 'Correct the resource details before publishing.',
+                       status_code=409, fields={'title': ['This field is required for publication.']})
+    if not resource.media_ready():
+        if resource.type == EventResource.Type.VIDEO:
+            message = 'A validated video reference is required before publishing.'
+        else:
+            message = 'A ready uploaded asset is required before publishing.'
+        raise APIError('MEDIA_NOT_READY', message, status_code=409)
+
+
 def publish_resource(event_id, resource_id):
+    """Check, promote the validated bytes to a new public key (no locks held),
+    then re-check and record visibility atomically. Any failure after the copy
+    leaves the resource unpublished and records the new public key for cleanup."""
     with transaction.atomic():
         event, resource = _lock_resource(event_id, resource_id)
-        if resource.status == PUBLISHED:
-            raise invalid_transition('resource', resource.status, 'published')
-        if event.status != PUBLISHED:
-            raise APIError('EVENT_NOT_PUBLISHED',
-                           'Publish the parent event before publishing its resources.',
-                           status_code=409)
-        if not resource.title.strip():
-            raise APIError('RESOURCE_NOT_PUBLISHABLE', 'Correct the resource details before publishing.',
-                           status_code=409, fields={'title': ['This field is required for publication.']})
-        if not resource.media_ready():
-            if resource.type == EventResource.Type.VIDEO:
-                message = 'A validated video reference is required before publishing.'
-            else:
-                message = 'A ready uploaded asset is required before publishing.'
-            raise APIError('MEDIA_NOT_READY', message, status_code=409)
-        resource.status = PUBLISHED
-        resource.published_at = timezone.now()
-        resource.save(update_fields=['status', 'published_at', 'updated_at'])
+        _check_resource_publishable(event, resource)
+        uploaded = resource.type in EventResource.UPLOADED_TYPES
+        asset = (resource.private_object_key, resource.etag)
+
+    public_key = public_url = ''
+    if uploaded:
+        public_key, public_url = uploads.promote_to_public(resource)
+
+    try:
+        with transaction.atomic():
+            event, resource = _lock_resource(event_id, resource_id)
+            _check_resource_publishable(event, resource)
+            if uploaded and (resource.private_object_key, resource.etag) != asset:
+                raise APIError('MEDIA_CHANGED', 'The audio changed while publishing. Try again.', status_code=409)
+            fields = ['status', 'published_at', 'updated_at']
+            if uploaded:
+                stale = resource.public_object_key
+                resource.public_object_key, resource.public_media_url = public_key, public_url
+                fields += ['public_object_key', 'public_media_url']
+                if stale:
+                    uploads.cleanup_after_commit([uploads.record_cleanup(
+                        uploads.PUBLIC, stale, 'replaced', resource_id=resource.pk).pk])
+            resource.status = PUBLISHED
+            resource.published_at = timezone.now()
+            resource.save(update_fields=fields)
+    except Exception:
+        if public_key:
+            uploads.record_cleanup(uploads.PUBLIC, public_key, 'publish_aborted', resource_id=resource_id)
+        raise
     resource.event = event
     return resource
 
 
 def unpublish_resource(event_id, resource_id):
+    """Hide immediately; the public copy is recorded for deletion (already
+    shared/cached bytes cannot be recalled)."""
     with transaction.atomic():
         event, resource = _lock_resource(event_id, resource_id)
         if resource.status != PUBLISHED:
             raise invalid_transition('resource', resource.status, 'unpublished')
         resource.status = UNPUBLISHED
-        resource.save(update_fields=['status', 'updated_at'])
+        fields = ['status', 'updated_at']
+        if resource.public_object_key:
+            row = uploads.record_cleanup(uploads.PUBLIC, resource.public_object_key, 'unpublished',
+                                         resource_id=resource.pk)
+            resource.public_object_key = resource.public_media_url = ''
+            fields += ['public_object_key', 'public_media_url']
+            uploads.cleanup_after_commit([row.pk])
+        resource.save(update_fields=fields)
     resource.event = event
     return resource
 
@@ -129,6 +172,7 @@ def update_resource(event_id, resource_id, serializer_factory):
         data = dict(serializer.validated_data)
         extra = []
         if 'type' in data and data['type'] != resource.type:
+            uploads.cleanup_after_commit(uploads.supersede_open_intents(resource, reason='RESOURCE_TYPE_CHANGED'))
             resource.storage_status = EventResource.initial_storage_status(data['type'])
             extra.append('storage_status')
         apply_update(resource, data, extra)
@@ -184,11 +228,15 @@ def delete_event(event_id):
         references = event_references(event)
         if references:
             raise referenced_error(references)
+        cleanup_ids = []
+        for resource in event.resources.select_for_update().order_by('id'):
+            cleanup_ids += uploads.record_resource_cleanup(resource, 'resource_deleted')
         try:
             # Legacy local files are left on disk; Django does not delete them.
             event.delete()
         except (ProtectedError, RestrictedError):
             raise referenced_error(event_references(event)) from None
+        uploads.cleanup_after_commit(cleanup_ids)
 
 
 def delete_resource(event_id, resource_id):
@@ -196,5 +244,6 @@ def delete_resource(event_id, resource_id):
         _, resource = _lock_resource(event_id, resource_id)
         if resource.status == PUBLISHED:
             raise unpublish_required('resource')
-        # DAWAH-02 records provider cleanup for uploaded assets here.
+        cleanup_ids = uploads.record_resource_cleanup(resource, 'resource_deleted')
         resource.delete()
+        uploads.cleanup_after_commit(cleanup_ids)
