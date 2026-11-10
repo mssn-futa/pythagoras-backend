@@ -68,6 +68,12 @@ class CollisionReportTests(TestCase):
             (4, 'c@x.test', '  '), (5, 'd@x.test', None), (6, 'e@x.test', 'CSC/2')])
         self.assertEqual(report, {'email': [[1, 2]], 'matric_number': [[1, 2]]})
 
+    def test_blank_emails_collide_like_the_constraint(self):
+        report = find_identity_collisions([(1, '', None), (2, '   ', None), (3, None, None),
+                                           (4, 'ok@x.test', None)])
+        self.assertEqual(report, {'email': [[1, 2, 3]], 'matric_number': []})
+        self.assertEqual(find_identity_collisions([(1, '  ', None)]), {'email': [], 'matric_number': []})
+
     def test_command_passes_on_clean_data(self):
         make_user(email='one@example.test', matric_number='A/1')
         make_user(email='two@example.test')
@@ -135,6 +141,13 @@ class IdentityMigrationTests(TransactionTestCase):
         rows = list(OldUser.objects.order_by('pk').values_list('email', 'matric_number'))
         self.assertEqual(rows, [('Dup@Example.test', ' x/1 '), ('dup@example.TEST', ''),
                                 ('third@example.test', 'X/1')])  # untouched, nothing merged
+
+        # Blank emails ('' and whitespace) would collide after trimming: also blocked.
+        blank_a = OldUser.objects.create(email='', matric_number=None)
+        blank_b = OldUser.objects.create(email='   ', matric_number=None)
+        with self.assertRaisesMessage(Exception, f'email: user IDs {blank_a.pk}, {blank_b.pk}'):
+            self.migrate(self.after)
+        OldUser.objects.filter(pk__in=[blank_a.pk, blank_b.pk]).delete()  # test fixture only
 
         # Lead-approved manual cleanup, then the migration proceeds.
         OldUser.objects.filter(pk=second.pk).update(email='second@example.test')

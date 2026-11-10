@@ -5,7 +5,7 @@ from django.db import transaction
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
 
-from pythagoras.mail import InvalidMessage, OutboundEmail, SendResult, send_email
+from pythagoras.mail import InvalidMessage, OutboundEmail, SendResult, idempotency_key, send_email
 
 logger = logging.getLogger('accounts.email')
 
@@ -16,7 +16,8 @@ WELCOME_SUBJECT = "Welcome to Pythagoras! 🎓"
 
 
 def welcome_idempotency_key(user_id):
-    return f'welcome/{user_id}/{WELCOME_MESSAGE_VERSION}'
+    # {namespace}/welcome/{user_id}/{message_version}
+    return idempotency_key('welcome', user_id, WELCOME_MESSAGE_VERSION)
 
 
 class EmailService:
@@ -32,10 +33,12 @@ class EmailService:
         return html, text
 
     @classmethod
-    def send_templated(cls, *, subject, template_name, context, to, idempotency_key) -> SendResult:
+    def send_templated(cls, *, subject, template_name, context, to, idempotency_key,
+                       timeout=None) -> SendResult:
         """Send one templated message to one recipient from the server sender.
 
-        Returns the structured transport outcome. Never raises for rendering,
+        ``timeout`` tightens the transport's total bound. Returns the
+        structured transport outcome. Never raises for rendering,
         configuration or provider failures; those are logged without addresses.
         """
         try:
@@ -59,7 +62,7 @@ class EmailService:
             logger.error('email_not_sent key=%s code=%s', idempotency_key, result.code)
             return result
         try:
-            result = send_email(message)
+            result = send_email(message, timeout=timeout)
         except Exception:
             # Transports should not raise; treat anything unexpected as unresolved.
             result = SendResult.uncertain('TRANSPORT_EXCEPTION')
@@ -85,6 +88,7 @@ class EmailService:
             context=context,
             to=user.email,
             idempotency_key=welcome_idempotency_key(user.pk),
+            timeout=settings.WELCOME_EMAIL_TIMEOUT_SECONDS,
         )
 
     @classmethod

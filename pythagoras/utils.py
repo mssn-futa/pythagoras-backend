@@ -4,7 +4,6 @@ import logging
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
-from rest_framework.views import exception_handler as drf_exception_handler, set_rollback
 
 logger = logging.getLogger('pythagoras.api')
 
@@ -87,6 +86,11 @@ class StandardizedJSONRenderer(JSONRenderer):
 
 
 def exception_handler(exc, context):
+    # Imported here: rest_framework.views resolves DEFAULT_RENDERER_CLASSES
+    # (this module) while it initializes, so a module-level import of it would
+    # make "import pythagoras.utils" before DRF views a circular import.
+    from rest_framework.views import exception_handler as drf_exception_handler, set_rollback
+
     response = drf_exception_handler(exc, context)
     if response is None:
         set_rollback()

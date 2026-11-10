@@ -246,9 +246,18 @@ if EMAIL_TRANSPORT not in {'resend', 'memory'}:
 RESEND_API_KEY = os.getenv('RESEND_API_KEY', '')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '')
 EMAIL_REPLY_TO = os.getenv('EMAIL_REPLY_TO', '')
+# Total wall-clock bound (DNS+connect+send+read) for one Resend request.
 RESEND_TIMEOUT_SECONDS = env_positive_int('RESEND_TIMEOUT_SECONDS', 30)
-RESEND_REQUESTS_PER_SECOND = env_positive_int('RESEND_REQUESTS_PER_SECOND', 2)
-RESEND_DAILY_REQUEST_BUDGET = env_positive_int('RESEND_DAILY_REQUEST_BUDGET', 100)
+# Shorter bound for the welcome send that runs inside the registration request.
+WELCOME_EMAIL_TIMEOUT_SECONDS = env_positive_int(
+    'WELCOME_EMAIL_TIMEOUT_SECONDS', min(10, RESEND_TIMEOUT_SECONDS))
+if WELCOME_EMAIL_TIMEOUT_SECONDS > RESEND_TIMEOUT_SECONDS:
+    raise ImproperlyConfigured('WELCOME_EMAIL_TIMEOUT_SECONDS must not exceed RESEND_TIMEOUT_SECONDS.')
+# Prefix of every provider idempotency key; staging and production MUST differ.
+EMAIL_IDEMPOTENCY_NAMESPACE = os.getenv('EMAIL_IDEMPOTENCY_NAMESPACE', 'local').strip()
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', EMAIL_IDEMPOTENCY_NAMESPACE):
+    raise ImproperlyConfigured(
+        'EMAIL_IDEMPOTENCY_NAMESPACE must be 1-64 letters, digits, ".", "_" or "-".')
 
 # Configuration interfaces only; DAWAH-02 owns the S3/R2 implementation.
 R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')

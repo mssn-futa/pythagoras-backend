@@ -124,7 +124,7 @@ error, never a raw IntegrityError.
 
 | Migration | Effect |
 | --- | --- |
-| `accounts.0003_normalize_identities` | Aborts (changing nothing) if normalized email or matric values collide, listing only user IDs; otherwise normalizes stored email/matric/department in place. Never merges, deletes or re-roles users. |
+| `accounts.0003_normalize_identities` | Aborts (changing nothing) if normalized email or matric values collide (two or more blank/whitespace-only emails count as a collision), listing only user IDs; otherwise normalizes stored email/matric/department in place. Never merges, deletes or re-roles users. |
 | `accounts.0004_customuser_identity_constraints` | Adds the two case-insensitive unique constraints and the non-blank matric check. |
 | `token_blacklist.0001`-`0013` (library) | SimpleJWT outstanding/blacklisted token tables. |
 
@@ -160,13 +160,21 @@ role.
 ## Email transport (`pythagoras.mail`)
 
 ```python
-from pythagoras.mail import OutboundEmail, SendResult, SendStatus, send_email, get_transport
+from pythagoras.mail import (OutboundEmail, SendResult, SendStatus, get_transport,
+                             idempotency_key, send_email)
 
+key = idempotency_key("broadcast", delivery_id, "generation", 1)  # "{namespace}/broadcast/..."
 message = OutboundEmail(from_email=settings.DEFAULT_FROM_EMAIL, to="one@example.test",
                         subject="...", html="...", text="...",
-                        idempotency_key="welcome/1/v1", reply_to=None)
-result = send_email(message)   # never raises for provider/network outcomes
+                        idempotency_key=key, reply_to=None)
+result = send_email(message)               # never raises for transport problems
+result = send_email(message, timeout=10)   # optional tighter total bound
 ```
+
+`idempotency_key(*parts)` prefixes `EMAIL_IDEMPOTENCY_NAMESPACE` (D4's
+`{environment}/...`), rejects empty parts or parts containing `/`, and enforces
+the 256-character limit. All callers (COMM-02 included) should build keys
+with it so environments sharing a Resend account never collide.
 
 `OutboundEmail` is frozen, single-recipient and validated (no lists/commas,
 single-line headers, key 1-256 characters). `SendResult.status` is:
@@ -176,22 +184,30 @@ single-line headers, key 1-256 characters). `SendResult.status` is:
 | `accepted` | `provider_message_id` set; not proof of inbox delivery | 2xx with a non-empty `id` |
 | `retryable` | Not accepted; same payload/key may be retried after `retry_after` seconds | 429 (`Retry-After` parsed), 409 `concurrent_idempotent_requests` |
 | `failed` | Definitive; investigate, never rotate the key | other 4xx, 409 `invalid_idempotent_request`, missing API key |
-| `uncertain` | May have been accepted; replay only the same request/key inside the safety window | timeout, connection error, 408, 5xx, unknown 409, redirect, 2xx without an id |
+| `uncertain` | May have been accepted; replay only the same request/key inside the safety window | total deadline exceeded, socket timeout, connection error, malformed HTTP (bad/overlong status line, incomplete read), any unexpected transport exception, 408, 5xx, unknown 409, redirect, 2xx without an id |
 
 `code` is the provider error name uppercased (only plain identifiers) or
-`HTTP_<status>`/`TIMEOUT`/`CONNECTION_ERROR`/... The Resend adapter posts to
-`https://api.resend.com/emails` with `Authorization: Bearer`, `Idempotency-Key`
-and `User-Agent: pythagoras-backend/1.0`, uses `RESEND_TIMEOUT_SECONDS`, makes
-exactly one attempt, refuses redirects and logs only key/status/code/provider
-ID (never the API key, body or addresses). It uses only the standard library.
+`HTTP_<status>`/`DEADLINE_EXCEEDED`/`TIMEOUT`/`CONNECTION_ERROR`/`TRANSPORT_ERROR`.
+The Resend adapter posts to `https://api.resend.com/emails` with
+`Authorization: Bearer`, `Idempotency-Key` and `User-Agent: pythagoras-backend/1.0`
+and makes exactly one attempt. Its timeout is a **total wall-clock deadline**
+covering DNS resolution, connect, send and read: the request runs in a daemon
+worker joined against the deadline (DNS has no socket timeout), each socket
+operation gets only the remaining budget, and the body is read one receive at a
+time, capped at 64 KiB. Exceeding the deadline returns `uncertain
+DEADLINE_EXCEEDED` (the request may still reach the provider). It refuses
+redirects and logs only key/status/code/provider ID (never the API key, body or
+addresses). It uses only the standard library.
 `MemoryTransport` (`pythagoras.mail.memory.outbox`, `memory.reset()`) mimics
 idempotency for tests and development. The test runner
 (`pythagoras.test_runner.IsolatedTestRunner`) forces `memory` and a blank key.
 
 Welcome mail: `accounts.services.EmailService` renders the existing
 `emails/welcome.html`/`.txt` templates and sends with key
-`welcome/{user_id}/v1` from `DEFAULT_FROM_EMAIL` (optional `EMAIL_REPLY_TO`),
-inside `transaction.on_commit`. Bump `WELCOME_MESSAGE_VERSION` whenever the
+`{EMAIL_IDEMPOTENCY_NAMESPACE}/welcome/{user_id}/v1` (e.g.
+`production/welcome/42/v1`) from `DEFAULT_FROM_EMAIL` (optional
+`EMAIL_REPLY_TO`), inside `transaction.on_commit`, bounded by
+`WELCOME_EMAIL_TIMEOUT_SECONDS`. Bump `WELCOME_MESSAGE_VERSION` whenever the
 subject or templates change.
 
 ## Configuration
@@ -202,19 +218,23 @@ subject or templates change.
 | `RESEND_API_KEY` | Backend-only Resend send key. Blank yields `failed TRANSPORT_NOT_CONFIGURED`. |
 | `DEFAULT_FROM_EMAIL` | Verified sender; blank yields `failed INVALID_MESSAGE` for welcome mail. |
 | `EMAIL_REPLY_TO` | Optional reply-to. |
-| `RESEND_TIMEOUT_SECONDS` | Per-request bound (default 30). |
+| `RESEND_TIMEOUT_SECONDS` | Total wall-clock bound per Resend request (default 30). |
+| `WELCOME_EMAIL_TIMEOUT_SECONDS` | Bound for the welcome send inside the registration request (default 10, or `RESEND_TIMEOUT_SECONDS` if lower); startup fails if set above `RESEND_TIMEOUT_SECONDS`. |
+| `EMAIL_IDEMPOTENCY_NAMESPACE` | Idempotency key prefix, 1-64 of `[A-Za-z0-9._-]`, default `local`. **Staging and production must set distinct values** (e.g. `staging`, `production`). |
 | `TRUST_CLOUDFLARE_PROXY` | When true, throttles identify the client by the last `X-Forwarded-For` hop (`NUM_PROXIES=1`); otherwise by `REMOTE_ADDR`. |
 
 `manage.py check --deploy` warns when the transport is `memory` or Resend is
-missing its key/sender.
+missing its key/sender. Request-rate/daily budgets are not configured here;
+COMM-02 introduces them with its rate budgeting.
 
 ## Known limitations
 
 - Throttle counters use Django's default (process-local) cache. Deployment-wide
   enforcement needs a shared cache configured by the release/deployment WPs.
 - The welcome send runs synchronously after commit, so a slow provider can add
-  up to `RESEND_TIMEOUT_SECONDS` to the registration response. It is not
-  retried; outcomes are only logged (no persisted delivery record).
+  up to `WELCOME_EMAIL_TIMEOUT_SECONDS` (default 10 s) to the registration
+  response. It is not retried; outcomes are only logged (no persisted delivery
+  record). A send abandoned at its deadline may finish in its daemon thread.
 - Reuse of a rotated refresh token is rejected but does not revoke the rest of
   that user's sessions.
 - Tokens live in browser memory/`sessionStorage` per D0, not HttpOnly cookies.
