@@ -82,7 +82,12 @@ jobs:
         run: |
           docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" \
             -e PYTHAGORAS_ALLOW_MIGRATE=yes "$IMAGE" migrate
+          set +e
           docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" "$IMAGE" job-probe
+          test $? -eq 1   # CI database has no verified TLS: the probe must refuse
+          set -e
+          docker run --rm --network host -e SECRET_KEY="$CI_SECRET_KEY" -e DATABASE_URL="$CI_DATABASE_URL" \
+            -e JOB_PROBE_ALLOW_INSECURE_DB=yes "$IMAGE" job-probe
       - name: Job probe fails nonzero when the database is unreachable
         run: |
           set +e
@@ -96,4 +101,17 @@ jobs:
           for i in $(seq 30); do curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: api.ci.example' http://127.0.0.1:8000/healthz/ && break; sleep 1; done
           curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: api.ci.example' http://127.0.0.1:8000/readyz/
           curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: api.ci.example' http://127.0.0.1:8000/admin/login/ | grep -q 'Log in'
+      - name: Spoofed SCRIPT_NAME and forwarded host are ignored or rejected
+        run: |
+          H1='X-Forwarded-Proto: https'; H2='X-Forwarded-Host: api.ci.example'
+          # a client-sent SCRIPT_NAME header must not change routing (would be 500/302 to /evil/ if honoured)
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "$H1" -H "$H2" -H 'SCRIPT_NAME: /evil' http://127.0.0.1:8000/healthz/)
+          test "$code" = 200
+          loc=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "$H1" -H "$H2" -H 'SCRIPT_NAME: /evil' http://127.0.0.1:8000/admin/)
+          echo "$loc"; case "$loc" in 302*evil*) exit 1;; 302*) ;; *) exit 1;; esac
+          # a foreign forwarded host is rejected by ALLOWED_HOSTS
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "$H1" -H 'X-Forwarded-Host: evil.example' http://127.0.0.1:8000/healthz/)
+          test "$code" = 400
+      - name: No secret in web logs
+        run: |
           docker logs web 2>&1 | grep -F -e "$CI_SECRET_KEY" -e ci-only-postgres && exit 1 || true

@@ -7,6 +7,10 @@ session is TLS-protected, then exits.
 
 Exit codes: 0 success, 1 failure, 124 wall-clock budget exceeded.
 
+For PostgreSQL it also fails unless the session is TLS-protected AND the
+configured ``sslmode`` is ``verify-full``; set JOB_PROBE_ALLOW_INSECURE_DB=yes
+only for local/CI databases.
+
 Only coarse, non-secret facts are printed (never the DSN, host, user, or
 exception messages, which can embed connection strings).
 """
@@ -19,6 +23,10 @@ import time
 DEFAULT_BUDGET_SECONDS = 240
 EXIT_FAILURE = 1
 EXIT_TIMEOUT = 124
+
+
+class ProbePolicyError(Exception):
+    """Fixed, non-secret failure reason (the message is safe to print)."""
 
 
 def budget_seconds(environ=os.environ):
@@ -70,7 +78,19 @@ def run():
                 cursor.execute('SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
                 row = cursor.fetchone()
                 fields['tls'] = bool(row[0]) if row else False
+                options = connection.settings_dict.get('OPTIONS') or {}
+                fields['sslmode'] = options.get('sslmode') or 'default'
+                if os.environ.get('JOB_PROBE_ALLOW_INSECURE_DB') != 'yes':
+                    # Production proof must use verified TLS. The opt-out is for local/CI only.
+                    if not fields['tls']:
+                        raise ProbePolicyError('tls_required')
+                    if fields['sslmode'] != 'verify-full':
+                        raise ProbePolicyError('sslmode_must_be_verify_full')
         connection.close()
+    except ProbePolicyError as exc:
+        watchdog.cancel()
+        _emit(ok=False, error=str(exc))
+        return EXIT_FAILURE
     except Exception as exc:  # noqa: BLE001 - class name only
         watchdog.cancel()
         _emit(ok=False, error=type(exc).__name__)

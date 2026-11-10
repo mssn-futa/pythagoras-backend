@@ -19,8 +19,27 @@ describe('readiness is an actual HTTP health check', () => {
     const c = clock();
     const answers = [() => Promise.reject(new Error('refused')), () => Promise.resolve(new Response('{}', { status: 503 })), () => Promise.resolve(ok())];
     let i = 0;
-    const result = await waitUntilReady({ probe: () => answers[i++](), ...c, budgetMs: 30_000, intervalMs: 1000 });
+    const result = await waitUntilReady({ probe: () => answers[i++](), ...c, budgetMs: 30_000, intervalMs: 1000, attemptTimeoutMs: 5000 });
     expect(result).toEqual({ ready: true, attempts: 3 });
+  });
+
+  it('bounds each attempt: a hung probe is aborted and cannot exceed the budget', async () => {
+    let aborted = false;
+    const started = Date.now();
+    const result = await waitUntilReady({
+      probe: (signal) =>
+        new Promise<Response>(() => {
+          signal.addEventListener('abort', () => (aborted = true)); // never resolves
+        }),
+      now: Date.now,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      budgetMs: 300,
+      intervalMs: 20,
+      attemptTimeoutMs: 100,
+    });
+    expect(result.ready).toBe(false);
+    expect(aborted).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 
   it('gives up when the budget is exhausted (a port that answers 5xx is never ready)', async () => {
@@ -30,6 +49,7 @@ describe('readiness is an actual HTTP health check', () => {
       ...c,
       budgetMs: 5000,
       intervalMs: 1000,
+      attemptTimeoutMs: 5000,
     });
     expect(result.ready).toBe(false);
     expect(result.attempts).toBeGreaterThan(1);

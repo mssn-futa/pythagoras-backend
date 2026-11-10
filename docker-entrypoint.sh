@@ -33,6 +33,11 @@ case "$role" in
     case "$port" in ''|*[!0-9]*) fail "PORT must be numeric" ;; esac
     workers="${WEB_CONCURRENCY:-2}"
     case "$workers" in ''|*[!0-9]*) fail "WEB_CONCURRENCY must be numeric" ;; esac
+    # --forwarder-headers "" stops gunicorn from turning client headers named
+    # SCRIPT_NAME / PATH_INFO into WSGI environ keys (default SCRIPT_NAME,PATH_INFO).
+    # Bound every libpq connect so a black-holed database cannot outlast the
+    # Worker's readiness budget (Django has no connect_timeout of its own here).
+    export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
     # Gunicorn independently honours X-Forwarded-Proto from 127.0.0.1 by default.
     # Keep one policy: only when TRUST_CLOUDFLARE_PROXY is true (the Worker
     # strips client forwarding headers and sets its own) is it honoured.
@@ -44,6 +49,7 @@ case "$role" in
     exec gunicorn pythagoras.wsgi:application \
       --bind "0.0.0.0:$port" \
       --forwarded-allow-ips "$forwarded_ips" \
+      --forwarder-headers "" \
       --workers "$workers" --threads 4 \
       --timeout 60 --graceful-timeout 20 --keep-alive 5 \
       --access-logfile - --error-logfile -

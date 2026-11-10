@@ -25,11 +25,11 @@ public HTTPS --> Worker (src/index.ts, fetch)
                  container: PYTHAGORAS_ROLE=web  (gunicorn pythagoras.wsgi)  --TLS--> PostgreSQL (external)
 
 Cron Trigger (* * * * *, UTC) --> Worker scheduled() --> JobContainer "job-singleton".tick()
-                   |  active run?  yes -> ATTACH (no second start)
-                   |               no  -> start container, PYTHAGORAS_ROLE=job-probe
+                   |  container actually running? yes -> ATTACH (no second start; force-stop if overdue)
+                   |                              no  -> reconcile previous run, start PYTHAGORAS_ROLE=job-probe
                    v
                  container: python -m pythagoras.job_probe  --> exit code
-                   '--> container stop event (monitored exit) --> recorded in the DO, logged
+                   '--> exit recorded only if the library's `stopped_with_code` state belongs to this run
 ```
 
 * One image, one `Dockerfile`, two Container applications (`pythagoras-web`,
@@ -51,8 +51,8 @@ The entrypoint takes **at most one** argument (a role) or `PYTHAGORAS_ROLE`
 
 | Role | Behavior | Exit |
 |------|----------|------|
-| `web` | `gunicorn pythagoras.wsgi:application` on `$PORT` (default 8000), 2 workers x 4 threads (`WEB_CONCURRENCY` overrides workers), `exec` so SIGTERM reaches gunicorn | gunicorn |
-| `job-probe` | `timeout` around `python -m pythagoras.job_probe`: Django `check --database default`, connect, `SELECT 1`, report server major version and `pg_stat_ssl` TLS flag as one JSON line; hard watchdog at `JOB_PROBE_BUDGET_SECONDS` (default 240) | 0 ok, 1 failure, 124 budget exceeded |
+| `web` | `gunicorn pythagoras.wsgi:application` on `$PORT` (default 8000), 2 workers x 4 threads (`WEB_CONCURRENCY` overrides workers), `--forwarder-headers ""`, `PGCONNECT_TIMEOUT` default 10 s, `exec` so SIGTERM reaches gunicorn | gunicorn |
+| `job-probe` | `timeout` around `python -m pythagoras.job_probe`: Django `check --database default`, connect, `SELECT 1`, report server major version, `pg_stat_ssl` TLS flag and `sslmode` as one JSON line. **For PostgreSQL it exits 1 unless the session uses TLS and `sslmode=verify-full`**; `JOB_PROBE_ALLOW_INSECURE_DB=yes` is a local/CI-only opt-out. Hard watchdog at `JOB_PROBE_BUDGET_SECONDS` (default 240) | 0 ok, 1 failure, 124 budget exceeded |
 | `migrate` | **Operator only.** `manage.py migrate --noinput`; refuses unless `PYTHAGORAS_ALLOW_MIGRATE=yes`. Not in the controller allow-list, never run by `web` or `job-probe`. | 78 without opt-in |
 | anything else | rejected | 64 |
 
@@ -101,7 +101,15 @@ Findings and consequences:
    (`src/routing.ts`); the container must never be reachable except via the Worker.
 4. `X-Forwarded-For` is set to Cloudflare's `CF-Connecting-IP` (client value
    discarded) so DRF throttle identification is not spoofable.
-5. `ALLOWED_HOSTS` is validated against `X-Forwarded-Host`, so it must contain the
+5. **Client-controlled WSGI environ keys.** Gunicorn's default `--forwarder-headers
+   SCRIPT_NAME,PATH_INFO`, with `--forwarded-allow-ips '*'`, let a client header
+   `SCRIPT_NAME: /evil` pass through the Worker and change routing (reproduced as a
+   500 on `/admin/`). Fixed in both layers: the entrypoint passes
+   `--forwarder-headers ""`, and the Worker drops every client header whose name
+   contains `_` plus `X-Forwarded-Ssl/-Protocol/-Scheme`, `X-Url-Scheme`, `X-Scheme`
+   and `Front-End-Https` (alternative scheme signals that also cause "contradictory
+   scheme headers" errors).
+6. `ALLOWED_HOSTS` is validated against `X-Forwarded-Host`, so it must contain the
    public API hostname (and the `workers.dev` hostname if that is used for the proof).
 
 Required deployment environment (names only; see the inventory below):
@@ -117,7 +125,7 @@ Worker Secrets (`wrangler secret put`/`--secrets-file`; declared in
 | Name | Role(s) | Notes |
 |------|---------|-------|
 | `SECRET_KEY` | web, job-probe | required |
-| `DATABASE_URL` | web, job-probe | required; `postgresql://...?sslmode=verify-full&sslrootcert=system` |
+| `DATABASE_URL` | web, job-probe | required; use `?sslmode=verify-full&sslrootcert=system` (the job probe refuses anything weaker) |
 | `RESEND_API_KEY` | web only | forwarded when bound (PLAT-03 / COMM) |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | web only | forwarded when bound (DAWAH-02); distinct from the deploy token |
 
@@ -137,7 +145,11 @@ Log scrubbing: controller logs are JSON lines with event names and coarse fields
 every line also passes through a scrubber that removes bound secret values and URL
 credentials. Error messages are never logged, only error class names. The Containers
 helper returns raw exception text in a `500` body when its proxy hop fails;
-`scrubProxyError` replaces that with a fixed `502 {"error":"upstream_unavailable"}`.
+`scrubProxyError` replaces the library's text/plain error bodies (proxy-hop 500,
+"Failed to start container: ...", "There is no Container instance...", 429 with an
+arbitrary message) with fixed JSON (`502 upstream_unavailable`, `503
+container_unavailable`, `503 container_capacity`); application JSON responses pass
+through.
 
 ## Versions used
 
@@ -180,12 +192,17 @@ runtime user: permission denied.
   `PYTHAGORAS_ALLOW_MIGRATE=yes ... migrate` applied all migrations.
 
 ### `web` role
-* `DEBUG=false`, trust flag off: plain request -> 301; spoofed `X-Forwarded-Proto` -> 301 (after the gunicorn fix); bad Host -> 400.
+* `DEBUG=false`, trust flag off: plain request -> 301; spoofed `X-Forwarded-Proto` -> 301 (re-run after the latest image build: 301); bad Host -> 400.
 * `TRUST_CLOUDFLARE_PROXY=true`: `/healthz/` 200 `{"status": "ok"}`; `/readyz/` 200 (DB reached);
   without the proto header -> 301 to `https://api.test.example/...`; `X-Forwarded-Host: evil.example` -> 400;
   `/admin/login/` 200 "Log in | Django site admin" with `Secure` + `SameSite=Lax` CSRF cookie;
   admin POST without CSRF -> 403; with CSRF token + trusted `Origin` -> 200 (login form, bad credentials message);
   with a foreign `Origin` -> 403; `/static/admin/css/base.css` 200 (WhiteNoise); `HEAD /healthz/` 200.
+* Spoofing, re-run on the rebuilt image with `TRUST_CLOUDFLARE_PROXY=true`: before the fix
+  `-H 'SCRIPT_NAME: /evil'` on `/admin/` returned 500. After: `/healthz/` with `SCRIPT_NAME: /evil` -> 200;
+  `/admin/` with `SCRIPT_NAME: /evil` or `PATH_INFO: /x` -> 302 to the normal login URL (no `/evil`);
+  foreign `X-Forwarded-Host` -> 400; `/readyz/` and `/admin/login/` 200; logs contain no secret (0 matches).
+  The entrypoint exports `PGCONNECT_TIMEOUT=10` for the web role (seen in PID 1's environ).
 * Database unreachable at boot: `/healthz/` 200, `/readyz/` 503 `{"status": "unavailable"}`, log shows only `OperationalError`.
 * `docker stop` -> clean gunicorn shutdown in about 1.3 s.
 * Cold start of the container to first `/readyz/` 200 locally (image cached): about 1.3 s;
@@ -200,22 +217,26 @@ Cloudflare behavior (each wake is a fresh container filesystem) and is not a
 Cloudflare result.
 
 ### `job-probe`
-* Against local PG: exit 0, `{"elapsed_ms": 899, "ok": true, "probe": "job-probe", "server_major": 16, "tls": false, "vendor": "postgresql"}`.
-* Unreachable DB (port 1): exit 1, `{"error": "OperationalError", "ok": false, ...}` with no DSN text.
-* A server that accepts TCP and never answers, `PGCONNECT_TIMEOUT=60`, `JOB_PROBE_BUDGET_SECONDS=5`:
-  watchdog fired, **exit 124 after 5.3 s** (`budget_exceeded`).
-* `JOB_PROBE_BUDGET_SECONDS=abc` -> exit 64.
+Re-recorded on the rebuilt image after TLS enforcement was added.
+* Local PG without TLS (no opt-out): exit 1, `{"error": "tls_required", "ok": false}`.
+* Same with `JOB_PROBE_ALLOW_INSECURE_DB=yes`: exit 0, `{"elapsed_ms": 1087, "ok": true, "server_major": 16, "sslmode": "default", "tls": false, ...}`.
+* Unreachable DB (port 1): exit 1, `OperationalError`, no DSN text (covered by the Django suite).
+* A server that accepts TCP and never answers, `PGCONNECT_TIMEOUT=60`, `JOB_PROBE_BUDGET_SECONDS=4`:
+  watchdog fired, **exit 124** (`budget_exceeded`).
+* `JOB_PROBE_BUDGET_SECONDS=abc` -> exit 64 (from the earlier run; the entrypoint check is unchanged).
 
 ### Native TLS (throwaway `postgres:16-alpine`, `ssl=on`, self-signed CA, SAN `localhost`/`127.0.0.1`)
-| `DATABASE_URL` query | Result |
-|----------------------|--------|
-| `sslmode=disable` | ok, `tls:false` |
-| `sslmode=require` | ok, `tls:true` |
-| `sslmode=verify-full&sslrootcert=/certs/ca.crt` | ok, `tls:true` |
-| `sslmode=verify-full` (CA not trusted) | exit 1 |
-| `sslmode=verify-full&sslrootcert=system` + `SSL_CERT_FILE=ca.crt` | ok, `tls:true` |
+Job probe result per `DATABASE_URL` query (re-run on the rebuilt image):
 
-`/readyz/` over `verify-full` also returned 200. psycopg2-binary 2.9.11 bundles
+| Query | Result |
+|-------|--------|
+| `sslmode=disable` | exit 1 `tls_required` |
+| `sslmode=require` | exit 1 `sslmode_must_be_verify_full` (with the opt-out: ok, `tls:true`) |
+| `sslmode=verify-full&sslrootcert=/certs/ca.crt` | exit 0, `tls:true`, `sslmode:verify-full` |
+| `sslmode=verify-full` (CA not trusted) | exit 1 `OperationalError` |
+| `sslmode=verify-full&sslrootcert=system` + `SSL_CERT_FILE=ca.crt` | exit 0, `tls:true` |
+
+`/readyz/` over `verify-full` returned 200 in the earlier run. psycopg2-binary 2.9.11 bundles
 libpq 17.6, which supports `sslrootcert=system` (OpenSSL default trust store), the
 appropriate setting for a publicly trusted provider such as Neon. This proves the
 driver and image, **not** Neon or any Cloudflare-to-database network path.
@@ -229,14 +250,32 @@ Entry-point output never echoes environment values.
 ```sh
 cd cloudflare && npm ci --ignore-scripts && npm run typecheck && npm test
 ```
-`tsc --noEmit` clean; **vitest: 6 files, 35 tests passed** (job overlap/attach
-including truly concurrent ticks, monitored success/failure exit, idempotent stop
-events, reconciliation after a coordinator restart, overdue force-stop at
-budget+60 s, adoption of an unrecorded active container, start failure,
-missing secrets, no secret in logs, role allow-list rejecting `migrate`/arbitrary
-strings, header replacement/stripping, HTTP-based readiness including 5xx and
-retry, proxy-error scrubbing, structural check that the public fetch path never
-reaches the job binding or an entrypoint override).
+`@types/node` (22.20.5, pinned and locked) is in the tsconfig because `test/` uses
+`node:fs`; an earlier revision omitted it and `tsc --noEmit` exited 2 (the earlier
+"clean" claim in this document was wrong). Now `npm run typecheck` exits 0 and
+**vitest passes 7 files / 64 tests**: job overlap/attach incl. truly concurrent ticks;
+a library-faithful fake (state lags the process, lazy stop delivery, early-exit
+`start()` throw); a lazily delivered exit for run A never applied to run B; the
+library default exit code 0 never recorded as success; `start_failed`/`lost`/
+`killed_overdue` terminal and never duplicated; overdue force-stop whenever the
+container is active, including with a terminal or missing record; reconciliation;
+missing secrets; no secret in logs; role allow-list; header replacement including
+underscore headers (`SCRIPT_NAME`) and alternative scheme headers; HTTP readiness
+including hung probes (per-attempt timeout) and 5xx; library error scrubbing;
+behavioural tests of `WebContainer` (never proxies until `/readyz/` is 200 -
+mutation check: replacing `waitUntilReady` with a constant makes 4 tests fail) and
+`JobContainer` (every request is 404 - mutation check fails 2 tests; `onStop`
+ignores the default exit code), and of the Worker entry (public fetch never touches
+the job binding; `scheduled()` ticks the singleton).
+
+Exit attribution follows the installed library: `onStop` is delivered lazily and
+reports `exitCode: 0` for a no-longer-running container whose state the monitor has
+not yet updated. The controller therefore ignores the parameter, reads
+`getState()`, and accepts an exit only when the state is `stopped_with_code`,
+changed at or after the run's start, and the run is `running`. An unconfirmed exit
+is reconciled on the next tick as `lost` (unknown), never as success. A genuinely
+successful run whose monitor update lags can therefore be recorded as `lost`; this
+is a deliberate bias against false success and is to be observed on the real platform.
 
 ```sh
 npx wrangler --version                       # 4.160.0
@@ -251,7 +290,7 @@ entitlement, or image acceptance by the registry.
 
 Django suite (PostgreSQL, env as in `docs/backend-testing.md`): `manage.py check`
 clean, `makemigrations --check --dry-run` no changes, `manage.py test --noinput`
-**37 tests OK** (30 existing + 7 added for health/probe).
+**38 tests OK** (30 existing + 8 added for health/probe, including the PostgreSQL TLS-policy test).
 
 ## What changed in shared files
 
@@ -261,8 +300,8 @@ clean, `makemigrations --check --dry-run` no changes, `manage.py test --noinput`
   (not a management command) specifically to avoid an `INSTALLED_APPS` change; the
   libpq connect bound uses `PGCONNECT_TIMEOUT`.
 * The existing CI workflow is untouched; `.github/workflows/cloudflare-runtime.yml`
-  is a separate lane (controller tests + offline dry run; image build + role,
-  probe and web checks on a PostgreSQL service). It has no deploy step or secret.
+  is a separate lane (typecheck, controller tests + offline dry run; image build + role,
+  probe, web, and negative spoofing checks on a PostgreSQL service). It has no deploy step or secret.
 * `render.yaml` and `build.sh` are left as-is (legacy; `build.sh` migrates, the image never does).
 
 ## Known limits and cost items to verify on the real account
@@ -284,10 +323,11 @@ Unverified until the lead supplies access; record actual values then.
   interval for the final scheduler if cost or start latency is unacceptable.
 * Cold start on Cloudflare (image pull plus Django import plus DB connect) and the
   Worker's `READY_BUDGET_MS` (45 s) / `sleepAfter` (web 10 m) tuning.
-* Whether `start()` on the job container returns promptly and the stop event
-  (`onStop` exit code) is delivered after a clean exit; this implementation relies
-  on `@cloudflare/containers` 0.3.7 `onStop({exitCode})` and `getState()`
-  (`stopped_with_code`) and cannot confirm them without the platform.
+* Whether `start()` on the job container returns promptly, whether the library's
+  monitor updates `stopped_with_code` promptly after a clean exit (otherwise runs
+  are recorded `lost`), and when `onStop` is actually delivered; these rely on
+  `@cloudflare/containers` 0.3.7 `getState()` and `ctx.container.running` and cannot
+  be confirmed without the platform.
 * Scheduled-handler and container monitor wall-time limits relative to the 240 s
   budget (D5 states the budget is below them; verify).
 * Outbound TCP 5432/TLS egress from Containers (`enableInternet = true`) to the

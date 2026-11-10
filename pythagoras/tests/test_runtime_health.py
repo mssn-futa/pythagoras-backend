@@ -62,6 +62,17 @@ class JobProbeProcessTests(SimpleTestCase):
         self.assertNotIn('hunter2', result.stdout + result.stderr)
         self.assertFalse(json.loads(result.stdout.strip().splitlines()[-1])['ok'])
 
+    def test_postgres_without_verified_tls_fails_unless_explicitly_allowed(self):
+        url = os.environ.get('DATABASE_URL', '')
+        if not url.startswith('postgres'):
+            self.skipTest('requires the PostgreSQL test database')
+        denied = self.run_probe(DATABASE_URL=url, JOB_PROBE_ALLOW_INSECURE_DB='no')
+        self.assertEqual(denied.returncode, 1, denied.stdout)
+        self.assertIn(json.loads(denied.stdout.strip().splitlines()[-1])['error'],
+                      {'tls_required', 'sslmode_must_be_verify_full'})
+        allowed = self.run_probe(DATABASE_URL=url, JOB_PROBE_ALLOW_INSECURE_DB='yes')
+        self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+
     def test_invalid_budget_is_rejected(self):
         result = self.run_probe(JOB_PROBE_BUDGET_SECONDS='0')
         self.assertNotEqual(result.returncode, 0)

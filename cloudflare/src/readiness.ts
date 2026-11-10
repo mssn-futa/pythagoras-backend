@@ -3,8 +3,10 @@
  * bare TCP connect: the Containers helper's port check accepts ANY response.
  */
 export interface ReadinessOptions {
-  /** Performs one probe request against GET /readyz/. */
-  probe: () => Promise<Response>;
+  /** Performs one probe request against GET /readyz/; must honour the signal where it can. */
+  probe: (signal: AbortSignal) => Promise<Response>;
+  /** Hard per-attempt bound: a hung probe cannot exceed the overall budget. */
+  attemptTimeoutMs: number;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   budgetMs: number;
@@ -21,6 +23,23 @@ export async function isHealthyResponse(response: Response): Promise<boolean> {
   }
 }
 
+async function attempt(options: ReadinessOptions, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error('attempt_timeout'));
+    }, timeoutMs);
+  });
+  try {
+    // Race so a probe that ignores the signal is still bounded.
+    return await Promise.race([options.probe(controller.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Polls until the app answers 200 {"status":"ok"} or the budget is exhausted. */
 export async function waitUntilReady(options: ReadinessOptions): Promise<{ ready: boolean; attempts: number }> {
   const deadline = options.now() + options.budgetMs;
@@ -28,7 +47,7 @@ export async function waitUntilReady(options: ReadinessOptions): Promise<{ ready
   for (;;) {
     attempts += 1;
     try {
-      if (await isHealthyResponse(await options.probe())) return { ready: true, attempts };
+      if (await isHealthyResponse(await attempt(options, Math.max(1, Math.min(options.attemptTimeoutMs, deadline - options.now()))))) return { ready: true, attempts };
     } catch {
       // not listening yet / connection reset: retry until the budget ends
     }

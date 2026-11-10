@@ -26,8 +26,6 @@ import { makeLogger } from './redact';
 import { waitUntilReady } from './readiness';
 import { jsonError, probeHeaders, scrubProxyError, toContainerRequest } from './routing';
 
-export { ContainerProxy } from '@cloudflare/containers';
-
 export interface Env extends EnvLike {
   WEB: DurableObjectNamespace<WebContainer>;
   JOB: DurableObjectNamespace<JobContainer>;
@@ -35,8 +33,11 @@ export interface Env extends EnvLike {
   PUBLIC_API_HOST: string;
 }
 
-const READY_BUDGET_MS = 45_000; // Neon/cold starts: generous but bounded
-const READY_INTERVAL_MS = 1_000;
+/** Overall readiness budget; Neon/cold starts are slow, so generous but bounded. */
+export const READY_BUDGET_MS = 45_000;
+export const READY_INTERVAL_MS = 1_000;
+/** Per-attempt bound. Must exceed the container's PGCONNECT_TIMEOUT (10 s) to see its 503. */
+export const READY_ATTEMPT_TIMEOUT_MS = 12_000;
 
 export class WebContainer extends Container<Env> {
   defaultPort = WEB_PORT;
@@ -44,6 +45,10 @@ export class WebContainer extends Container<Env> {
   sleepAfter = '10m';
   enableInternet = true; // outbound PostgreSQL (TLS) and later Resend/R2
   private ready = false;
+  /** Overridable for tests; production values are the exported constants. */
+  protected readyBudgetMs = READY_BUDGET_MS;
+  protected readyIntervalMs = READY_INTERVAL_MS;
+  protected readyAttemptTimeoutMs = READY_ATTEMPT_TIMEOUT_MS;
   private readonly log = makeLogger(() => secretValues(this.env));
 
   constructor(ctx: ConstructorParameters<typeof Container>[0], env: Env) {
@@ -76,15 +81,19 @@ export class WebContainer extends Container<Env> {
       return false;
     }
     const result = await waitUntilReady({
-      probe: () =>
+      probe: (signal) =>
         this.containerFetch(
-          new Request('http://container.internal/readyz/', { headers: probeHeaders(this.env.PUBLIC_API_HOST) }),
+          new Request('http://container.internal/readyz/', {
+            headers: probeHeaders(this.env.PUBLIC_API_HOST),
+            signal,
+          }),
           WEB_PORT,
         ),
       now: Date.now,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      budgetMs: READY_BUDGET_MS,
-      intervalMs: READY_INTERVAL_MS,
+      budgetMs: this.readyBudgetMs,
+      intervalMs: this.readyIntervalMs,
+      attemptTimeoutMs: this.readyAttemptTimeoutMs,
     });
     this.log(result.ready ? 'web_ready' : 'web_not_ready', { attempts: result.attempts });
     this.ready = result.ready;
@@ -114,8 +123,13 @@ export class JobContainer extends Container<Env> {
       container: {
         getState: async () => {
           const state = await this.getState();
-          return { status: state.status as ContainerStatus, exitCode: 'exitCode' in state ? state.exitCode : undefined };
+          return {
+            status: state.status as ContainerStatus,
+            exitCode: 'exitCode' in state ? state.exitCode : undefined,
+            lastChange: state.lastChange,
+          };
         },
+        isRunning: () => Boolean(ctx.container?.running),
         start: (options) => this.start({ envVars: options.envVars }),
         destroy: () => this.destroy(),
       },
@@ -135,8 +149,13 @@ export class JobContainer extends Container<Env> {
     return this.controller.tick();
   }
 
-  override async onStop(params: { exitCode: number }): Promise<void> {
-    await this.controller.recordExit(params.exitCode);
+  /**
+   * The library delivers this lazily and with a default exitCode of 0 when its monitor
+   * has not yet recorded the exit, so the reported code is deliberately ignored: the
+   * controller reads the authoritative state itself and validates it against the run.
+   */
+  override async onStop(): Promise<void> {
+    await this.controller.handleStop();
   }
 
   override onError(error: unknown): void {
