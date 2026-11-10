@@ -67,10 +67,19 @@ class SubmissionImmutable(AssessmentError):
     default_message = 'Finalized submissions cannot be changed or deleted.'
 
 
-class PublicationInvalid(AssessmentError):
-    """The quiz graph fails publication validation (400 VALIDATION_ERROR with ``fields``)."""
+class AuthoringInvalid(AssessmentError):
+    """Authoring input breaks a rule checked under the quiz lock (400 VALIDATION_ERROR).
+
+    ``fields`` maps dotted field paths (``order``, ``options.2.text``) to message lists.
+    """
 
     code = 'VALIDATION_ERROR'
+    default_message = 'Correct the highlighted fields.'
+
+
+class PublicationInvalid(AuthoringInvalid):
+    """The quiz graph fails publication validation (400 VALIDATION_ERROR with ``fields``)."""
+
     default_message = 'This quiz cannot be published.'
 
 
