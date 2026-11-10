@@ -107,7 +107,7 @@ TRUNCATE does not fire row triggers (test flushes, operator restores).
   `ATTEMPT_EXPIRED`. All timestamps written in one transaction are that one
   instant.
 - publish/close: quiz row `FOR UPDATE`.
-- start/finalize (and the temporary direct submit): quiz row `FOR SHARE`, so
+- start/finalize: quiz row `FOR SHARE`, so
   students run in parallel, while still conflicting with publish/close and
   content writes; finalize then locks only the attempt row
   (`FOR UPDATE OF "quiz_attempt"`, not the joined user row). One attempt per
@@ -115,11 +115,12 @@ TRUNCATE does not fire row triggers (test flushes, operator restores).
   winner, then reuses its (locked) row.
 - question/option writes: quiz row `FOR NO KEY UPDATE`.
 - Lock order: quiz row, then attempt row.
-- Known edge: if `mark_expired` (arriving at/after expiry) commits while an
-  earlier-arriving finalize waits for the attempt lock, that finalize sees
-  `expired` and gets `ATTEMPT_EXPIRED`. Callers should only call
-  `mark_expired` for reads well past expiry, or rely on
-  `effective_attempt_status` (no write).
+- Resolved edge (ASSESS-04): a write of `expired` committed while an
+  earlier-arriving finalize waits for the attempt lock would make that
+  finalize fail. `finalize_attempt` therefore never persists `expired` (a late
+  request only raises `AttemptExpired`), no API path calls `mark_expired`, and
+  reads use `effective_attempt_status`. `mark_expired` stays an operator
+  primitive for rows well past expiry.
 
 ## Service primitives (`quiz.lifecycle`, `quiz.services`)
 
@@ -138,9 +139,9 @@ TRUNCATE does not fire row triggers (test flushes, operator restores).
 | `delete_draft_quiz(quiz_id)` | `QuizReferenced` (history) before `QuizImmutable` (not draft) |
 | `is_eligible_student(user)` | active `role=student` (no enrollment gate) |
 | `share_lock_quiz(id)` / `lock_attempt(**lookup)` / `create_attempt(quiz, student, now)` | locking building blocks |
-| `start_attempt(quiz_id, student)` | returns existing attempt unchanged first; legacy submission is `SubmissionConflict`; else requires availability at arrival (`QuizUnavailable`); `(attempt, created)` |
-| `finalize_attempt(attempt_id, student, answers)` | ownership (`Attempt.DoesNotExist`), replay/`SubmissionConflict`, expiry at arrival (`AttemptExpired`, persists `expired`), `InvalidAnswers`, then atomic grade + snapshot + attempt `submitted`; `(submission, created)` |
-| `mark_expired(attempt_id)` | persist expiry without a grade |
+| `start_attempt(quiz_id, student)` | returns existing attempt unchanged first; a draft is `Quiz.DoesNotExist` (404) next; legacy submission is `SubmissionConflict`; else requires availability at arrival (`QuizUnavailable`); `(attempt, created)` |
+| `finalize_attempt(attempt_id, student, answers)` | ownership (`Attempt.DoesNotExist`), replay/`SubmissionConflict`, expiry at arrival (`AttemptExpired`; not persisted), `InvalidAnswers`, then atomic grade + snapshot + attempt `submitted`; `(submission, created)` |
+| `mark_expired(attempt_id)` | persist expiry without a grade (operator use only; see the resolved edge) |
 | `replay_or_conflict(submission, answers)` | strict JSON comparison |
 | `finalize_locked(quiz, attempt, answers, now)` | lower-level step under caller-held locks |
 | `QuizService.validate_answers` / `QuizService.grade` | answer membership; `GradingResult(score, total_points, snapshot)` |
@@ -149,7 +150,7 @@ Tests may pass `now=`; API code must not.
 
 Error codes (`quiz.errors`, all `code` attributes; map with
 `quiz.views.domain_errors`): `QUIZ_IMMUTABLE` (409), `INVALID_TRANSITION`
-(409), `RESOURCE_REFERENCED` (409), `QUIZ_UNAVAILABLE` (status for ASSESS-04),
+(409), `RESOURCE_REFERENCED` (409), `QUIZ_UNAVAILABLE` (409 on a new start; a draft is 404),
 `ATTEMPT_EXPIRED` (409), `SUBMISSION_CONFLICT` (409), `PublicationInvalid` ->
 400 `VALIDATION_ERROR` with `fields`.
 
@@ -162,15 +163,14 @@ until finalized). Questions are delivered by the ASSESS-04 view.
 
 The authoring/publication/closing API (ASSESS-03) supersedes the temporary
 quiz/question write behaviour described here in ASSESS-02; see
-[assessment-authoring.md](assessment-authoring.md). Still temporary until
-ASSESS-04:
+[assessment-authoring.md](assessment-authoring.md). The attempt, submission and
+results API (ASSESS-04) supersedes the temporary direct submit; see
+[assessment-results.md](assessment-results.md).
 
 - Student visibility is `published` and `deadline > now`, not `is_active`.
-- `POST /quiz/submissions/` (direct submit) keeps its request/response and
-  promises; it now creates the student's attempt at the server instant and
-  finalizes it in the same transaction (`started_at == finalized_at`), storing
-  `total_points` and a snapshot. An existing expired attempt yields 409
-  `ATTEMPT_EXPIRED`.
+- The ASSESS-02 direct submit (`POST /quiz/submissions/ {"quiz", "answers"}`,
+  which created and finalized an attempt in one step) is retired by ASSESS-04:
+  that body is a 400 and `QuizService.submit` no longer exists.
 
 ## Migrations and existing data
 

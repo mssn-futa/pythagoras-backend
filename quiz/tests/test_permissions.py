@@ -26,8 +26,8 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
         return {'title': 'Changed', 'type': 'arabic', 'description': 'd', 'time_limit': 10}
 
     def submit_body(self):
-        question, correct, _ = self.questions[0]
-        return {'quiz': self.quiz.pk, 'answers': {str(question.pk): correct.pk}}
+        # The fixture result was finalized with no answers: this is its replay.
+        return {'attempt_id': self.own.attempt_id, 'answers': {}}
 
     def detail_paths(self, base, pk):
         """Canonical slash route and the legacy no-slash alias."""
@@ -69,13 +69,19 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
             requests.append(('get', path, None))
         return requests
 
+    def student_requests(self):
+        """Student-only participation routes (ASSESS-04)."""
+        return [('post', f'/quiz/quizzes/{self.quiz.pk}/attempts/', {}),
+                ('get', f'/quiz/attempts/{self.own.attempt_id}/', None),
+                ('post', '/quiz/submissions/', self.submit_body())]
+
     def admin_only_reads(self):
         return [('get', '/quiz/question/', None),
                 ('get', f'/quiz/quizzes/{self.quiz.pk}/submissions/', None)]
 
     def all_requests(self):
         return (self.read_requests() + self.admin_only_reads() + self.write_requests()
-                + [('post', '/quiz/submissions/', self.submit_body())])
+                + self.student_requests())
 
     def test_anonymous_is_rejected_everywhere(self):
         before = self.snapshot()
@@ -105,10 +111,10 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_student_reads(self):
-        for method, path, body in self.read_requests():
+        for method, path, body in self.read_requests() + self.student_requests():
             with self.subTest(path=path):
                 response = self.call(self.student, method, path, body)
-                self.assertEqual(response.status_code, 200, response.content)
+                self.assertEqual(response.status_code, 200, response.content)  # resume/replay
                 self.assertIs(response.json()['success'], True)
                 self.assertNoAnswerKeys(response)
 
@@ -133,14 +139,18 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
 
     def test_history_contains_only_own_submissions(self):
         response = self.call(self.student, 'get', '/quiz/submissions/')
-        self.assertEqual([row['id'] for row in response.json()['data']], [self.own.pk])
+        self.assertEqual([row['id'] for row in response.json()['data']['results']], [self.own.pk])
         response = self.call(self.admin, 'get', '/quiz/submissions/')
-        self.assertEqual(response.json()['data'], [])
+        self.assertEqual(response.json()['data']['results'], [])
 
-    def test_admin_cannot_submit_as_a_student(self):
-        self.assertEnvelopeError(self.call(self.admin, 'post', '/quiz/submissions/',
-                                           self.submit_body()), 403, 'PERMISSION_DENIED')
+    def test_admin_cannot_take_assessments(self):
+        before = self.snapshot()
+        for method, path, body in self.student_requests():
+            with self.subTest(method=method, path=path):
+                self.assertEnvelopeError(self.call(self.admin, method, path, body), 403,
+                                         'PERMISSION_DENIED')
         self.assertEqual(Submission.objects.filter(student=self.admin).count(), 0)
+        self.assertEqual(self.snapshot(), before)
 
     def test_no_manual_grade_mutation_on_submission_detail(self):
         before = self.snapshot()
@@ -200,7 +210,7 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
 
     def test_admin_result_rows_include_student_identity(self):
         response = self.call(self.admin, 'get', f'/quiz/quizzes/{self.quiz.pk}/submissions/')
-        rows = response.json()['data']
+        rows = response.json()['data']['results']
         self.assertEqual({row['student_email'] for row in rows},
                          {'student@example.test', 'other@example.test'})
         self.assertEqual({row['student_name'] for row in rows}, {'Amina Yusuf'})

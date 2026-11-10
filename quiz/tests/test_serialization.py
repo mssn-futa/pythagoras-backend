@@ -3,7 +3,8 @@ from django.test import TestCase
 
 from quiz.models import Option, Question
 from quiz.serializers import (
-    StudentQuestionSerializer, StudentQuizSerializer, StudentSubmissionSerializer,
+    AttemptQuestionSerializer, StudentAttemptDetailSerializer, StudentQuestionSerializer,
+    StudentQuizSerializer, StudentSubmissionSerializer,
 )
 
 from .helpers import KEY_FIELDS, QuizAPITestMixin, make_quiz, walk_keys
@@ -17,8 +18,8 @@ class AnswerKeyLeakageTests(QuizAPITestMixin, TestCase):
 
     def submit(self):
         question, correct, _ = self.questions[0]
-        return self.call(self.student, 'post', '/quiz/submissions/',
-                         {'quiz': self.quiz.pk, 'answers': {str(question.pk): correct.pk}})
+        attempt = self.start_api(self.student, self.quiz.pk).json()['data']
+        return self.submit_api(self.student, attempt['id'], {str(question.pk): correct.pk})
 
     def test_walker_detects_nested_keys(self):
         self.assertIn('is_correct', set(walk_keys({'a': [{'b': [{'is_correct': True}]}]})))
@@ -62,14 +63,15 @@ class AnswerKeyLeakageTests(QuizAPITestMixin, TestCase):
 
     def test_error_responses_do_not_echo_keys(self):
         question, correct, _ = self.questions[0]
-        response = self.call(self.student, 'post', '/quiz/submissions/',
-                             {'quiz': self.quiz.pk, 'answers': {str(question.pk): 'B'}})
+        attempt = self.start_api(self.student, self.quiz.pk).json()['data']
+        response = self.submit_api(self.student, attempt['id'], {str(question.pk): 'B'})
         self.assertEqual(response.status_code, 400)
         self.assertNoAnswerKeys(response)
 
     def test_student_serializers_declare_no_key_fields(self):
         for serializer_class in (StudentQuizSerializer, StudentQuestionSerializer,
-                                 StudentSubmissionSerializer):
+                                 StudentSubmissionSerializer, StudentAttemptDetailSerializer,
+                                 AttemptQuestionSerializer):
             with self.subTest(serializer=serializer_class.__name__):
                 self.assertFalse(KEY_FIELDS.intersection(serializer_class().fields))
 
@@ -79,10 +81,14 @@ class AnswerKeyLeakageTests(QuizAPITestMixin, TestCase):
         options = data['questions'][0]['options']
         self.assertEqual([o['is_correct'] for o in options], [False, True, False, False])
         self.submit()
-        submission_id = self.call(self.student, 'get', '/quiz/submissions/').json()['data'][0]['id']
+        history = self.call(self.student, 'get', '/quiz/submissions/').json()['data']
+        submission_id = history['results'][0]['id']
         admin_result = self.call(self.admin, 'get', f'/quiz/submissions/{submission_id}/').json()['data']
         self.assertEqual(admin_result['student_email'], 'student@example.test')
-        self.assertIn('is_correct', set(walk_keys(admin_result)))
+        # Admin review: stored answers and per-question snapshot (keys stay on quiz detail).
+        self.assertEqual(admin_result['answers'], {str(self.questions[0][0].pk):
+                                                   self.questions[0][1].pk})
+        self.assertEqual(admin_result['grading_snapshot']['score'], 2)
 
 
 class DispatchRegressionTests(QuizAPITestMixin, TestCase):
@@ -126,8 +132,8 @@ class DispatchRegressionTests(QuizAPITestMixin, TestCase):
 
     def test_submission_detail_dispatches_pk_on_both_routes(self):
         question, correct, _ = self.questions[0]
-        created = self.call(self.student, 'post', '/quiz/submissions/',
-                            {'quiz': self.quiz.pk, 'answers': {str(question.pk): correct.pk}})
+        attempt = self.start_api(self.student, self.quiz.pk).json()['data']
+        created = self.submit_api(self.student, attempt['id'], {str(question.pk): correct.pk})
         submission_id = created.json()['data']['id']
         for path in (f'/quiz/submissions/{submission_id}/', f'/quiz/submissions/{submission_id}'):
             for user in (self.student, self.admin):

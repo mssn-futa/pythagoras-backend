@@ -3,12 +3,12 @@ import threading
 from datetime import timedelta
 from unittest import mock
 
-from django.db import connection, connections
+from django.db import connection, connections, transaction
 from django.test import TransactionTestCase, skipUnlessDBFeature
 from django.utils import timezone
 
 from quiz import lifecycle
-from quiz.errors import SubmissionConflict
+from quiz.errors import AttemptExpired, SubmissionConflict
 from quiz.models import Attempt, Submission
 from quiz.services import QuizService
 
@@ -19,6 +19,7 @@ THREADS = 8
 
 @skipUnlessDBFeature('has_select_for_update')
 class ConcurrentSubmissionTests(QuizAPITestMixin, TransactionTestCase):
+    """Threaded API requests by one student (real HTTP stack, one connection each)."""
 
     def setUp(self):
         super().setUp()
@@ -30,9 +31,31 @@ class ConcurrentSubmissionTests(QuizAPITestMixin, TransactionTestCase):
             {str(q1.pk): w1[0].pk},
         ]
 
-    def test_same_student_concurrent_posts_create_exactly_one_submission(self):
+    def run_clients(self, request):
         barrier = threading.Barrier(THREADS)
         results = [None] * THREADS
+
+        def worker(index):
+            try:
+                client = self.client_for(self.student)
+                barrier.wait(timeout=10)
+                response = request(client, index)
+                results[index] = (response.status_code, response.json(), index % 2)
+            except Exception as exc:  # surfaced by the assertions below
+                results[index] = ('error', repr(exc), index % 2)
+            finally:
+                connections.close_all()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(THREADS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertTrue(all(result is not None for result in results), results)
+        return results
+
+    def test_same_student_concurrent_submits_create_exactly_one_result(self):
+        attempt, _ = lifecycle.start_attempt(self.quiz.pk, self.student)
         original_grade = QuizService.grade
 
         def slow_grade(quiz, answers):
@@ -41,26 +64,11 @@ class ConcurrentSubmissionTests(QuizAPITestMixin, TransactionTestCase):
             threading.Event().wait(0.3)
             return original_grade(quiz, answers)
 
-        def worker(index):
-            try:
-                client = self.client_for(self.student)
-                barrier.wait(timeout=10)
-                response = client.post('/quiz/submissions/', {
-                    'quiz': self.quiz.pk, 'answers': self.answer_maps[index % 2]}, format='json')
-                results[index] = (response.status_code, response.json(), index % 2)
-            except Exception as exc:  # surfaced by the assertions below
-                results[index] = ('error', repr(exc), index % 2)
-            finally:
-                connections.close_all()
-
         with mock.patch.object(QuizService, 'grade', side_effect=slow_grade):
-            threads = [threading.Thread(target=worker, args=(i,)) for i in range(THREADS)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=60)
+            results = self.run_clients(lambda client, index: client.post(
+                '/quiz/submissions/', {'attempt_id': attempt.pk,
+                                       'answers': self.answer_maps[index % 2]}, format='json'))
 
-        self.assertTrue(all(result is not None for result in results), results)
         statuses = sorted(result[0] for result in results)
         self.assertEqual(Submission.objects.filter(quiz=self.quiz, student=self.student).count(), 1,
                          statuses)
@@ -74,10 +82,94 @@ class ConcurrentSubmissionTests(QuizAPITestMixin, TransactionTestCase):
                 continue
             if answer_map == winning_map:
                 self.assertEqual(status_code, 200, body)
-                self.assertEqual(body['data']['id'], winner.pk)
+                self.assertEqual(body['data'], created[0][1]['data'])
             else:
                 self.assertEqual(status_code, 409, body)
                 self.assertEqual(body['data']['code'], 'SUBMISSION_CONFLICT')
+        attempt.refresh_from_db()
+        self.assertEqual((attempt.status, attempt.finalized_at), ('submitted', winner.submitted_at))
+
+    def test_same_student_concurrent_starts_create_one_attempt(self):
+        results = self.run_clients(lambda client, index: client.post(
+            f'/quiz/quizzes/{self.quiz.pk}/attempts/', {}, format='json'))
+        statuses = sorted(result[0] for result in results)
+        self.assertEqual(statuses, [200] * (THREADS - 1) + [201], results)
+        attempt = Attempt.objects.get()
+        self.assertEqual({result[1]['data']['id'] for result in results}, {attempt.pk})
+        self.assertEqual({result[1]['data']['expires_at'] for result in results},
+                         {result[1]['data']['expires_at'] for result in results[:1]})
+
+    def test_grading_failure_under_concurrency_leaves_no_partial_result(self):
+        attempt, _ = lifecycle.start_attempt(self.quiz.pk, self.student)
+        with mock.patch.object(QuizService, 'grade', side_effect=RuntimeError('boom')):
+            results = self.run_clients(lambda client, index: client.post(
+                '/quiz/submissions/', {'attempt_id': attempt.pk,
+                                       'answers': self.answer_maps[0]}, format='json'))
+        self.assertEqual({result[0] for result in results}, {500})
+        self.assertFalse(Submission.objects.exists())
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, 'in_progress')
+
+
+@skipUnlessDBFeature('has_select_for_update')
+class LateArrivalLockOrderTests(QuizAPITestMixin, TransactionTestCase):
+    """The lifecycle doc's open edge: an on-time arrival queued behind a late one.
+
+    The late request (arrival at/after expiry) obtains the attempt lock first.
+    It must not persist ``expired``: the earlier, on-time arrival that then gets
+    the lock is accepted at its arrival instant.
+    """
+
+    def test_late_request_holding_the_lock_does_not_reject_an_earlier_arrival(self):
+        self.assertEqual(connection.vendor, 'postgresql')
+        quiz, questions = make_quiz('Lock order', points=(1,))
+        (question, correct, _), = questions
+        attempt, _ = lifecycle.start_attempt(quiz.pk, self.student)
+        answers = {str(question.pk): correct.pk}
+        on_time = attempt.expires_at - timedelta(seconds=1)
+        late = attempt.expires_at + timedelta(seconds=1)
+        results = {}
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            try:
+                with transaction.atomic():
+                    Attempt.objects.select_for_update().get(pk=attempt.pk)
+                    holding.set()
+                    release.wait(timeout=20)
+            finally:
+                connections.close_all()
+
+        def finalize(name, now):
+            try:
+                results[name] = lifecycle.finalize_attempt(attempt.pk, self.student, answers,
+                                                           now=now)
+            except Exception as exc:  # asserted below
+                results[name] = exc
+            finally:
+                connections.close_all()
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        self.assertTrue(holding.wait(timeout=10))
+        late_thread = threading.Thread(target=finalize, args=('late', late))
+        late_thread.start()
+        threading.Event().wait(0.5)  # the late request queues for the row lock first
+        on_time_thread = threading.Thread(target=finalize, args=('on_time', on_time))
+        on_time_thread.start()
+        threading.Event().wait(0.5)
+        release.set()
+        for thread in (holder, late_thread, on_time_thread):
+            thread.join(timeout=30)
+
+        self.assertIsInstance(results['late'], AttemptExpired)
+        self.assertIsInstance(results['on_time'], tuple, results)
+        submission, created = results['on_time']
+        self.assertTrue(created)
+        self.assertEqual(submission.submitted_at, on_time)
+        attempt.refresh_from_db()
+        self.assertEqual((attempt.status, attempt.finalized_at), ('submitted', on_time))
 
 
 @skipUnlessDBFeature('has_select_for_update')

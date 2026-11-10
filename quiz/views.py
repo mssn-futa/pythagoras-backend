@@ -14,9 +14,16 @@ are 409 (``QUIZ_IMMUTABLE``, ``INVALID_TRANSITION``, ``RESOURCE_REFERENCED``).
 Legacy aliases (no-slash detail routes, ``PUT``, ``POST /quiz/question/``) run
 the same serializers and services, so they cannot bypass a rule.
 
-Student availability is ``published`` with a future deadline. Temporary until
-ASSESS-04: ``POST /quiz/submissions/`` grades an MCQ answer map directly,
-creating and finalizing the student's single attempt in one step.
+Student availability is ``published`` with a future deadline.
+
+ASSESS-04 student participation (docs/assessment-results.md): start or resume
+the single timed attempt (``POST /quiz/quizzes/{id}/attempts/``), read it with
+its key-free questions and server time (``GET /quiz/attempts/{id}/``), finalize
+it once (``POST /quiz/submissions/`` with ``attempt_id``; identical replay 200,
+changed 409 ``SUBMISSION_CONFLICT``, first arrival at/after expiry 409
+``ATTEMPT_EXPIRED``), and read own results/history; admins read flat paginated
+result rows per quiz and any result. The ASSESS-01 direct submission
+(``{"quiz", "answers"}``) is retired (400), so nothing bypasses the attempt.
 """
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -40,7 +47,7 @@ from quiz import authoring, lifecycle
 from quiz.errors import (
     AssessmentError, AuthoringInvalid, PublicationInvalid, QuizImmutable, is_immutable_db_error,
 )
-from quiz.models import Course, Question, Quiz, Submission
+from quiz.models import Attempt, Course, Question, Quiz, Submission
 from quiz.permissions import (
     IsActiveAdmin, IsActiveStudent, IsActiveUser, admin_or_read_permissions, is_admin,
     visible_questions, visible_quizzes, visible_submissions,
@@ -48,10 +55,12 @@ from quiz.permissions import (
 from quiz.serializers import (
     AdminQuestionSerializer, AdminQuestionWriteSerializer, AdminQuizSerializer,
     AdminQuizWriteSerializer, AdminSubmissionDetailSerializer, AdminSubmissionSerializer,
-    CourseSerializer, QuizListSerializer, StudentQuestionSerializer, StudentQuizSerializer,
-    StudentSubmissionSerializer, SubmissionCreateSerializer,
+    CourseSerializer, QuizListSerializer, StudentAttemptDetailSerializer,
+    StudentQuestionSerializer, StudentQuizSerializer, StudentSubmissionSerializer,
+    SubmissionCreateSerializer,
 )
-from quiz.services import InvalidAnswers, QuizService
+from quiz.services import InvalidAnswers
+from quiz.throttles import AttemptStartRateThrottle, SubmissionRateThrottle
 
 
 @contextmanager
@@ -68,7 +77,7 @@ def domain_errors():
         raise APIError(exc.code, exc.message, fields=exc.fields)
     except InvalidAnswers as exc:
         raise serializers.ValidationError(exc.as_fields())
-    except (Quiz.DoesNotExist, Question.DoesNotExist):
+    except (Quiz.DoesNotExist, Question.DoesNotExist, Attempt.DoesNotExist):
         raise Http404()
     except ProtectedError:
         raise APIError('RESOURCE_REFERENCED',
@@ -512,78 +521,242 @@ class QuizCloseView(APIView):
                                 'Quiz closed.' if changed else 'Quiz already closed.')
 
 
-class QuizSubmissionView(APIView):
+# ----------------------------------------------------------------------------
+# ASSESS-04: attempts, submissions and results
+# ----------------------------------------------------------------------------
 
-    permission_classes = [IsActiveAdmin]
+EXAMPLE_ATTEMPT = {
+    'id': 123, 'quiz_id': 45, 'quiz_title': 'Arabic week 1', 'status': 'in_progress',
+    'started_at': '2026-10-12T10:00:00Z', 'expires_at': '2026-10-12T10:30:00Z',
+    'server_time': '2026-10-12T10:00:00Z', 'submission_id': None,
+    'questions': [{'id': 10, 'text': 'Question', 'points': 2, 'order': 1, 'options': [
+        {'id': 101, 'text': 'A', 'order': 1}, {'id': 102, 'text': 'B', 'order': 2},
+        {'id': 103, 'text': 'C', 'order': 3}, {'id': 104, 'text': 'D', 'order': 4}]}],
+}
+EXAMPLE_RESULT = {
+    'id': 9, 'quiz_id': 45, 'quiz_title': 'Arabic week 1', 'attempt_id': 123,
+    'status': 'submitted', 'score': 2, 'total_points': 2,
+    'submitted_at': '2026-10-12T10:20:00Z', 'graded_at': '2026-10-12T10:20:00Z',
+}
+EXAMPLE_ADMIN_ROW = {**EXAMPLE_RESULT, 'student_id': 7, 'student_name': 'Amina Yusuf',
+                     'student_email': 'amina@example.test', 'is_legacy': False}
+EXAMPLE_ADMIN_DETAIL = {
+    **EXAMPLE_ADMIN_ROW, 'answers': {'10': 102},
+    'grading_snapshot': {'version': 1, 'quiz_id': 45, 'quiz_title': 'Arabic week 1', 'score': 2,
+                         'total_points': 2, 'questions': [
+                             {'question_id': 10, 'order': 1, 'points': 2,
+                              'selected_option_id': 102, 'awarded_points': 2}]},
+    'started_at': '2026-10-12T10:00:00Z', 'expires_at': '2026-10-12T10:30:00Z',
+}
+SUBMIT_REQUEST = OpenApiExample('Submit', request_only=True,
+                                value={'attempt_id': 123, 'answers': {'10': 102}})
+NOT_FOUND_EXAMPLE = OpenApiExample(
+    'Not found', response_only=True, status_codes=['404'],
+    value=error('NOT_FOUND', 'The requested resource was not found.'))
+
+
+def positive_int_param(request, name):
+    """Optional positive-integer query filter (400 field error otherwise)."""
+    raw = request.query_params.get(name)
+    if raw is None:
+        return None
+    if not (raw.isascii() and raw.isdigit()) or int(raw) < 1:
+        raise serializers.ValidationError({name: ['A positive integer ID is required.']})
+    return int(raw)
+
+
+def attempt_response(attempt, message, status_code=status.HTTP_200_OK):
+    attempt = Attempt.objects.select_related('quiz').get(pk=attempt.pk)
+    data = StudentAttemptDetailSerializer(attempt, context={'now': lifecycle.server_now()}).data
+    return success_response(data, message, status=status_code)
+
+
+class QuizAttemptStartView(APIView):
+    """Start, or resume, the student's single timed attempt (A09/A10)."""
+
+    permission_classes = [IsActiveStudent]
+    throttle_classes = [AttemptStartRateThrottle]
 
     @extend_schema(
-        summary="Get all submissions for a Quiz (Admin Only)",
-        description="Retrieves a list of all student submissions for a specific quiz ID.",
-        responses={200: AdminSubmissionSerializer(many=True)}
+        summary='Start or resume my attempt (student only)',
+        request=None,
+        responses={201: StudentAttemptDetailSerializer, 200: StudentAttemptDetailSerializer,
+                   **ERROR_RESPONSES, 404: OpenApiTypes.OBJECT},
+        examples=[
+            OpenApiExample('Started', response_only=True, status_codes=['201'],
+                           value=envelope(EXAMPLE_ATTEMPT, 'Attempt started.')),
+            OpenApiExample('Existing attempt', response_only=True, status_codes=['200'],
+                           value=envelope({**EXAMPLE_ATTEMPT,
+                                           'server_time': '2026-10-12T10:05:00Z'},
+                                          'Attempt retrieved.')),
+            OpenApiExample('Not available', response_only=True, status_codes=['409'],
+                           value=error('QUIZ_UNAVAILABLE', 'This quiz is not available.')),
+            NOT_FOUND_EXAMPLE,
+        ],
+        description=(
+            'Idempotent start (A09). The first call creates the attempt at the server instant '
+            '(201): `expires_at = min(started_at + time_limit, deadline)` (A10). Any later call '
+            'returns the same attempt unchanged (200), also after the quiz closed or its '
+            'deadline/expiry passed, so a retry never creates or re-times an attempt. Only a '
+            'new attempt needs an available quiz (published, deadline in the future): a '
+            'closed or past-deadline quiz is 409 QUIZ_UNAVAILABLE, a draft or missing quiz '
+            '404 (checked first, so drafts look missing to every student); a legacy '
+            'submission for the quiz is 409 SUBMISSION_CONFLICT. No request '
+            'body. Throttled at 20/min per student (429).'),
+    )
+    def post(self, request, quiz_id):
+        reject_body(request)
+        with domain_errors():
+            # A draft raises Quiz.DoesNotExist (404) before any other check.
+            attempt, created = lifecycle.start_attempt(quiz_id, request.user)
+        if created:
+            return attempt_response(attempt, 'Attempt started.', status.HTTP_201_CREATED)
+        return attempt_response(attempt, 'Attempt retrieved.')
+
+
+class AttemptDetailView(APIView):
+    """The student's own attempt with its key-free questions and server time."""
+
+    permission_classes = [IsActiveStudent]
+
+    @extend_schema(
+        summary='Get my attempt (student only)',
+        responses={200: StudentAttemptDetailSerializer, 404: OpenApiTypes.OBJECT},
+        examples=[OpenApiExample('Attempt', response_only=True,
+                                 value=envelope(EXAMPLE_ATTEMPT, 'Attempt retrieved.')),
+                  OpenApiExample('Submitted', response_only=True, value=envelope(
+                      {**EXAMPLE_ATTEMPT, 'status': 'submitted',
+                       'server_time': '2026-10-12T10:21:00Z', 'submission_id': 9},
+                      'Attempt retrieved.')),
+                  NOT_FOUND_EXAMPLE],
+        description=(
+            'Own attempts only (another student\'s attempt is 404). `status` is effective at '
+            '`server_time` (the database clock): an unfinalized attempt at/after `expires_at` '
+            'reads `expired`. `started_at`/`expires_at` never change; `submission_id` is null '
+            'until finalized. Questions are MCQ only, in persisted order, with option IDs and '
+            'text and never a correctness key. Clients anchor their countdown to '
+            '`server_time`/`expires_at`.'),
+    )
+    def get(self, request, attempt_id):
+        attempt = get_object_or_404(Attempt.objects.filter(student=request.user), pk=attempt_id)
+        return attempt_response(attempt, 'Attempt retrieved.')
+
+
+class QuizSubmissionView(APIView):
+    """Admin results of one quiz: flat, paginated rows."""
+
+    permission_classes = [IsActiveAdmin]
+    pagination_class = StandardPagination
+
+    @extend_schema(
+        summary='Results of a quiz (admin only)',
+        responses={200: AdminSubmissionSerializer(many=True), 404: OpenApiTypes.OBJECT},
+        examples=[OpenApiExample('Page', response_only=True, value=EXAMPLE_ADMIN_ROW)],
+        description=(
+            'Paginated (`page`, `page_size` default 20 max 100) finalized results of one quiz, '
+            'newest first (`-submitted_at`, `-id`). Flat rows: result fields plus `student_id`, '
+            '`student_name`, `student_email` and `is_legacy`. Legacy rows (before attempts) '
+            'have null `attempt_id`/`total_points`. Expired attempts have no result row.'),
     )
     def get(self, request, quiz_id):
         quiz = get_object_or_404(Quiz, pk=quiz_id)
-        submissions = Submission.objects.filter(quiz=quiz).select_related(
-            'quiz', 'student').order_by('pk')
-        serializer = AdminSubmissionSerializer(submissions, many=True)
-        return success_response(
-            serializer.data, f"Found {submissions.count()} submissions for {quiz.title}")
+        queryset = Submission.objects.filter(quiz=quiz).select_related(
+            'quiz', 'student').order_by('-submitted_at', '-pk')
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        data = AdminSubmissionSerializer(page, many=True).data
+        return success_response(paginator.get_paginated_response(data).data,
+                                'Results retrieved.')
 
 
 class UserSubmissionView(APIView):
+    pagination_class = StandardPagination
 
     def get_permissions(self):
         if self.request.method == 'POST':
             return [IsActiveStudent()]
         return [IsActiveUser()]
 
-    @extend_schema(
-        summary="Get my submission history",
-        description="The authenticated user's own submissions, without answer keys.",
-        responses={200: StudentSubmissionSerializer(many=True)}
-    )
-    def get(self, request):
-        submissions = Submission.objects.filter(student=request.user).select_related(
-            'quiz').order_by('pk')
-        serializer = StudentSubmissionSerializer(submissions, many=True)
-        return success_response(serializer.data, "Your submission history retrieved successfully")
+    def get_throttles(self):
+        if self.request.method == 'POST':
+            return [SubmissionRateThrottle()]
+        return []
 
     @extend_schema(
-        summary="Submit a Quiz (student only)",
+        summary='My results history',
+        parameters=[
+            OpenApiParameter('attempt', int, description='Only the result of this attempt.'),
+            OpenApiParameter('quiz', int, description='Only results of this quiz.'),
+        ],
+        responses={200: StudentSubmissionSerializer(many=True)},
+        examples=[OpenApiExample('Page', response_only=True, value=EXAMPLE_RESULT)],
         description=(
-            "Temporary direct submission of an available quiz (published, before its "
-            "deadline), graded on the server; it creates and finalizes the student's single "
-            "attempt. `answers` maps "
-            "decimal question-ID strings to the selected option ID. The student and score "
-            "come from the server; `student`, `score` and other keys are rejected. One "
-            "submission per quiz: an identical replay returns 200 with the saved result, "
-            "different answers return 409 SUBMISSION_CONFLICT."
-        ),
+            'The authenticated user\'s own finalized results, newest first (`-submitted_at`, '
+            '`-id`), paginated (`page`, `page_size` default 20 max 100), optionally filtered by '
+            '`attempt` and/or `quiz` (positive integer IDs, else 400). History stays available '
+            'after closing/deadline. No answers, snapshots or keys. Admins have no results '
+            'of their own (use `/quiz/quizzes/{id}/submissions/`).'),
+    )
+    def get(self, request):
+        queryset = Submission.objects.filter(student=request.user).select_related('quiz')
+        attempt_id = positive_int_param(request, 'attempt')
+        quiz_id = positive_int_param(request, 'quiz')
+        if attempt_id is not None:
+            queryset = queryset.filter(attempt_id=attempt_id)
+        if quiz_id is not None:
+            queryset = queryset.filter(quiz_id=quiz_id)
+        queryset = queryset.order_by('-submitted_at', '-pk')
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        data = StudentSubmissionSerializer(page, many=True).data
+        return success_response(paginator.get_paginated_response(data).data,
+                                'Results retrieved.')
+
+    @extend_schema(
+        summary='Submit my attempt (student only)',
         request=SubmissionCreateSerializer,
-        responses={201: StudentSubmissionSerializer, 200: StudentSubmissionSerializer},
+        responses={201: StudentSubmissionSerializer, 200: StudentSubmissionSerializer,
+                   **ERROR_RESPONSES, 404: OpenApiTypes.OBJECT},
+        examples=[
+            SUBMIT_REQUEST,
+            OpenApiExample('Graded', response_only=True, status_codes=['201'],
+                           value=envelope(EXAMPLE_RESULT, 'Result saved.')),
+            OpenApiExample('Replay', response_only=True, status_codes=['200'],
+                           value=envelope(EXAMPLE_RESULT, 'Result already saved.')),
+            OpenApiExample('Invalid answers', response_only=True, status_codes=['400'],
+                           value=error('VALIDATION_ERROR', 'Correct the highlighted fields.',
+                                       {'answers': {'10': ['Not an option of this question.']}})),
+            OpenApiExample('Expired', response_only=True, status_codes=['409'],
+                           value=error('ATTEMPT_EXPIRED', 'This attempt has expired.')),
+            OpenApiExample('Conflict', response_only=True, status_codes=['409'],
+                           value=error('SUBMISSION_CONFLICT', 'Different answers were already '
+                                       'submitted for this attempt.')),
+            NOT_FOUND_EXAMPLE,
+        ],
+        description=(
+            'Finalize the student\'s own attempt once, graded on the server. Body: '
+            '`attempt_id` and `answers` mapping decimal question-ID strings of the quiz to '
+            'the integer ID of one option of that question; unanswered questions score zero. '
+            'Every other key (`student`, `score`, `quiz`, ...) is 400. Order: 400 structure; '
+            '404 a missing or another student\'s attempt; an existing result is returned for '
+            'an identical answer map (200, also after expiry/closing) and different answers '
+            'are 409 SUBMISSION_CONFLICT (never overwritten); a first submission arriving '
+            'at/after `expires_at` is 409 ATTEMPT_EXPIRED (no grade); invalid answers are '
+            '400 with `fields.answers.<question id>`; then grading by persisted question '
+            'points and correct option, the immutable snapshot and the attempt status are '
+            'saved atomically (201). Closing the quiz does not block an unexpired attempt. '
+            'Throttled at 60/min per student (429).'),
     )
     def post(self, request):
-        serializer = SubmissionCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            submission, created = QuizService.submit(
-                quiz_id=serializer.validated_data['quiz'],
-                student=request.user,
-                answers=serializer.validated_data['answers'],
-            )
-        except InvalidAnswers as exc:
-            raise serializers.ValidationError(exc.as_fields())
-        except AssessmentError as exc:
-            # SUBMISSION_CONFLICT, or ATTEMPT_EXPIRED for an existing expired attempt.
-            message = exc.message
-            if exc.code == 'SUBMISSION_CONFLICT':
-                message = 'You have already submitted different answers for this quiz.'
-            raise APIError(exc.code, message)
-        data = StudentSubmissionSerializer(submission).data
+        data = validated(SubmissionCreateSerializer(data=request.data))
+        with domain_errors():
+            submission, created = lifecycle.finalize_attempt(
+                data['attempt_id'], request.user, data['answers'])
+        submission = Submission.objects.select_related('quiz').get(pk=submission.pk)
+        payload = StudentSubmissionSerializer(submission).data
         if not created:
-            return success_response(data, "Submission already saved.")
-        return success_response(data, "Quiz submitted and graded successfully!",
-                                status=status.HTTP_201_CREATED)
+            return success_response(payload, 'Result already saved.')
+        return success_response(payload, 'Result saved.', status=status.HTTP_201_CREATED)
 
 
 class SubmissionDetailView(APIView):
@@ -591,15 +764,22 @@ class SubmissionDetailView(APIView):
     permission_classes = [IsActiveUser]
 
     @extend_schema(
-        summary="View Submission Details",
-        description="Students see only their own submission, without answer keys (another "
-                    "student's submission is 404). Admins see any, with the quiz and keys.",
+        summary='Get a result',
+        description='Students see only their own result (another student\'s is 404) without '
+                    'answers or keys. Admins see any result with the student\'s identity, the '
+                    'stored answers, the grading snapshot and the attempt timing. Results are '
+                    'immutable: there is no grade mutation route.',
         responses={200: role_specific('SubmissionDetail', AdminSubmissionDetailSerializer,
-                                      StudentSubmissionSerializer)},
+                                      StudentSubmissionSerializer), 404: OpenApiTypes.OBJECT},
+        examples=[OpenApiExample('Student result', response_only=True,
+                                 value=envelope(EXAMPLE_RESULT, 'Result retrieved.')),
+                  OpenApiExample('Admin result', response_only=True,
+                                 value=envelope(EXAMPLE_ADMIN_DETAIL, 'Result retrieved.')),
+                  NOT_FOUND_EXAMPLE],
     )
     def get(self, request, pk):
-        submission = get_object_or_404(visible_submissions(request.user), pk=pk)
+        queryset = visible_submissions(request.user).select_related('attempt')
+        submission = get_object_or_404(queryset, pk=pk)
         serializer_class = (AdminSubmissionDetailSerializer if is_admin(request.user)
                             else StudentSubmissionSerializer)
-        return success_response(serializer_class(submission).data,
-                                "Student's Submission for a quiz retrieved successfully")
+        return success_response(serializer_class(submission).data, 'Result retrieved.')
