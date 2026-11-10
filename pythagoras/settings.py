@@ -270,6 +270,11 @@ R2_PUBLIC_DOMAIN = os.getenv('R2_PUBLIC_DOMAIN', '')
 R2_UPLOAD_INTENT_TTL_SECONDS = env_positive_int('R2_UPLOAD_INTENT_TTL_SECONDS', 900)
 R2_PREVIEW_TTL_SECONDS = env_positive_int('R2_PREVIEW_TTL_SECONDS', 300)
 R2_CORS_ALLOWED_ORIGINS = env_list('R2_CORS_ALLOWED_ORIGINS')
+# Development only: honored solely when DEBUG is also true (never production).
+R2_ALLOW_R2_DEV_DOMAIN = env_bool('R2_ALLOW_R2_DEV_DOMAIN')
+# Optional CDN purge of deleted public media URLs (DAWAH-02); both or neither.
+CLOUDFLARE_ZONE_ID = os.getenv('CLOUDFLARE_ZONE_ID', '').strip()
+CLOUDFLARE_PURGE_API_TOKEN = os.getenv('CLOUDFLARE_PURGE_API_TOKEN', '').strip()
 AUTOMATION_TIMEZONE = os.getenv('AUTOMATION_TIMEZONE', 'Africa/Lagos')
 AUTOMATION_CATCH_UP_DAYS = env_positive_int('AUTOMATION_CATCH_UP_DAYS', 1)
 AUTOMATION_REMINDER_GRACE_SECONDS = env_positive_int('AUTOMATION_REMINDER_GRACE_SECONDS', 900)
