@@ -4,7 +4,7 @@ from rest_framework import serializers
 
 from pythagoras.serializers import UTCDateTimeField
 
-from . import uploads
+from . import uploads, youtube
 from .media import MP3_CONTENT_TYPE, MP3_MAX_BYTES
 from .models import Event, EventResource, PublicationStatus
 
@@ -86,7 +86,8 @@ class ResourceFieldsMixin(serializers.Serializer):
         return uploads.preview_url(obj)
 
     @extend_schema_field({'type': 'object', 'nullable': True, 'additionalProperties': True,
-                          'description': 'Typed playback metadata (video: DAWAH-05).'})
+                          'description': 'Video with a validated YouTube ID: {provider:"youtube", video_id, '
+                                         'watch_url, embed_url} (constructed server-side); null otherwise.'})
     def get_playback(self, obj):
         return obj.playback
 
@@ -191,10 +192,29 @@ class EventResourceWriteSerializer(StrictWriteMixin, serializers.ModelSerializer
     """Metadata only. The URL's event owns the association; files are not accepted
     (durable uploads use DAWAH-02's intent/finalize protocol)."""
 
+    youtube_url = serializers.CharField(
+        required=False, write_only=True, trim_whitespace=False, max_length=youtube.MAX_URL_LENGTH,
+        help_text='Video resources only: a YouTube watch/embed/shorts or youtu.be HTTPS link. Normalized to '
+                  'the video ID; the submitted text is not stored.')
+
     class Meta:
         model = EventResource
-        fields = ['title', 'type', 'duration']
+        fields = ['title', 'type', 'duration', 'youtube_url']
         extra_kwargs = {'duration': {'min_value': 1}}
+
+    def validate_youtube_url(self, value):
+        try:
+            return youtube.parse_youtube_url(value)
+        except youtube.InvalidYouTubeUrl as error:
+            raise serializers.ValidationError(str(error)) from None
+
+    def validate(self, attrs):
+        if 'youtube_url' in attrs:
+            resource_type = attrs.get('type', getattr(self.instance, 'type', None))
+            if resource_type != EventResource.Type.VIDEO:
+                raise serializers.ValidationError({'youtube_url': ['Only video resources have a YouTube link.']})
+            attrs['youtube_video_id'] = attrs.pop('youtube_url')
+        return attrs
 
     def validate_type(self, value):
         instance = self.instance

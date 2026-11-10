@@ -217,10 +217,15 @@ def update_resource(event_id, resource_id, serializer_factory):
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
         extra = []
+        if 'youtube_video_id' in data and resource.status == PUBLISHED:
+            raise APIError('UNPUBLISH_REQUIRED', 'Unpublish this resource before changing its video link.',
+                           status_code=409)
         if 'type' in data and data['type'] != resource.type:
             uploads.cleanup_after_commit(uploads.supersede_open_intents(resource, reason='RESOURCE_TYPE_CHANGED'))
             resource.storage_status = EventResource.initial_storage_status(data['type'])
             extra.append('storage_status')
+            if data['type'] != EventResource.Type.VIDEO and resource.youtube_video_id:
+                data.setdefault('youtube_video_id', '')  # a link belongs to video resources only
         apply_update(resource, data, extra)
     resource.event = event
     return resource
