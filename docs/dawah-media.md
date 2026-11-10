@@ -71,7 +71,35 @@ Optional throttle override: `REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['dawah_upl
 
 ## Tests
 
-Fake adapter tests run in the normal suite. A live S3-compatible proof
+Fake-adapter tests run in the normal suite. A live S3-compatible proof
 (`dawah/tests/test_s3_integration.py`) runs only when `DAWAH_S3_TEST_ENDPOINT`, `_ACCESS_KEY`,
 `_SECRET_KEY`, `_PRIVATE_BUCKET`, `_PUBLIC_BUCKET`, `_PUBLIC_BASE_URL` (optional `_REGION`) point at
-throwaway buckets (MinIO or an R2 test account).
+throwaway buckets. Set `DAWAH_S3_TEST_EMULATOR=moto` only for a moto run: it skips (with reasons)
+exactly the cases moto cannot emulate. Never set it against R2. Every case must pass on R2 (RELEASE-07).
+
+### Emulator evidence (moto) - NOT R2 proof
+
+moto is an AWS S3 emulator, not Cloudflare R2. Passing here shows that the adapter and API flow
+work against a real S3 HTTP wire protocol (botocore signing, path-style addressing, copy, range).
+It does **not** prove R2 behavior, R2 CORS, the custom domain, or signature enforcement. Docker Hub,
+quay.io and dl.min.io were unreachable from the build environment, so MinIO could not be used.
+
+Run (2026-11-10, moto 5.2.5 `moto_server` in a throwaway venv outside the project, buckets created
+via boto3, public bucket given an anonymous `s3:GetObject` policy):
+
+| Case | moto result |
+|---|---|
+| API end to end: intent → browser PUT with signed `Content-Type` → finalize (HEAD, copy at ETag, stream + MP3 validation) → preview GET → publish (copy to public) → public Range 206 → unpublish deletes public copy | pass |
+| Presigned PUT with `Content-Type` lands an object; server-observed size/type/ETag | pass |
+| Copy at the observed ETag | pass |
+| Staging overwrite through the still-valid PUT URL leaves the validated copy unchanged | pass |
+| Public GET `Range: bytes=0-99` → 206 with `Content-Range`, `Content-Type`, `Content-Disposition`, `Cache-Control`; adapter range read | pass |
+| Admin preview (signed GET) reads the private object with the response Content-Type override | pass |
+| Anonymous GET of a private-bucket object is refused | pass |
+| Signed Content-Type enforced (wrong type → 403) | skipped: moto does not verify presigned signatures (default mode accepts anything; its IAM-auth mode fails query-string auth with HTTP 500) |
+| Signature bound to the staging key (swapped key / unsigned PUT refused) | skipped: same reason |
+| `x-amz-copy-source-if-match` refuses a stale ETag (also after a staging overwrite) | skipped: moto 5.2.5 implements only `if-none-match` for copies; the adapter's request does carry `x-amz-copy-source-if-match` (checked on the wire) |
+| Anonymous public HEAD → 200 | skipped: moto authorizes HEAD as a nonexistent `s3:HeadObject` action, so an `s3:GetObject` policy still gives 403 for HEAD (confirmed by adding that action) |
+
+The fake-adapter suite covers the skipped properties at the protocol level. The provider-level
+proof for them remains RELEASE-07 on R2.
