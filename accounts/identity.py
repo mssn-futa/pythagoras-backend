@@ -30,9 +30,9 @@ def find_identity_collisions(rows):
     """
     groups = {'email': defaultdict(list), 'matric_number': defaultdict(list)}
     for user_id, email, matric in rows:
-        email_key = normalize_email(email)
-        if email_key:
-            groups['email'][email_key].append(user_id)
+        # Blank/whitespace/NULL emails all normalize to '' and collide with
+        # each other under the unique constraints, so '' is a real key.
+        groups['email'][normalize_email(email) or ''].append(user_id)
         matric_key = normalize_matric(matric)
         if matric_key:
             groups['matric_number'][matric_key].append(user_id)
