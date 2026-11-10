@@ -1,381 +1,289 @@
-from django.shortcuts import get_object_or_404, render
-from django.utils import timezone
-from django.db import transaction
+"""Legacy assessment endpoints with shared role and object permissions.
 
-from rest_framework import status, permissions
+Every handler resolves permissions through ``get_permissions`` (never by
+assigning ``permission_classes`` inside a handler), and every object lookup goes
+through a role-aware queryset from ``quiz.permissions`` before any serializer
+or mutation runs. Student responses use only ``Student*`` serializers.
+
+Temporary legacy behaviour (until ASSESS-02/03/04): quiz availability is the
+``is_active`` flag, and ``POST /quiz/submissions/`` grades an MCQ answer map
+directly instead of an attempt. It is limited to one submission per student
+and quiz; an identical replay returns the saved result.
+"""
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from drf_spectacular.utils import PolymorphicProxySerializer, extend_schema
+from rest_framework import serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.exceptions import PermissionDenied
-from drf_spectacular.utils import extend_schema
-from accounts.permissions import IsAdmin, IsAdminOrReadOnly
-from quiz.models import Course, Question, Quiz, Submission
-from .serializers import (
-                CourseSerializer, QuestionSerializer, QuestionCreateSerializer, 
-                QuizSerializer, QuizListSerializer, SubmissionCreateSerializer, 
-                SubmissionDetailSerializer, SubmissionSerializer
-)
-from quiz.services import QuizService
 
-class CourseView(APIView):
-    
-    permission_classes = [IsAdminOrReadOnly]
+from pythagoras.utils import APIError, success_response
+from quiz.models import Course, Question, Quiz, Submission
+from quiz.permissions import (
+    IsActiveAdmin, IsActiveStudent, IsActiveUser, admin_or_read_permissions, is_admin,
+    visible_questions, visible_quizzes, visible_submissions,
+)
+from quiz.serializers import (
+    AdminQuestionSerializer, AdminQuestionWriteSerializer, AdminQuizSerializer,
+    AdminSubmissionDetailSerializer, AdminSubmissionSerializer, CourseSerializer,
+    QuizListSerializer, StudentQuestionSerializer, StudentQuizSerializer,
+    StudentSubmissionSerializer, SubmissionCreateSerializer,
+)
+from quiz.services import InvalidAnswers, QuizService, SubmissionConflict
+
+
+def role_specific(name, admin, student):
+    return PolymorphicProxySerializer(
+        component_name=name, serializers=[admin, student], resource_type_field_name=None)
+
+
+class AdminOrReadView(APIView):
+    """Active users read (filtered by role); only active admins write."""
+
+    def get_permissions(self):
+        return admin_or_read_permissions(self.request)
+
+
+class CourseView(AdminOrReadView):
 
     @extend_schema(
         responses={200: CourseSerializer(many=True)},
         description="Retrieve a list of all courses."
     )
     def get(self, request):
-        queryset = Course.objects.all()
-        serializer = CourseSerializer(queryset, many=True)
-
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Courses Retrieved Successfully"
-            },
-            status=status.HTTP_200_OK
-        )
+        serializer = CourseSerializer(Course.objects.order_by('pk'), many=True)
+        return success_response(serializer.data, "Courses Retrieved Successfully")
 
     @extend_schema(
         request=CourseSerializer,
         responses={201: CourseSerializer},
-        description="Create a new Course."
+        description="Create a new Course (admin only)."
     )
     def post(self, request):
         serializer = CourseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Course Created Successfully"
-            },
-            status=status.HTTP_201_CREATED
-        )
+        return success_response(serializer.data, "Course Created Successfully",
+                                status=status.HTTP_201_CREATED)
 
 
-class QuizList(APIView):
-    
-    permission_classes = [IsAdminOrReadOnly]
+class QuizList(AdminOrReadView):
 
     @extend_schema(
         responses={200: QuizListSerializer(many=True)},
-        description="Retrieve a list of all quizzes."
+        description="Admins list every quiz; students list active quizzes."
     )
     def get(self, request):
-        queryset = Quiz.objects.all()
-        serializer = QuizListSerializer(queryset, many=True)
-
-        return Response(
-            {
-                'success': True,
-                'data': serializer.data,
-                'message': "Quizzes Retrieved Successfully"
-            }
-        )
+        queryset = visible_quizzes(request.user).select_related(
+            'related_course', 'related_event').order_by('pk')
+        serializer = QuizListSerializer(queryset, many=True, context={'request': request})
+        return success_response(serializer.data, "Quizzes Retrieved Successfully")
 
     @extend_schema(
-        request=QuizSerializer,
-        responses={201: QuizSerializer},
-        description="Create a new Quiz."
+        request=AdminQuizSerializer,
+        responses={201: AdminQuizSerializer},
+        description="Create a new Quiz (admin only)."
     )
     def post(self, request):
-        serializer = QuizSerializer(data=request.data)
+        serializer = AdminQuizSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        return success_response(serializer.data, "Quiz Created Successfully",
+                                status=status.HTTP_201_CREATED)
 
-        return Response(
-            {
-                'success': True,
-                'data': serializer.data,
-                'message': "Quiz Created Successfully"
-            },
-            status=status.HTTP_201_CREATED
-        )
 
-class QuizDetail(APIView):
+class QuizDetail(AdminOrReadView):
 
-    permission_classes = [permissions.IsAuthenticated]
+    def get_quiz(self, quiz_id):
+        return get_object_or_404(visible_quizzes(self.request.user), pk=quiz_id)
 
     @extend_schema(
-        responses ={200: QuizSerializer},
-        description='Retrieve a Specific Quiz by ID.'
+        responses={200: role_specific('QuizDetail', AdminQuizSerializer, StudentQuizSerializer)},
+        description='Retrieve a quiz. Admins receive answer keys; students receive an active '
+                    'quiz with MCQ questions and options only, never keys.'
     )
     def get(self, request, quiz_id):
-        quiz = get_object_or_404(Quiz, pk=quiz_id)
-        serializer = QuizSerializer(quiz)
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Quiz Retrieved Successfully"
-            },
-            status=status.HTTP_200_OK
-        )
+        quiz = self.get_quiz(quiz_id)
+        serializer_class = AdminQuizSerializer if is_admin(request.user) else StudentQuizSerializer
+        return success_response(serializer_class(quiz).data, "Quiz Retrieved Successfully")
 
     @extend_schema(
-        request = QuizSerializer,
-        responses = {200: QuizSerializer},
-        description='Update an existing Quiz.'
+        request=AdminQuizSerializer,
+        responses={200: AdminQuizSerializer},
+        description='Update an existing Quiz (admin only).'
     )
     def put(self, request, quiz_id):
-        quiz = get_object_or_404(Quiz, pk=quiz_id)
-        serializer = QuizSerializer(quiz, data=request.data)
+        quiz = self.get_quiz(quiz_id)
+        serializer = AdminQuizSerializer(quiz, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Quiz Updated Successfully"
-            },
-            status=status.HTTP_200_OK
-        )
-    
+        return success_response(serializer.data, "Quiz Updated Successfully")
+
     @extend_schema(
-        responses = {204: None},
-        description="Delete a Quiz"
+        responses={204: None},
+        description="Delete a quiz without submissions (admin only). A quiz with "
+                    "submissions returns 409 RESOURCE_REFERENCED so results are never cascaded."
     )
     def delete(self, request, quiz_id):
-        permission_classes = [IsAdmin]
-        quiz = get_object_or_404(Quiz, pk=quiz_id)
-        quiz.delete()
-        return Response(
-            {
-                "success": True,
-                "data": {},
-                "message": "Quiz Deleted Successfully"
-            },
-            status=status.HTTP_204_NO_CONTENT
-        )
+        with transaction.atomic():
+            quiz = get_object_or_404(visible_quizzes(request.user).select_for_update(), pk=quiz_id)
+            if Submission.objects.filter(quiz=quiz).exists():
+                raise APIError('RESOURCE_REFERENCED',
+                               'This quiz has submissions and cannot be deleted.')
+            quiz.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class QuestionList(APIView):
+    """Admin authoring/list path. Students read questions through quiz detail."""
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveAdmin]
 
     @extend_schema(
-        responses = {200: QuestionSerializer(many=True)}
+        responses={200: AdminQuestionSerializer(many=True)},
+        description="List every question with answer keys (admin only)."
     )
     def get(self, request):
-        queryset = Question.objects.all()
-        
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Questions Retrieved Successfully"
-            },
-            status=status.HTTP_200_OK
-        )
+        queryset = Question.objects.order_by('pk')
+        serializer = AdminQuestionSerializer(queryset, many=True)
+        return success_response(serializer.data, "Questions Retrieved Successfully")
 
     @extend_schema(
-        request=QuestionCreateSerializer,
-        responses={201: QuestionSerializer},
-        description="Create a new Question."
+        request=AdminQuestionWriteSerializer,
+        responses={201: AdminQuestionSerializer},
+        description="Create an MCQ question with options (admin only)."
     )
     def post(self, request):
-        serializer = QuestionCreateSerializer(data=request.data)
+        serializer = AdminQuestionWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        with transaction.atomic():
+            serializer.save()
+        return success_response(serializer.data, "Question Created Successfully",
+                                status=status.HTTP_201_CREATED)
 
-        return Response(
-            {
-                'success': True,
-                'data': serializer.data,
-                'message': "Question Created Successfully"
-            },
-            status=status.HTTP_201_CREATED
-        )
 
-class QuestionDetail(APIView):
+class QuestionDetail(AdminOrReadView):
 
-    permission_classes = [permissions.IsAuthenticated]
+    def get_question(self, question_id):
+        return get_object_or_404(visible_questions(self.request.user), pk=question_id)
 
     @extend_schema(
-        responses ={200: QuestionSerializer},
-        description='Retrieve a Specific Question by ID.'
+        responses={200: role_specific('QuestionDetail', AdminQuestionSerializer,
+                                      StudentQuestionSerializer)},
+        description='Retrieve a question. Admins receive answer keys; students receive an '
+                    'MCQ question of an active quiz without keys.'
     )
     def get(self, request, question_id):
-        question = get_object_or_404(Question, pk=question_id)
-        serializer = QuestionSerializer(question)
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Question Retrieved Successfully"
-            },
-            status=status.HTTP_200_OK
-        )
+        question = self.get_question(question_id)
+        serializer_class = (AdminQuestionSerializer if is_admin(request.user)
+                            else StudentQuestionSerializer)
+        return success_response(serializer_class(question).data, "Question Retrieved Successfully")
 
     @extend_schema(
-        request = QuestionCreateSerializer,
-        responses = {200: QuestionSerializer},
-        description='Update an existing Quiz.'
+        request=AdminQuestionWriteSerializer,
+        responses={200: AdminQuestionSerializer},
+        description='Replace an existing question and its options (admin only).'
     )
     def put(self, request, question_id):
-        question = get_object_or_404(Question, pk=question_id)
-        serializer = QuestionCreateSerializer(question, data=request.data)
+        question = self.get_question(question_id)
+        serializer = AdminQuestionWriteSerializer(question, data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Question Updated Successfully"
-            },
-            status=status.HTTP_200_OK
-        )
-    
+        with transaction.atomic():
+            serializer.save()
+        return success_response(serializer.data, "Question Updated Successfully")
+
     @extend_schema(
-        responses = {204: None},
-        description="Delete a Question"
+        responses={204: None},
+        description="Delete a Question (admin only)."
     )
     def delete(self, request, question_id):
-        # only admin can delete
-        if not request.user.is_staff:
-            raise PermissionDenied("Only admins can delete questions.")
-        question = get_object_or_404(Question, pk=question_id)
-        question.delete()
-        return Response(
-            {
-                "success": True,
-                "data": {},
-                "message": "Question Deleted Successfully"
-            },
-            status=status.HTTP_204_NO_CONTENT
-        )
+        self.get_question(question_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class QuizSubmissionView(APIView):
 
-    permission_classes = [IsAdmin]
+    permission_classes = [IsActiveAdmin]
 
     @extend_schema(
         summary="Get all submissions for a Quiz (Admin Only)",
         description="Retrieves a list of all student submissions for a specific quiz ID.",
-        responses = {200: SubmissionSerializer(many=True)}
+        responses={200: AdminSubmissionSerializer(many=True)}
     )
     def get(self, request, quiz_id):
         quiz = get_object_or_404(Quiz, pk=quiz_id)
-
-        submission = Submission.objects.filter(quiz=quiz)
-        serializer = SubmissionSerializer(submission, many=True)
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": f"Found {submission.count()} submissions for {quiz.title}"
-            },
-            status= status.HTTP_200_OK
-        )
+        submissions = Submission.objects.filter(quiz=quiz).select_related(
+            'quiz', 'student').order_by('pk')
+        serializer = AdminSubmissionSerializer(submissions, many=True)
+        return success_response(
+            serializer.data, f"Found {submissions.count()} submissions for {quiz.title}")
 
 
 class UserSubmissionView(APIView):
 
-    permission_classes = [permissions.IsAuthenticated]
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [IsActiveStudent()]
+        return [IsActiveUser()]
 
     @extend_schema(
         summary="Get my submission history",
-        description = "Retrieve all the Courses Submisiion for a specific student",
-        responses = {200: SubmissionSerializer(many=True)}
+        description="The authenticated user's own submissions, without answer keys.",
+        responses={200: StudentSubmissionSerializer(many=True)}
     )
     def get(self, request):
-        my_submission = Submission.objects.filter(student=request.user)
-        serializer = SubmissionSerializer(my_submission, many=True)
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Your submission history retrieved successfully"
-            },
-            status= status.HTTP_200_OK
-        )
-    
+        submissions = Submission.objects.filter(student=request.user).select_related(
+            'quiz').order_by('pk')
+        serializer = StudentSubmissionSerializer(submissions, many=True)
+        return success_response(serializer.data, "Your submission history retrieved successfully")
+
     @extend_schema(
-        summary="Submit a Quiz",
-        description="Create a new submission. Answers must be valid JSON.",
-        request= SubmissionCreateSerializer,
-        responses = {201: SubmissionCreateSerializer}
+        summary="Submit a Quiz (student only)",
+        description=(
+            "Legacy submission of an active quiz, graded on the server. `answers` maps "
+            "decimal question-ID strings to the selected option ID. The student and score "
+            "come from the server; `student`, `score` and other keys are rejected. One "
+            "submission per quiz: an identical replay returns 200 with the saved result, "
+            "different answers return 409 SUBMISSION_CONFLICT."
+        ),
+        request=SubmissionCreateSerializer,
+        responses={201: StudentSubmissionSerializer, 200: StudentSubmissionSerializer},
     )
     def post(self, request):
-        serializer = SubmissionCreateSerializer(data=request.data, context={'request': request})
+        serializer = SubmissionCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
-        # create + grade atomically
-        with transaction.atomic():
-            instance = serializer.save(student=request.user)
-            score = QuizService.grade_submission(instance)
-            instance.score = score
-            instance.graded_at = timezone.now()
-            instance.save()
-
-        out = SubmissionDetailSerializer(instance, context={'request': request})
-        return Response(
-            {
-                "success": True,
-                "data": out.data,
-                "message": "Quiz submitted and graded successfully!"
-            },
-            status=status.HTTP_201_CREATED
-        )
+        try:
+            submission, created = QuizService.submit(
+                quiz_id=serializer.validated_data['quiz'],
+                student=request.user,
+                answers=serializer.validated_data['answers'],
+            )
+        except InvalidAnswers as exc:
+            raise serializers.ValidationError(exc.as_fields())
+        except SubmissionConflict:
+            raise APIError('SUBMISSION_CONFLICT',
+                           'You have already submitted different answers for this quiz.')
+        data = StudentSubmissionSerializer(submission).data
+        if not created:
+            return success_response(data, "Submission already saved.")
+        return success_response(data, "Quiz submitted and graded successfully!",
+                                status=status.HTTP_201_CREATED)
 
 
 class SubmissionDetailView(APIView):
 
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_object(self, pk, user):
-        submission = get_object_or_404(Submission, pk=pk)
-
-        if not user.is_staff and submission.student != user:
-            raise PermissionDenied("You are not allowed to view other student's submission.")
-
-        return submission
+    permission_classes = [IsActiveUser]
 
     @extend_schema(
         summary="View Submission Details",
-        description="Retrieve full details of a submission (Answers + Score). Students see only their own; Admin see any.",
-        responses = {200: SubmissionDetailSerializer}
+        description="Students see only their own submission, without answer keys (another "
+                    "student's submission is 404). Admins see any, with the quiz and keys.",
+        responses={200: role_specific('SubmissionDetail', AdminSubmissionDetailSerializer,
+                                      StudentSubmissionSerializer)},
     )
-    def get(self, request, quiz_id):
-        submission = self.get_object(pk=quiz_id, user=request.user)
-        serializer = SubmissionDetailSerializer(submission, context={'request': request})
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Student's Submission for a quiz retrieved successfully"
-            },
-            status=status.HTTP_200_OK
-        )
-
-    @extend_schema(
-        summary = "Grade a Submission (Admin only)",
-        description = "Update the score and feedback. Only accessible by Admins.",
-        request = SubmissionDetailSerializer,
-        responses = {200: SubmissionDetailSerializer},
-    )
-    def patch(self, request, pk):
-        if not request.user.is_staff:
-            return Response(
-                {
-                    "success": False,
-                    "message": "Permission denied. Only Admin can grade submissions."
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-        submission = get_object_or_404(Submission, pk=pk)
-        serializer = SubmissionDetailSerializer(submission, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(
-            {
-                "success": True,
-                "data": serializer.data,
-                "message": "Submission graded successfully."
-            },
-            status=status.HTTP_200_OK
-        )
+    def get(self, request, pk):
+        submission = get_object_or_404(visible_submissions(request.user), pk=pk)
+        serializer_class = (AdminSubmissionDetailSerializer if is_admin(request.user)
+                            else StudentSubmissionSerializer)
+        return success_response(serializer_class(submission).data,
+                                "Student's Submission for a quiz retrieved successfully")
