@@ -20,14 +20,14 @@ def students():
     return User.objects.filter(role=User.Role.STUDENT)
 
 
-def lock_status_scope(target_pk):
+def lock_status_scope(target_pk, *more_pks):
     """Lock the target row and every active product-admin row in one ordered
     statement (consistent lock order, so concurrent status changes serialize
     instead of deadlocking). Must run inside ``transaction.atomic``.
     Returns the locked target or None when it does not exist."""
     rows = list(
         User.objects.select_for_update()
-        .filter(Q(pk=target_pk) | Q(role=User.Role.ADMIN, is_active=True))
+        .filter(Q(pk__in=[target_pk, *more_pks]) | Q(role=User.Role.ADMIN, is_active=True))
         .order_by("pk")
     )
     return next((row for row in rows if row.pk == target_pk), None)
@@ -56,6 +56,25 @@ def assert_status_change_allowed(target, actor, make_active, new_role=None):
                 LAST_ADMIN, "The last active administrator cannot be deactivated or demoted.",
                 status_code=409,
             )
+
+
+SELF_DELETION = "SELF_DELETION"
+
+
+def assert_deletion_allowed(pks, actor):
+    """Refuse deleting the acting admin or every remaining active admin.
+    Call inside ``transaction.atomic`` after ``lock_status_scope(*pks)``; the
+    whole set is refused if any member violates the rule."""
+    pks = set(pks)
+    if actor is not None and actor.pk in pks:
+        raise APIError(SELF_DELETION, "You cannot delete your own account.", status_code=409)
+    active_admins = set(
+        User.objects.filter(role=User.Role.ADMIN, is_active=True).values_list("pk", flat=True)
+    )
+    if active_admins & pks and not active_admins - pks:
+        raise APIError(
+            LAST_ADMIN, "The last active administrator cannot be deleted.", status_code=409
+        )
 
 
 def set_account_active(target_pk, make_active, actor=None):

@@ -495,3 +495,69 @@ class DjangoAdminRetentionTests(StudentAdminBase, TestCase):
         self.assertFalse(student.is_active)
         self.assertEqual(self.post_change(student, first_name="Renamed").status_code, 302)
         self.assertEqual(self.post_change(self.admin, first_name="Ada2").status_code, 302)
+
+
+class DjangoAdminDeletionTests(StudentAdminBase, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.admin.is_staff = self.admin.is_superuser = True
+        self.admin.save()
+        self.client.force_login(self.admin)
+
+    def delete_single(self, user):
+        return self.client.post(f"/admin/accounts/customuser/{user.pk}/delete/", {"post": "yes"},
+                                follow=True)
+
+    def bulk(self, *users):
+        return self.client.post(
+            "/admin/accounts/customuser/",
+            {"action": "delete_selected", "_selected_action": [u.pk for u in users], "post": "yes"},
+            follow=True)
+
+    def messages(self, response):
+        return [str(m) for m in response.context["messages"]]
+
+    def test_single_delete_self_refused(self):
+        response = self.delete_single(self.admin)
+        self.assertIn("You cannot delete your own account.", self.messages(response))
+        self.assertTrue(User.objects.filter(pk=self.admin.pk).exists())
+
+    def test_single_delete_last_active_admin_refused(self):
+        self.other_admin.is_active = False
+        self.other_admin.save()
+        actor = make_user("root@example.test", role="student", is_staff=True, is_superuser=True)
+        self.client.force_login(actor)
+        response = self.delete_single(self.admin)
+        self.assertTrue(any("last active administrator" in m for m in self.messages(response)))
+        self.assertTrue(User.objects.filter(pk=self.admin.pk).exists())
+
+    def test_single_delete_allowed_cases(self):
+        student = self.student(1)
+        self.delete_single(student)
+        self.delete_single(self.other_admin)
+        self.assertFalse(User.objects.filter(pk__in=[student.pk, self.other_admin.pk]).exists())
+
+    def test_bulk_refuses_whole_set_if_any_violates(self):
+        student = self.student(1)
+        response = self.bulk(student, self.admin)  # includes self
+        self.assertTrue(any("cannot delete your own" in m for m in self.messages(response)))
+        self.assertEqual(User.objects.filter(pk__in=[student.pk, self.admin.pk]).count(), 2)
+
+        actor = make_user("root@example.test", role="student", is_staff=True, is_superuser=True)
+        self.client.force_login(actor)
+        response = self.bulk(student, self.admin, self.other_admin)  # every active admin
+        self.assertTrue(any("last active administrator" in m for m in self.messages(response)))
+        self.assertEqual(User.objects.filter(pk__in=[student.pk, self.admin.pk, self.other_admin.pk]).count(), 3)
+
+    def test_bulk_allowed_when_an_admin_remains(self):
+        students = [self.student(1), self.student(2)]
+        self.bulk(*students, self.other_admin)
+        self.assertEqual(User.objects.filter(pk__in=[s.pk for s in students]).count(), 0)
+        self.assertFalse(User.objects.filter(pk=self.other_admin.pk).exists())
+        self.assertTrue(User.objects.filter(pk=self.admin.pk).exists())
+
+    def test_bulk_confirmation_page_refuses_early(self):
+        response = self.client.post(
+            "/admin/accounts/customuser/",
+            {"action": "delete_selected", "_selected_action": [self.admin.pk]}, follow=True)
+        self.assertIn("You cannot delete your own account. Nothing was deleted.", self.messages(response))
