@@ -11,10 +11,10 @@ from dawah import services
 from dawah.models import EventResource
 from pythagoras.utils import APIError
 
-from .helpers import PUBLISHED, UNPUBLISHED, make_event, make_resource
+from .helpers import PUBLISHED, UNPUBLISHED, FakeStorageMixin, make_event, make_resource
 
 
-class TransitionLockTests(TransactionTestCase):
+class TransitionLockTests(FakeStorageMixin, TransactionTestCase):
     """Transitions lock the event row, so a racing request sees the committed state."""
 
     def run_blocked(self, func, *args):

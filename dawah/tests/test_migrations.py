@@ -68,3 +68,39 @@ class PublicationStateMigrationTests(TransactionTestCase):
         old = self.migrate(BEFORE)
         self.assertEqual(old.get_model('dawah', 'Event').objects.get(pk=event.pk).title, 'Kept')
         self.assertEqual(old.get_model('dawah', 'EventResource').objects.count(), 1)
+
+
+class DurableAudioMigrationTests(TransactionTestCase):
+    """0003 adds asset metadata without publishing or claiming legacy files."""
+
+    migrate = PublicationStateMigrationTests.migrate
+
+    def tearDown(self):
+        self.migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_existing_rows_keep_data_and_assetless_ready_rows_are_demoted(self):
+        old = self.migrate(AFTER)
+        Event = old.get_model('dawah', 'Event')
+        EventResource = old.get_model('dawah', 'EventResource')
+        start = datetime(2026, 1, 9, 12, tzinfo=UTC)
+        event = Event.objects.create(title='Legacy', category='c', speakers='s', location='l', start_time=start,
+                                     end_time=start, status='published')
+        legacy = EventResource.objects.create(event=event, title='Legacy file', type='aud', duration=60,
+                                              file='event_resources/old.mp3')
+        claimed = EventResource.objects.create(event=event, title='Claimed', type='aud', status='published',
+                                               storage_status='ready')
+        video = EventResource.objects.create(event=event, title='Video', type='vid', storage_status='not_applicable')
+
+        new = self.migrate([('dawah', '0003_durable_audio_upload')])
+        EventResource = new.get_model('dawah', 'EventResource')
+        rows = {r.pk: r for r in EventResource.objects.all()}
+        self.assertEqual((rows[legacy.pk].file.name, rows[legacy.pk].storage_status, rows[legacy.pk].status,
+                          rows[legacy.pk].private_object_key, rows[legacy.pk].public_media_url),
+                         ('event_resources/old.mp3', 'none', 'draft', '', ''))
+        self.assertEqual((rows[claimed.pk].storage_status, rows[claimed.pk].status), ('none', 'unpublished'))
+        self.assertEqual(rows[video.pk].storage_status, 'not_applicable')
+        self.assertEqual(new.get_model('dawah', 'UploadIntent').objects.count(), 0)
+
+        back = self.migrate(AFTER)
+        self.assertEqual(back.get_model('dawah', 'EventResource').objects.count(), 3)

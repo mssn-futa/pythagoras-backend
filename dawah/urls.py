@@ -21,6 +21,9 @@ urlpatterns = [
          name='event-resource-publish'),
     path('events/<int:event_id>/resources/<int:resource_id>/unpublish/',
          views.EventResourceUnpublishView.as_view(), name='event-resource-unpublish'),
+    path('events/<int:event_id>/resources/<int:resource_id>/audio/', views.AudioUploadIntentView.as_view(),
+         name='event-resource-audio-intent'),
+    path('uploads/<int:upload_id>/finalize/', views.UploadFinalizeView.as_view(), name='upload-finalize'),
     path('resources/<int:resource_id>/', views.ResourceDetailView.as_view(), name='resource-detail'),
     path('archive/', views.ArchiveView.as_view(), name='archive'),
 
