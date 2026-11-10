@@ -1,0 +1,92 @@
+"""Assessment domain errors (no HTTP imports).
+
+Each state error carries the D0 domain ``code`` its HTTP adapter should use
+(409 unless noted). Views translate them with ``quiz.views.domain_errors``;
+ASSESS-03/04 should do the same rather than re-deriving codes.
+"""
+
+
+class AssessmentError(Exception):
+    """Base for assessment state errors. ``code``/``message`` map to a D0 error."""
+
+    code = 'CONFLICT'
+    default_message = 'This assessment operation is not allowed.'
+
+    def __init__(self, message=None, *, fields=None):
+        self.message = message or self.default_message
+        self.fields = fields
+        super().__init__(self.message)
+
+
+class QuizImmutable(AssessmentError):
+    """A published/closed quiz's grading/timing content or a finalized record would change."""
+
+    code = 'QUIZ_IMMUTABLE'
+    default_message = 'Published assessment content cannot be changed.'
+
+
+class InvalidTransition(AssessmentError):
+    """A lifecycle transition D3 does not allow (e.g. closed -> published)."""
+
+    code = 'INVALID_TRANSITION'
+    default_message = 'This lifecycle transition is not allowed.'
+
+
+class QuizReferenced(AssessmentError):
+    """A quiz with attempts/submissions cannot be deleted (history is protected)."""
+
+    code = 'RESOURCE_REFERENCED'
+    default_message = 'This quiz has attempts or submissions and cannot be deleted.'
+
+
+class QuizUnavailable(AssessmentError):
+    """No new attempt: the quiz is not published or its deadline has passed."""
+
+    code = 'QUIZ_UNAVAILABLE'
+    default_message = 'This quiz is not available.'
+
+
+class AttemptExpired(AssessmentError):
+    """First finalization at/after the attempt's server expiry (A10)."""
+
+    code = 'ATTEMPT_EXPIRED'
+    default_message = 'This attempt has expired.'
+
+
+class SubmissionConflict(AssessmentError):
+    """A finalized submission exists with different answers (never overwritten)."""
+
+    code = 'SUBMISSION_CONFLICT'
+    default_message = 'Different answers were already submitted for this attempt.'
+
+
+class SubmissionImmutable(AssessmentError):
+    """Finalized submissions (and their snapshots) are never updated or deleted."""
+
+    code = 'QUIZ_IMMUTABLE'
+    default_message = 'Finalized submissions cannot be changed or deleted.'
+
+
+class PublicationInvalid(AssessmentError):
+    """The quiz graph fails publication validation (400 VALIDATION_ERROR with ``fields``)."""
+
+    code = 'VALIDATION_ERROR'
+    default_message = 'This quiz cannot be published.'
+
+
+class InvalidAnswers(ValueError):
+    """Answers do not have the structure a grader requires.
+
+    ``errors`` maps a question-ID string (or ``non_field_errors``) to a list of
+    messages. ``as_fields()`` nests them under ``field`` (``answers`` by
+    default) for a D0 ``VALIDATION_ERROR`` ``fields`` object; ``field=None``
+    means ``errors`` already names request fields.
+    """
+
+    def __init__(self, errors, field='answers'):
+        self.errors = errors
+        self.field = field
+        super().__init__('Invalid answers.')
+
+    def as_fields(self):
+        return self.errors if self.field is None else {self.field: self.errors}
