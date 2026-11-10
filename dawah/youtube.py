@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 VIDEO_ID = re.compile(r'[A-Za-z0-9_-]{11}', re.ASCII)
 MAX_URL_LENGTH = 2048
 
-YOUTUBE_HOSTS = frozenset({'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'})
+YOUTUBE_HOSTS = frozenset({'youtube.com', 'www.youtube.com', 'm.youtube.com'})
 SHORT_HOST = 'youtu.be'
 NOCOOKIE_HOSTS = frozenset({'www.youtube-nocookie.com'})
 

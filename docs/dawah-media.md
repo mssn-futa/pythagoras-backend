@@ -144,7 +144,7 @@ the 11-character video ID is stored (`youtube_video_id`). The payload exposes
 `playback` = `{provider, video_id, watch_url, embed_url}` built server-side
 (`https://www.youtube.com/watch?v=<id>`, `https://www.youtube-nocookie.com/embed/<id>`)
 (null without a valid ID).
-Accepted: HTTPS on youtube.com, www./m./music.youtube.com (`/watch?v=`, `/embed/`,
+Accepted: HTTPS on youtube.com, www./m.youtube.com (`/watch?v=`, `/embed/`,
 `/shorts/`), youtu.be/`<id>`, www.youtube-nocookie.com/embed/`<id>`; other query
 parameters and fragments are discarded. A video is publishable/visible only once
 it has an ID. Changing the link of a published video is `409 UNPUBLISH_REQUIRED`.

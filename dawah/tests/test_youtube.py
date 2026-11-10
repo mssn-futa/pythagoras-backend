@@ -27,7 +27,7 @@ class ParserTests(SimpleTestCase):
     def test_valid_forms(self):
         cases = [
             f'https://www.youtube.com/watch?v={ID}', f'https://youtube.com/watch?v={ID}',
-            f'https://m.youtube.com/watch?v={ID}', f'https://music.youtube.com/watch?v={ID}',
+            f'https://m.youtube.com/watch?v={ID}',
             f'https://www.youtube.com/watch?v={ID}&t=42s&si=abc', f'https://www.youtube.com/watch?t=5&v={ID}',
             f'https://www.youtube.com/watch?v={ID}&list=PL123&index=2', f'https://www.youtube.com/watch?v={ID}#t=10',
             f'https://youtu.be/{ID}', f'https://youtu.be/{ID}?t=30&si=xyz', f'https://youtu.be/{ID}/',
@@ -35,7 +35,7 @@ class ParserTests(SimpleTestCase):
             f'https://www.youtube.com/embed/{ID}', f'https://www.youtube.com/embed/{ID}?start=3',
             f'https://m.youtube.com/embed/{ID}', f'https://www.youtube-nocookie.com/embed/{ID}',
             f'https://www.youtube.com/shorts/{ID}', f'https://m.youtube.com/shorts/{ID}?feature=share',
-            f'https://music.youtube.com/shorts/{ID}', f'  https://youtu.be/{ID}  ',
+            f'  https://youtu.be/{ID}  ',
         ]
         for url in cases:
             with self.subTest(url=url):
@@ -58,6 +58,7 @@ class ParserTests(SimpleTestCase):
             f'https://youtube.co/watch?v={ID}', f'https://www.youtube.com.evil.test/watch?v={ID}',
             f'https://youtu.be.evil.com/{ID}', f'https://youtube-nocookie.com.evil.com/embed/{ID}',
             f'https://www.youtube.com./watch?v={ID}', f'https://youtu.be./{ID}',
+            f'https://music.youtube.com/watch?v={ID}', f'https://music.youtube.com/shorts/{ID}',
             f'https://gaming.youtube.com/watch?v={ID}', f'https://studio.youtube.com/watch?v={ID}',
             f'https://www.youtu.be/{ID}', f'https://m.youtu.be/{ID}', f'https://youtube-nocookie.com/embed/{ID}',
             f'https://www.youtube-nocookie.com/watch?v={ID}', f'https://youtube.com@evil.com/watch?v={ID}',
