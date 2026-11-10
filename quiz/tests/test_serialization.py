@@ -57,7 +57,7 @@ class AnswerKeyLeakageTests(QuizAPITestMixin, TestCase):
         self.assertEqual(len(first['options']), 4)
         for option in first['options']:
             self.assertEqual(set(option), {'id', 'text', 'order'})
-        listed = self.call(self.student, 'get', '/quiz/quizzes/').json()['data'][0]
+        listed = self.call(self.student, 'get', '/quiz/quizzes/').json()['data']['results'][0]
         self.assertEqual(listed['question_count'], 2)
 
     def test_error_responses_do_not_echo_keys(self):
@@ -95,7 +95,7 @@ class DispatchRegressionTests(QuizAPITestMixin, TestCase):
     def test_question_list_get(self):
         response = self.call(self.admin, 'get', '/quiz/question/')
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual([q['id'] for q in response.json()['data']],
+        self.assertEqual([q['id'] for q in response.json()['data']['results']],
                          sorted(q.pk for q, _, _ in self.questions))
 
     def test_question_create_and_replace_return_the_question(self):
@@ -193,7 +193,7 @@ class QuizTitleFieldTests(QuizAPITestMixin, TestCase):
                            (self.admin, f'/quiz/quizzes/{quiz.pk}/')):
             with self.subTest(user=user.email, path=path):
                 data = self.call(user, 'get', path).json()['data']
-                row = data[0] if isinstance(data, list) else data
+                row = data['results'][0] if 'results' in data else data
                 self.assertIn('course_title', row)
                 self.assertIn('event_title', row)
                 self.assertIsNone(row['course_title'])

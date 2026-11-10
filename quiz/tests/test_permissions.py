@@ -121,7 +121,7 @@ class PermissionMatrixTests(QuizAPITestMixin, TestCase):
         for path in paths:
             with self.subTest(path=path):
                 self.assertEnvelopeError(self.call(self.student, 'get', path), 404, 'NOT_FOUND')
-        listed = self.call(self.student, 'get', '/quiz/quizzes/').json()['data']
+        listed = self.call(self.student, 'get', '/quiz/quizzes/').json()['data']['results']
         self.assertEqual([row['id'] for row in listed], [self.quiz.pk])
 
     def test_student_cannot_read_another_students_submission(self):

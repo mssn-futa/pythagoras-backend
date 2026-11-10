@@ -143,8 +143,13 @@ def assert_quiz_changes_allowed(quiz, changed_fields):
             fields={name: ['This field cannot change after publication.'] for name in locked})
 
 
-def _normalized_text(text):
+def normalized_text(text):
+    """Distinct-option normalization (lead decision): trim, collapse internal
+    whitespace, casefold. Authoring and publication use this one rule."""
     return ' '.join((text or '').split()).casefold()
+
+
+_normalized_text = normalized_text
 
 
 def publication_errors(quiz, now):
