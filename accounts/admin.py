@@ -23,10 +23,11 @@ class CustomUserAdmin(UserAdmin):
         "matric_number",
         "department",
         "level",
+        "role",
         "is_staff",
         "is_active",
     )
-    list_filter = ("is_staff", "is_active", "level", "department")
+    list_filter = ("role", "is_staff", "is_active", "level", "department")
     search_fields = ("email", "first_name", "last_name", "matric_number")
     ordering = ("email",)
 
@@ -40,6 +41,7 @@ class CustomUserAdmin(UserAdmin):
             _("Permissions"),
             {
                 "fields": (
+                    "role",
                     "is_active",
                     "is_staff",
                     "is_superuser",
@@ -65,6 +67,7 @@ class CustomUserAdmin(UserAdmin):
                     "level",
                     "password1",
                     "password2",
+                    "role",
                     "is_staff",
                     "is_active",
                 ),
