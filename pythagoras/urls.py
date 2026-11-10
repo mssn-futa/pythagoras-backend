@@ -33,6 +33,7 @@ class SwaggerView(SpectacularSwaggerView):
 
 
 urlpatterns = [
+    path('', include('pythagoras.health')),
     path('', SwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     path('schema/', SchemaView.as_view(), name='schema'),
     path('admin/', admin.site.urls),
