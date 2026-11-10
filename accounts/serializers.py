@@ -217,3 +217,67 @@ class LoginResponseSerializer(serializers.Serializer):
 
 class RefreshTokenSerializer(serializers.Serializer):
     refresh = serializers.CharField(trim_whitespace=True)
+
+
+class StudentSerializer(UserSerializer):
+    """User shape plus ``date_joined`` for student administration."""
+
+    class Meta(UserSerializer.Meta):
+        fields = [*UserSerializer.Meta.fields, "date_joined"]
+        read_only_fields = fields
+
+
+class StudentListFilterSerializer(serializers.Serializer):
+    """Validated query parameters of the student list."""
+
+    search = serializers.CharField(required=False, allow_blank=True, max_length=100, trim_whitespace=True)
+    department = serializers.CharField(required=False, allow_blank=True, max_length=100, trim_whitespace=True)
+    level = serializers.ChoiceField(required=False, choices=User.LEVEL_CHOICES)
+    is_active = serializers.BooleanField(required=False)
+
+    def to_internal_value(self, data):
+        # An empty ?level= / ?is_active= means "no filter" rather than an error.
+        data = {k: v for k, v in data.items() if v != "" or k in ("search", "department")}
+        return super().to_internal_value(data)
+
+
+class StudentUpdateSerializer(StrictFieldsMixin, serializers.ModelSerializer):
+    """Admin edits of a student: profile, email/matric and active status only.
+    Role, staff flags and permissions are never writable."""
+
+    email = NormalizedEmailField(max_length=254, required=False)
+    matric_number = NormalizedMatricField()
+
+    class Meta:
+        model = User
+        fields = [
+            "first_name", "last_name", "department", "level",
+            "email", "matric_number", "is_active",
+        ]
+        extra_kwargs = {
+            "first_name": {"allow_blank": False},
+            "last_name": {"allow_blank": False},
+        }
+
+    def validate(self, attrs):
+        errors = identity_conflict_errors(
+            email=attrs.get("email"), matric=attrs.get("matric_number"),
+            exclude_pk=self.instance.pk if self.instance else None,
+        )
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+    def update(self, instance, validated_data):
+        try:
+            with transaction.atomic():
+                return super().update(instance, validated_data)
+        except IntegrityError:
+            # A concurrent change took the same normalized identity.
+            errors = identity_conflict_errors(
+                email=validated_data.get("email"), matric=validated_data.get("matric_number"),
+                exclude_pk=instance.pk,
+            )
+            raise serializers.ValidationError(
+                errors or {"non_field_errors": ["This account could not be updated."]}
+            )
