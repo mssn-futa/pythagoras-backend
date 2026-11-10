@@ -1,4 +1,5 @@
 from io import StringIO
+from unittest import mock
 
 from django.contrib import admin
 from django.core.management import CommandError, call_command
@@ -73,6 +74,12 @@ class CollisionReportTests(TestCase):
         out = StringIO()
         call_command('identity_collision_report', stdout=out)
         self.assertIn('No identity collisions found.', out.getvalue())
+
+    def test_command_passes_before_accounts_table_exists(self):
+        out = StringIO()
+        with mock.patch.object(connection.introspection, 'table_names', return_value=[]):
+            call_command('identity_collision_report', stdout=out)
+        self.assertIn('No accounts table yet', out.getvalue())
 
     def test_command_fails_with_ids_and_no_pii(self):
         # Simulate legacy pre-constraint rows: drop the case-insensitive indexes

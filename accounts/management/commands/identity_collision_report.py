@@ -19,7 +19,11 @@ class Command(BaseCommand):
     def handle(self, *args, database, **options):
         # Raw read of the base columns works before or after the constraint
         # migrations and is independent of current model code.
-        with connections[database].cursor() as cursor:
+        connection = connections[database]
+        if 'accounts_customuser' not in connection.introspection.table_names():
+            self.stdout.write(self.style.SUCCESS('No accounts table yet; no identity collisions possible.'))
+            return
+        with connection.cursor() as cursor:
             cursor.execute('SELECT id, email, matric_number FROM accounts_customuser')
             report = find_identity_collisions(cursor.fetchall())
         if has_collisions(report):
