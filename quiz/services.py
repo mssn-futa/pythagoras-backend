@@ -14,7 +14,6 @@ import re
 
 from django.db import transaction
 from django.db.models import Prefetch
-from django.utils import timezone
 
 from .models import Option, Question, Quiz, Submission
 
@@ -149,8 +148,11 @@ class QuizService:
                 student=student,
                 answers=normalized,
                 score=cls.grade_answers(quiz, normalized),
-                graded_at=timezone.now(),
             )
+            # Graded synchronously: one instant for both timestamps
+            # (submitted_at is auto_now_add, so it is set by the insert).
+            submission.graded_at = submission.submitted_at
+            submission.save(update_fields=['graded_at'])
         return submission, True
 
     # ------------------------------------------------------------------

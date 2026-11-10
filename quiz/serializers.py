@@ -95,10 +95,14 @@ class AdminQuestionSerializer(serializers.ModelSerializer):
 
 @extend_schema_field({'type': 'string', 'enum': [Question.Type.mcq.value]})
 class ReleaseQuestionTypeField(serializers.ChoiceField):
-    """Authoring accepts only the release MCQ type (A08)."""
+    """Authoring accepts only the release MCQ type (A08).
+
+    Optional and without a field default: a create defaults to ``mcq`` in
+    ``AdminQuestionWriteSerializer.validate``; an update never fills it in.
+    """
 
     def __init__(self, **kwargs):
-        kwargs.setdefault('default', Question.Type.mcq)
+        kwargs.setdefault('required', False)
         super().__init__(choices=[(Question.Type.mcq.value, Question.Type.mcq.label)], **kwargs)
 
 
@@ -115,6 +119,18 @@ class AdminQuestionWriteSerializer(serializers.ModelSerializer):
         model = Question
         fields = ['id', 'quiz', 'type', 'text', 'points', 'options']
         read_only_fields = ['id']
+
+    def validate(self, data):
+        if self.instance is None:
+            data.setdefault('type', Question.Type.mcq)
+        elif self.instance.type != Question.Type.mcq:
+            # Legacy text/multi questions are never converted: their options
+            # hold free-text answer keys that would become student-visible MCQ
+            # options. They stay admin-only; author a new MCQ question instead.
+            raise serializers.ValidationError({'type': [
+                'Legacy non-MCQ questions cannot be edited or converted; '
+                'create a new MCQ question instead.']})
+        return data
 
     def create(self, validated_data):
         options_data = validated_data.pop('options', [])
@@ -139,8 +155,10 @@ class AdminQuestionWriteSerializer(serializers.ModelSerializer):
 
 
 class _QuizSummaryMixin(serializers.Serializer):
-    course_title = serializers.CharField(source='related_course.title', read_only=True)
-    event_title = serializers.CharField(source='related_event.title', read_only=True)
+    course_title = serializers.CharField(source='related_course.title', read_only=True,
+                                         allow_null=True)
+    event_title = serializers.CharField(source='related_event.title', read_only=True,
+                                        allow_null=True)
     total_points = serializers.SerializerMethodField()
     question_count = serializers.SerializerMethodField()
 
@@ -177,8 +195,10 @@ class AdminQuizSerializer(_QuizSummaryMixin, serializers.ModelSerializer):
 
 class QuizListSerializer(serializers.ModelSerializer):
     """Lightweight quiz listing without questions. Safe for every role."""
-    course_title = serializers.CharField(source='related_course.title', read_only=True)
-    event_title = serializers.CharField(source='related_event.title', read_only=True)
+    course_title = serializers.CharField(source='related_course.title', read_only=True,
+                                         allow_null=True)
+    event_title = serializers.CharField(source='related_event.title', read_only=True,
+                                        allow_null=True)
     question_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -295,6 +315,15 @@ class AnswersField(serializers.JSONField):
     pass
 
 
+class StrictIntegerField(serializers.IntegerField):
+    """JSON integer only: rejects strings ("1"), floats (1.0) and booleans."""
+
+    def to_internal_value(self, data):
+        if type(data) is not int:
+            self.fail('invalid')
+        return super().to_internal_value(data)
+
+
 class SubmissionCreateSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
     """Legacy submission input. Student and score are server-owned (D0, D3).
 
@@ -302,7 +331,7 @@ class SubmissionCreateSerializer(RejectUnknownFieldsMixin, serializers.Serialize
     are checked by ``QuizService.submit`` under the quiz row lock. Temporary
     until the ASSESS-04 attempt contract (``attempt_id``) replaces it.
     """
-    quiz = serializers.IntegerField(min_value=1)
+    quiz = StrictIntegerField(min_value=1)
     answers = AnswersField()
 
     def validate_answers(self, value):

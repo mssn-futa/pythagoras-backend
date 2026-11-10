@@ -42,6 +42,9 @@ class SubmissionTests(QuizAPITestMixin, TestCase):
         self.assertEqual(saved.student, self.student)
         self.assertEqual(saved.score, 2)
         self.assertIsNotNone(saved.graded_at)
+        # Graded synchronously at the same instant it was submitted.
+        self.assertEqual(saved.graded_at, saved.submitted_at)
+        self.assertEqual(data['graded_at'], data['submitted_at'])
         self.assertEqual(saved.answers, self.answers())
 
     def test_all_correct_and_missing_answers(self):
@@ -118,7 +121,8 @@ class SubmissionTests(QuizAPITestMixin, TestCase):
 
     def test_unavailable_or_malformed_quiz(self):
         hidden, _ = make_quiz('Hidden', active=False, points=(1,))
-        for quiz in (hidden.pk, 999999, None, 'abc', True, 0, [self.quiz.pk]):
+        for quiz in (hidden.pk, 999999, None, 'abc', True, False, 0, -1, [self.quiz.pk],
+                     str(self.quiz.pk), float(self.quiz.pk), {'id': self.quiz.pk}):
             with self.subTest(quiz=quiz):
                 self.assertRejected({'quiz': quiz, 'answers': {}}, 'quiz')
         hidden_response = self.post({'quiz': hidden.pk, 'answers': {}}).json()

@@ -133,3 +133,64 @@ class DispatchRegressionTests(QuizAPITestMixin, TestCase):
                     response = self.call(user, 'get', path)
                     self.assertEqual(response.status_code, 200, response.content)
                     self.assertEqual(response.json()['data']['id'], submission_id)
+
+
+class LegacyQuestionConversionTests(QuizAPITestMixin, TestCase):
+    """Legacy text/multi questions are never turned into student-visible MCQs."""
+
+    def setUp(self):
+        super().setUp()
+        self.quiz, self.questions = make_quiz('Conversion', legacy_text_question=True)
+        self.legacy = self.quiz.question_set.get(type=Question.Type.text)
+
+    def test_put_without_or_with_type_does_not_convert_legacy_question(self):
+        full_options = [{'text': label, 'is_correct': label == 'A'} for label in 'ABCD']
+        bodies = [
+            {'quiz': self.quiz.pk, 'text': 'Edited', 'points': 1},
+            {'quiz': self.quiz.pk, 'type': 'mcq', 'text': 'Edited', 'points': 1},
+            {'quiz': self.quiz.pk, 'type': 'mcq', 'text': 'Edited', 'points': 1,
+             'options': full_options},
+        ]
+        for body in bodies:
+            for path in (f'/quiz/question/{self.legacy.pk}/', f'/quiz/question/{self.legacy.pk}'):
+                with self.subTest(body=body, path=path):
+                    response = self.call(self.admin, 'put', path, body)
+                    payload = self.assertEnvelopeError(response, 400, 'VALIDATION_ERROR')
+                    self.assertIn('type', payload['data']['fields'])
+        self.legacy.refresh_from_db()
+        self.assertEqual((self.legacy.type, self.legacy.text),
+                         (Question.Type.text, 'Conversion legacy text question'))
+        self.assertEqual(list(self.legacy.option_set.values_list('text', flat=True)),
+                         ['legacy answer'])
+        # Still hidden from students everywhere.
+        self.assertEnvelopeError(self.call(self.student, 'get', f'/quiz/question/{self.legacy.pk}/'),
+                                 404, 'NOT_FOUND')
+        detail = self.call(self.student, 'get', f'/quiz/quizzes/{self.quiz.pk}/')
+        self.assertNotIn(self.legacy.pk, [q['id'] for q in detail.json()['data']['questions']])
+        self.assertNotIn('legacy answer', detail.content.decode())
+
+    def test_put_without_type_keeps_mcq_question_mcq(self):
+        question = self.questions[0][0]
+        response = self.call(self.admin, 'put', f'/quiz/question/{question.pk}/',
+                             {'quiz': self.quiz.pk, 'text': 'Edited MCQ', 'points': 4})
+        self.assertEqual(response.status_code, 200, response.content)
+        question.refresh_from_db()
+        self.assertEqual((question.type, question.text, question.points),
+                         (Question.Type.mcq, 'Edited MCQ', 4))
+        self.assertEqual(question.option_set.count(), 4)  # options untouched when omitted
+
+
+class QuizTitleFieldTests(QuizAPITestMixin, TestCase):
+
+    def test_titles_are_present_and_null_without_relations(self):
+        quiz, _ = make_quiz('No relations')
+        for user, path in ((self.student, '/quiz/quizzes/'), (self.admin, '/quiz/quizzes/'),
+                           (self.student, f'/quiz/quizzes/{quiz.pk}/'),
+                           (self.admin, f'/quiz/quizzes/{quiz.pk}/')):
+            with self.subTest(user=user.email, path=path):
+                data = self.call(user, 'get', path).json()['data']
+                row = data[0] if isinstance(data, list) else data
+                self.assertIn('course_title', row)
+                self.assertIn('event_title', row)
+                self.assertIsNone(row['course_title'])
+                self.assertIsNone(row['event_title'])
