@@ -1,4 +1,5 @@
 """Broadcast drafts, audiences, queue snapshots and retry eligibility (COMM-01)."""
+import json
 from copy import deepcopy
 
 from django.core.cache import cache
@@ -8,7 +9,7 @@ from drf_spectacular.generators import SchemaGenerator
 from jsonschema import Draft4Validator, RefResolver
 
 from dawah import broadcasts
-from dawah.models import Broadcast, Delivery, DeliveryAttempt, DeliveryState
+from dawah.models import Broadcast, Delivery, DeliveryAttempt, DeliveryGeneration, DeliveryState
 from pythagoras.mail import memory
 
 from .helpers import DawahAPITestCase, User
@@ -194,6 +195,21 @@ class DraftValidationTests(BroadcastTestCase):
                 fields = self.fields(draft_payload(audience=audience))
                 self.assertEqual(list(fields), ['audience'])
                 self.assertTrue(all(isinstance(message, str) for message in fields['audience']))
+
+    def test_department_rejects_nul_and_surrogates_on_create_and_patch(self):
+        created = self.create()
+        for department in ('Computer\x00Science', 'Physics\ud800', '\udfffX'):
+            audience = {'type': 'department', 'department': department}
+            # json.dumps escapes lone surrogates as \uXXXX, as a browser client would.
+            for method, url, body in (('post', LIST, draft_payload(audience=audience)),
+                                      ('patch', detail(created['id']), {'audience': audience, 'version': 1})):
+                with self.subTest(department=repr(department), method=method):
+                    response = getattr(self.client, method)(url, json.dumps(body), content_type='application/json')
+                    fields = self.error(response, 400, 'VALIDATION_ERROR')['fields']
+                    self.assertEqual(list(fields), ['audience'])
+                    self.assertTrue(all(isinstance(message, str) for message in fields['audience']))
+        self.assertEqual(Broadcast.objects.get(pk=created['id']).version, 1)
+        self.assertEqual(Broadcast.objects.count(), 1)
 
     def test_non_object_body(self):
         self.error(self.client.post(LIST, [1, 2], format='json'), 400, 'VALIDATION_ERROR')
@@ -439,7 +455,7 @@ class DeliveryListTests(BroadcastTestCase):
         Delivery.objects.filter(pk=rows[0].pk).update(state='sent', provider_email_id='re_123',
                                                       sent_at=timezone.now(), attempt_count=1)
         Delivery.objects.filter(pk=rows[1].pk).update(state='failed', error_code='INVALID_RECIPIENT',
-                                                      attempt_count=3)
+                                                      attempt_count=3, nonacceptance_known=True)
         data = self.data(self.client.get(detail(queued['id'], 'deliveries/')))
         self.assertEqual(data['count'], len(rows))
         self.assertEqual([item['id'] for item in data['results']], [row.pk for row in rows])
@@ -488,13 +504,15 @@ class RetryTests(BroadcastTestCase):
     def test_ids_from_another_broadcast_reject_everything(self):
         other = self.make_queued(recipients=0, subject='Other')
         other_row = Delivery.objects.filter(broadcast_id=other['id']).first()
-        Delivery.objects.filter(pk__in=[self.rows[0].pk, other_row.pk]).update(state='failed')
+        Delivery.objects.filter(pk__in=[self.rows[0].pk, other_row.pk]).update(state='failed',
+                                                                                   nonacceptance_known=True)
         error = self.error(self.retry([self.rows[0].pk, other_row.pk]), 400, 'VALIDATION_ERROR')
         self.assertIn(str(other_row.pk), error['fields']['delivery_ids'][0])
         self.assertEqual(Delivery.objects.get(pk=self.rows[0].pk).state, 'failed')
 
     def test_mixed_eligibility_is_atomic(self):
-        Delivery.objects.filter(pk=self.rows[0].pk).update(state='failed', error_code='X', attempt_count=3)
+        Delivery.objects.filter(pk=self.rows[0].pk).update(state='failed', error_code='X', attempt_count=3,
+                                                           nonacceptance_known=True)
         for state, extra in (('sent', {'provider_email_id': 're_1'}), ('uncertain', {}), ('skipped', {}),
                              ('sending', {}), ('queued', {})):
             with self.subTest(state=state):
@@ -503,15 +521,42 @@ class RetryTests(BroadcastTestCase):
                 self.assertEqual(Delivery.objects.get(pk=self.rows[0].pk).state, 'failed')
 
     def test_failed_with_provider_id_is_not_retryable(self):
-        Delivery.objects.filter(pk=self.rows[0].pk).update(state='failed', provider_email_id='re_9')
+        Delivery.objects.filter(pk=self.rows[0].pk).update(state='failed', provider_email_id='re_9',
+                                                           nonacceptance_known=True)
         self.error(self.retry([self.rows[0].pk]), 409, 'DELIVERY_NOT_RETRYABLE')
+
+    def test_failure_without_positive_nonacceptance_evidence_is_not_retryable(self):
+        """Reviewer reproduction: a payload conflict may hide an accepted earlier
+        request, so it must never start a new generation/key."""
+        dispatched = timezone.now()
+        for code, extra in (('IDEMPOTENCY_PAYLOAD_CONFLICT', {}),
+                            ('IDEMPOTENCY_DEADLINE_EXPIRED', {'idempotency_deadline_at': dispatched}),
+                            ('PROVIDER_TIMEOUT', {})):
+            with self.subTest(code=code):
+                Delivery.objects.filter(pk=self.rows[0].pk).update(
+                    state='failed', error_code=code, attempt_count=1, idempotency_key='test/broadcast/1/generation/0',
+                    request_hash='abc', first_dispatch_at=dispatched, nonacceptance_known=False, **extra)
+                error = self.error(self.retry([self.rows[0].pk]), 409, 'DELIVERY_NOT_RETRYABLE')
+                self.assertIn(str(self.rows[0].pk), error['fields']['delivery_ids'][0])
+                row = Delivery.objects.get(pk=self.rows[0].pk)
+                self.assertEqual((row.state, row.retry_generation, row.idempotency_key),
+                                 ('failed', 0, 'test/broadcast/1/generation/0'))
+                listed = self.data(self.client.get(detail(self.queued['id'], 'deliveries/'), {'state': 'failed'}))
+                self.assertEqual(listed['results'][0]['eligible_actions'], [])
+                self.assertNotIn('retry', self.data(self.client.get(detail(self.queued['id'])))['eligible_actions'])
+        self.assertFalse(DeliveryGeneration.objects.exists())
 
     def test_known_failure_starts_new_generation(self):
         Delivery.objects.filter(broadcast_id=self.queued['id']).update(state='sent', provider_email_id='re_x',
                                                                        attempt_count=1)
+        dispatched = timezone.now()
+        snapshot = {'to': ['x@example.test'], 'subject': 's'}
         Delivery.objects.filter(pk=self.rows[0].pk).update(state='failed', provider_email_id='', error_code='E',
                                                            attempt_count=3, idempotency_key='k/1',
-                                                           request_hash='abc')
+                                                           request_hash='abc', request_snapshot=snapshot,
+                                                           first_dispatch_at=dispatched,
+                                                           idempotency_deadline_at=dispatched,
+                                                           nonacceptance_known=True)
         Broadcast.objects.filter(pk=self.queued['id']).update(state='completed_with_errors')
         response = self.retry([self.rows[0].pk])
         data = self.data(response, 202)
@@ -521,7 +566,25 @@ class RetryTests(BroadcastTestCase):
         self.assertEqual((row.state, row.retry_generation, row.attempt_count, row.error_code, row.idempotency_key,
                           row.request_hash, row.retry_requested_by),
                          ('queued', 1, 0, '', '', '', self.admin))
+        self.assertEqual((row.nonacceptance_known, row.request_snapshot, row.first_dispatch_at), (False, None, None))
+        evidence = DeliveryGeneration.objects.get(delivery=row)
+        self.assertEqual(
+            (evidence.generation, evidence.state, evidence.attempt_count, evidence.error_code,
+             evidence.nonacceptance_known, evidence.idempotency_key, evidence.request_hash,
+             evidence.request_snapshot, evidence.first_dispatch_at, evidence.idempotency_deadline_at,
+             evidence.requested_at, evidence.requested_by, evidence.closed_by),
+            (0, 'failed', 3, 'E', True, 'k/1', 'abc', snapshot, dispatched, dispatched, None, None, self.admin))
         self.assertEqual(memory.outbox, [])
+        # A second known failure closes generation 1, recording who requested it.
+        Delivery.objects.filter(pk=row.pk).update(state='failed', error_code='F', attempt_count=1,
+                                                  idempotency_key='k/2', nonacceptance_known=True)
+        self.data(self.retry([row.pk]), 202)
+        second = DeliveryGeneration.objects.get(delivery=row, generation=1)
+        self.assertEqual((second.idempotency_key, second.error_code, second.requested_by, second.closed_by),
+                         ('k/2', 'F', self.admin, self.admin))
+        self.assertIsNotNone(second.requested_at)
+        self.assertEqual(Delivery.objects.get(pk=row.pk).retry_generation, 2)
+        self.assertEqual(DeliveryGeneration.objects.filter(delivery=row).count(), 2)
 
     def test_draft_cannot_be_retried(self):
         draft = self.create()
@@ -623,7 +686,7 @@ class BroadcastSchemaTests(BroadcastTestCase):
         self.validate(base + 'queue/', 'post', '202', self.queue(pk, 1))
         self.validate(base + 'deliveries/', 'get', '200', self.client.get(detail(pk, 'deliveries/')))
         delivery = Delivery.objects.first()
-        Delivery.objects.filter(pk=delivery.pk).update(state='failed')
+        Delivery.objects.filter(pk=delivery.pk).update(state='failed', nonacceptance_known=True)
         self.validate(base + 'retry/', 'post', '202',
                       self.client.post(detail(pk, 'retry/'), {'delivery_ids': [delivery.pk]}, format='json'))
 
