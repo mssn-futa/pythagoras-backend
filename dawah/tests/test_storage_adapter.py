@@ -75,6 +75,16 @@ class PresignTests(SimpleTestCase):
         self.assertEqual(query['response-content-type'], ['audio/mpeg'])
         self.assertEqual(query['response-content-disposition'], ['inline; filename="k.mp3"'])
 
+    def test_document_preview_is_an_attachment_with_a_safe_name(self):
+        from dawah.storage.s3 import content_disposition
+        url = adapter().presign_get('media/documents/tok.docx', expires_in=300, filename='a"b\r\nc.docx',
+                                    content_type='application/vnd.openxmlformats-officedocument.'
+                                                 'wordprocessingml.document', disposition='attachment')
+        query = parse_qs(urlsplit(url).query)
+        self.assertEqual(query['response-content-disposition'], ['attachment; filename="abc.docx"'])
+        with self.assertRaises(ValueError):
+            content_disposition('form-data', 'x')
+
 
 class StubbedCallTests(SimpleTestCase):
     def setUp(self):

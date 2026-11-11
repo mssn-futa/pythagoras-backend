@@ -116,6 +116,76 @@ class LiveApiFlowTests(DawahAPITestCase, TestCase):
 
 
 @LIVE
+class LiveDocumentAndImageFlowTests(DawahAPITestCase, TestCase):
+    """DAWAH-07: document and featured-image intent → PUT → finalize → promotion via the real adapter."""
+
+    def setUp(self):
+        super().setUp()
+        self.live = live_adapter()
+        storage_module.set_storage(self.live)
+        self.as_admin()
+
+    def put_and_finalize(self, intent, data):
+        stored = UploadIntent.objects.get(pk=intent['upload_id'])
+        self.addCleanup(self.live.delete, stored.staging_key, bucket=PRIVATE)
+        self.addCleanup(self.live.delete, stored.validation_key, bucket=PRIVATE)
+        status, body, _ = http('PUT', intent['upload_url'], data, intent['headers'])
+        self.assertEqual(status, 200, body[:300])
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.data(self.client.post(f'/dawah/uploads/{intent["upload_id"]}/finalize/'))
+
+    def test_document_end_to_end(self):
+        from . import files
+        event = make_event(status=PUBLISHED)
+        resource = make_resource(event, type='doc')
+        data = files.docx_bytes()
+        content_type = files.DOCX_TYPE
+        base = f'/dawah/events/{event.pk}/resources/{resource.pk}'
+        intent = self.data(self.client.post(f'{base}/document/', {'file_name': 'Bio.docx', 'content_type': content_type,
+                                                                  'size_bytes': len(data)}, format='json'), 201)
+        finalized = self.put_and_finalize(intent, data)
+        self.assertEqual((finalized['upload']['status'], finalized['resource']['file_name']), ('ready', 'Bio.docx'))
+        status, body, headers = http('GET', finalized['preview_url'])
+        self.assertEqual((status, body, headers.get('Content-Disposition')),
+                         (200, data, 'attachment; filename="Bio.docx"'))
+        with self.captureOnCommitCallbacks(execute=True):
+            published = self.data(self.client.post(f'{base}/publish/'))
+        public_key = EventResource.objects.get(pk=resource.pk).public_object_key
+        self.addCleanup(self.live.delete, public_key, bucket=PUBLIC)
+        status, body, headers = http('GET', published['media_url'])
+        self.assertEqual((status, body, headers.get('Content-Type'), headers.get('Content-Disposition')),
+                         (200, data, content_type, 'attachment; filename="Bio.docx"'))
+        with self.captureOnCommitCallbacks(execute=True):
+            self.data(self.client.post(f'{base}/unpublish/'))
+        self.assertIsNone(self.live.head(public_key, bucket=PUBLIC))
+
+    def test_featured_image_replacement_on_published_event(self):
+        from dawah.models import Event
+
+        from . import files
+        event = make_event(status=PUBLISHED)
+        urls = []
+        for size in ((40, 30), (80, 60)):
+            data = files.image_bytes('PNG', size=size)
+            intent = self.data(self.client.post(f'/dawah/events/{event.pk}/featured-image/',
+                                                {'file_name': 'poster.png', 'content_type': 'image/png',
+                                                 'size_bytes': len(data)}, format='json'), 201)
+            finalized = self.put_and_finalize(intent, data)
+            self.assertEqual(finalized['upload']['status'], 'ready')
+            key = Event.objects.get(pk=event.pk).featured_image_public_key
+            self.addCleanup(self.live.delete, key, bucket=PUBLIC)
+            self.addCleanup(self.live.delete, Event.objects.get(pk=event.pk).featured_image_object_key,
+                            bucket=PRIVATE)
+            url = finalized['event']['featured_image_url']
+            status, body, headers = http('GET', url)
+            self.assertEqual((status, body, headers.get('Content-Type'), headers.get('Content-Disposition')),
+                             (200, data, 'image/png', 'inline; filename="poster.png"'))
+            urls.append(url)
+        self.assertNotEqual(urls[0], urls[1])
+        self.assertNotEqual(http('GET', urls[0])[0], 200)  # replaced copy deleted after the pointer swap
+
+
+@LIVE
 class LiveS3CompatibleTests(SimpleTestCase):
     def setUp(self):
         self.storage = S3ObjectStorage(
