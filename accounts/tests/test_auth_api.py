@@ -8,6 +8,7 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from accounts.serializers import UserRegistrationSerializer
+from accounts.throttles import RefreshIPRateThrottle
 from .helpers import PASSWORD, APITestMixin, User, make_user, registration_payload
 
 USER_KEYS = {'id', 'email', 'first_name', 'last_name', 'matric_number', 'department', 'level',
@@ -333,6 +334,23 @@ class ThrottleTests(APITestMixin, TestCase):
 
     def test_refresh_10_per_minute(self):
         self.assert_limit('/accounts/refresh/', 10)
+
+    def test_refresh_is_limited_per_session_not_per_shared_ip(self):
+        # Many students behind one NAT address: each session has its own budget.
+        for index in range(15):
+            response = self.client.post('/accounts/refresh/', {'refresh': f'session-{index}'}, format='json')
+            self.assertNotEqual(response.status_code, 429)
+        for _ in range(10):
+            self.client.post('/accounts/refresh/', {'refresh': 'same-session'}, format='json')
+        response = self.client.post('/accounts/refresh/', {'refresh': 'same-session'}, format='json')
+        self.assertEqual(response.status_code, 429)
+
+    @mock.patch.object(RefreshIPRateThrottle, 'THROTTLE_RATES', {'auth_refresh_ip': '12/min'})
+    def test_refresh_has_a_per_ip_ceiling(self):
+        for index in range(12):
+            self.client.post('/accounts/refresh/', {'refresh': f'token-{index}'}, format='json')
+        response = self.client.post('/accounts/refresh/', {'refresh': 'another'}, format='json')
+        self.assertEqual(response.status_code, 429)
 
     def test_limits_are_per_ip(self):
         for _ in range(5):

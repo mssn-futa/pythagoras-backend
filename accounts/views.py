@@ -27,7 +27,7 @@ from .serializers import (
     UserSerializer,
 )
 from .services import EmailService
-from .throttles import LoginRateThrottle, RefreshRateThrottle, RegistrationRateThrottle
+from .throttles import LoginRateThrottle, RefreshIPRateThrottle, RefreshRateThrottle, RegistrationRateThrottle
 from .tokens import issue_tokens, revoke_refresh_token, rotate_refresh_token
 
 User = get_user_model()
@@ -200,7 +200,7 @@ class UserLoginView(PublicAuthView):
 class TokenRefreshView(PublicAuthView):
     """POST /accounts/refresh/"""
 
-    throttle_classes = [RefreshRateThrottle]
+    throttle_classes = [RefreshIPRateThrottle, RefreshRateThrottle]
 
     @extend_schema(
         operation_id="accounts_refresh",
