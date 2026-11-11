@@ -9,17 +9,18 @@ from django.db.migrations.executor import MigrationExecutor
 from django.db.models import ProtectedError
 from django.test import TransactionTestCase
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from dawah.models import Event
 from quiz import lifecycle
 from quiz.errors import (
     PublicationInvalid, QuizImmutable, SubmissionConflict, db_error_sqlstate,
 )
-from quiz.models import Attempt, Option, Question, Quiz, Submission
+from quiz.models import Attempt, Course, Enrollment, Option, Question, Quiz, Submission
 from quiz.tests.helpers import QuizAPITestMixin, make_quiz
 
 BEFORE = [('quiz', '0003_alter_quiz_related_course_alter_quiz_related_event_and_more')]
-AFTER = [('quiz', '0007_assessment_history_triggers')]
+AFTER = [('quiz', '0008_arabic_classes_enrollment_modules')]
 SUBMITTED = datetime(2026, 3, 1, 9, 30, tzinfo=dt_timezone.utc)
 
 
@@ -214,3 +215,69 @@ class AssessmentMigrationTests(TransactionTestCase):
         self.assertIn('0007_assessment_history_triggers', self.applied())
 
         self.assertEqual(Attempt.objects.count(), 1)
+
+
+class LearningMigrationTests(TransactionTestCase):
+    """quiz.0008 (ASSESS-07) keeps legacy Course/Enrollment rows as they were."""
+
+    migrate = AssessmentMigrationTests.migrate
+
+    def tearDown(self):
+        try:
+            self.migrate(AFTER)
+        finally:
+            super().tearDown()
+
+    PRE_LEARNING = [('quiz', '0007_assessment_history_triggers')]
+
+    def test_legacy_courses_and_enrollments_are_preserved(self):
+        apps = self.migrate(self.PRE_LEARNING)
+        OldCourse = apps.get_model('quiz', 'Course')
+        OldEnrollment = apps.get_model('quiz', 'Enrollment')
+        OldQuiz = apps.get_model('quiz', 'Quiz')
+        User = get_user_model()
+        students = [User.objects.create_user(email=f'member{i}@example.test', password=None)
+                    for i in range(2)]
+        maths = OldCourse.objects.create(code='MTH101', title='Maths', department='Maths',
+                                         level='100', semester='First')
+        arabic = OldCourse.objects.create(code='ARB101', title='Arabic', department='Arabic',
+                                          level='200', semester='Second')
+        rows = [OldEnrollment.objects.create(course=maths, student_id=students[0].pk),
+                OldEnrollment.objects.create(course=arabic, student_id=students[0].pk),
+                OldEnrollment.objects.create(course=arabic, student_id=students[1].pk)]
+        quiz = OldQuiz.objects.create(title='Linked', type='arabic', description='d',
+                                      related_course=maths)
+
+        self.migrate(AFTER)
+        self.assertEqual(
+            {c.pk: (c.code, c.title, c.department, c.level, c.semester, c.kind, c.status,
+                    c.description, c.created_at, c.published_at, c.closed_at)
+             for c in Course.objects.all()},
+            {maths.pk: ('MTH101', 'Maths', 'Maths', '100', 'First', 'general', 'draft', '',
+                        None, None, None),
+             arabic.pk: ('ARB101', 'Arabic', 'Arabic', '200', 'Second', 'general', 'draft', '',
+                         None, None, None)})
+        self.assertEqual(
+            {e.pk: (e.course_id, e.student_id, e.status, e.enrolled_at, e.withdrawn_at,
+                    e.created_at) for e in Enrollment.objects.all()},
+            {row.pk: (row.course_id, row.student_id, 'active', None, None, None)
+             for row in rows})
+        self.assertEqual(Quiz.objects.get(pk=quiz.pk).related_course_id, maths.pk)
+        # Legacy courses are not presented as Arabic classes and stay protected.
+        admin = QuizAPITestMixin.make_user('migration-admin@example.test', role='admin')
+        client = APIClient()
+        client.force_authenticate(admin)
+        self.assertEqual(client.get('/quiz/classes/').json()['data']['count'], 0)
+        self.assertEqual(client.get(f'/quiz/classes/{arabic.pk}/').status_code, 404)
+        with self.assertRaises(ProtectedError):
+            Course.objects.get(pk=arabic.pk).delete()
+
+        # Rollback drops only the ASSESS-07 columns/tables; the rows survive.
+        apps = self.migrate(self.PRE_LEARNING)
+        OldCourse = apps.get_model('quiz', 'Course')
+        OldEnrollment = apps.get_model('quiz', 'Enrollment')
+        self.assertEqual(sorted(OldCourse.objects.values_list('pk', 'code')),
+                         sorted([(maths.pk, 'MTH101'), (arabic.pk, 'ARB101')]))
+        self.assertEqual(sorted(OldEnrollment.objects.values_list('pk', 'course_id',
+                                                                  'student_id')),
+                         sorted((row.pk, row.course_id, row.student_id) for row in rows))
