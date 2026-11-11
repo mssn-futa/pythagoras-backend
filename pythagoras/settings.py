@@ -212,14 +212,17 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'pythagoras.pagination.StandardPagination',
     'PAGE_SIZE': 20,
     'DATETIME_FORMAT': 'iso-8601',
-    # D5 engineering starting limits, per client IP, tunable per deployment
-    # (e.g. raise AUTH_REFRESH_RATE when many students share a campus NAT IP).
+    # D5 engineering starting limits, tunable per deployment. Register and
+    # login are per client IP; refresh is per session (refresh token) with a
+    # looser per-IP ceiling, because every page load refreshes and many
+    # students can share one campus NAT address.
     # Counters use the default cache; a shared cache is required for
     # deployment-wide enforcement.
     'DEFAULT_THROTTLE_RATES': {
         'auth_register': env_rate('AUTH_REGISTER_RATE', '5/min'),
         'auth_login': env_rate('AUTH_LOGIN_RATE', '10/min'),
         'auth_refresh': env_rate('AUTH_REFRESH_RATE', '10/min'),
+        'auth_refresh_ip': env_rate('AUTH_REFRESH_IP_RATE', '300/min'),
     },
     # Client IP is REMOTE_ADDR unless the verified Cloudflare router is trusted,
     # in which case the address it appends to X-Forwarded-For is used.
