@@ -138,7 +138,7 @@ per environment): `PUBLIC_API_HOST` (controller only), `ALLOWED_HOSTS`,
 only `SECRET_KEY`, `DATABASE_URL`, `JOB_PROBE_BUDGET_SECONDS`, `PYTHAGORAS_ROLE`,
 `PORT`. `outbox-once` receives `OUTBOX_FORWARDED_NAMES` (database, `RESEND_API_KEY`,
 `DEBUG`, `DEFAULT_FROM_EMAIL`, `EMAIL_REPLY_TO`, `EMAIL_IDEMPOTENCY_NAMESPACE`,
-`RESEND_TIMEOUT_SECONDS`, `RESEND_REQUESTS_PER_SECOND`, `OUTBOX_REQUESTS_PER_SECOND`,
+`RESEND_TIMEOUT_SECONDS`, `OUTBOX_REQUESTS_PER_SECOND`,
 `AUTOMATION_*`) plus `OUTBOX_BUDGET_SECONDS`, `PYTHAGORAS_ROLE`, `PORT`. Missing required secrets make the Worker answer `503 service_misconfigured`
 and the cron tick skip, logging the missing **names** only.
 
