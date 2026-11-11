@@ -50,7 +50,8 @@ class EventSummarySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Event
-        fields = ['id', 'title', 'speakers', 'category', 'start_time', 'summary', 'featured_image_url']
+        fields = ['id', 'title', 'speakers', 'category', 'start_time', 'summary', 'featured_image_url',
+                  'featured_image_alt']
         read_only_fields = fields
 
     @extend_schema_field(serializers.URLField(allow_null=True, help_text=FEATURED_IMAGE_URL_HELP))

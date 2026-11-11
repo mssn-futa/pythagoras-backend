@@ -28,6 +28,7 @@ RESOURCE_CREATE = {'title': 'Patience', 'type': 'aud', 'duration': 2100}
 EVENT_SUMMARY = {
     'id': 3, 'title': 'Friday khutbah', 'speakers': 'Guest speaker', 'category': 'jumuah',
     'start_time': '2026-10-09T12:00:00Z', 'summary': 'Key takeaways', 'featured_image_url': FEATURED_IMAGE_URL,
+    'featured_image_alt': 'Speaker at the FUTA mosque',
 }
 
 RESOURCE_NESTED = {
@@ -46,7 +47,7 @@ RESOURCE_DRAFT = {
     **RESOURCE_NESTED, 'status': 'draft', 'storage_status': 'none', 'media_url': None, 'published_at': None,
     'content_type': None, 'size_bytes': None, 'file_name': None, 'uploaded_at': None,
     'updated_at': '2026-10-01T09:05:00Z', 'created_by': 1, 'legacy_file_present': False,
-    'event': {**EVENT_SUMMARY, 'featured_image_url': None},
+    'event': {**EVENT_SUMMARY, 'featured_image_url': None, 'featured_image_alt': ''},
 }
 
 EVENT_DETAIL = {**EVENT_PUBLISHED, 'resources': [RESOURCE_NESTED]}

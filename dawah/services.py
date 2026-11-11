@@ -270,29 +270,67 @@ def create_resource(event_id, serializer, created_by):
             storage_status=EventResource.initial_storage_status(data['type']), **data)
 
 
-def event_references(event):
-    """Rows in other domains (e.g. quizzes) that point at this event.
-
-    Parent-owned resources and featured-image upload intents are not
-    references. Checked generically so the guard does not import or edit quiz
-    models; ASSESS-02 adds DB protection.
-    """
+def _incoming_references(model_class, instance, skip):
     references = {}
-    for relation in Event._meta.related_objects:
-        if relation.related_model in (EventResource, UploadIntent):
+    for relation in model_class._meta.related_objects:
+        if relation.related_model in skip:
             continue
         model = relation.related_model
-        ids = list(model._base_manager.filter(**{relation.field.name: event})
+        ids = list(model._base_manager.filter(**{relation.field.name: instance})
                    .order_by('pk').values_list('pk', flat=True)[:REFERENCE_ID_LIMIT])
         if ids:
             references[model._meta.label_lower] = ids
     return references
 
 
+def _merge(target, references):
+    for label, ids in references.items():
+        merged = sorted(set(target.get(label, [])) | set(ids))
+        target[label] = merged[:REFERENCE_ID_LIMIT]
+    return target
+
+
+def event_references(event):
+    """Rows in other domains that point at this event or at one of its resources
+    (e.g. quizzes, quiz.ModuleResource), as ``{app.model: [ids]}``.
+
+    Parent-owned resources and upload intents are not references themselves;
+    incoming references to the resources are included because deleting the
+    event deletes them. Checked generically so the guard does not import quiz
+    models; DB protection (PROTECT) is reported the same way.
+    """
+    references = _incoming_references(Event, event, (EventResource, UploadIntent))
+    for resource in event.resources.order_by('id'):
+        _merge(references, resource_references(resource))
+    return references
+
+
+def resource_references(resource):
+    """Rows in other domains (e.g. quiz.ModuleResource, ASSESS-07) that point at this resource.
+
+    Upload intents belong to the resource and are not references."""
+    return _incoming_references(EventResource, resource, (UploadIntent,))
+
+
+def protected_references(exc):
+    """``{app.model: [ids]}`` of the rows a ProtectedError/RestrictedError names."""
+    objects = getattr(exc, 'protected_objects', None) or getattr(exc, 'restricted_objects', None) or ()
+    references = {}
+    for obj in objects:
+        references.setdefault(obj._meta.label_lower, []).append(obj.pk)
+    return {label: sorted(ids)[:REFERENCE_ID_LIMIT] for label, ids in references.items()}
+
+
 def referenced_error(references):
     return APIError('RESOURCE_REFERENCED',
-                    'This event is referenced by other records (for example quizzes). '
+                    'This event or one of its resources is referenced by other records. '
                     'Remove those references before deleting it.',
+                    status_code=409, fields={'references': references})
+
+
+def resource_referenced_error(references):
+    return APIError('RESOURCE_REFERENCED',
+                    'This resource is referenced by other records. Remove those references before deleting it.',
                     status_code=409, fields={'references': references})
 
 
@@ -314,8 +352,9 @@ def delete_event(event_id):
         try:
             # Legacy local files are left on disk; Django does not delete them.
             event.delete()
-        except (ProtectedError, RestrictedError):
-            raise referenced_error(event_references(event)) from None
+        except (ProtectedError, RestrictedError) as exc:
+            # A race past the check, or a PROTECT reference to one of its resources.
+            raise referenced_error(protected_references(exc) or event_references(event)) from None
         uploads.cleanup_after_commit(cleanup_ids)
 
 
@@ -324,6 +363,12 @@ def delete_resource(event_id, resource_id):
         _, resource = _lock_resource(event_id, resource_id)
         if resource.status == PUBLISHED:
             raise unpublish_required('resource')
+        references = resource_references(resource)
+        if references:
+            raise resource_referenced_error(references)
         cleanup_ids = uploads.record_resource_cleanup(resource, 'resource_deleted')
-        resource.delete()
+        try:
+            resource.delete()  # PROTECT/RESTRICT raise before any row is deleted; the atomic block rolls back
+        except (ProtectedError, RestrictedError) as exc:
+            raise resource_referenced_error(protected_references(exc) or resource_references(resource)) from None
         uploads.cleanup_after_commit(cleanup_ids)
