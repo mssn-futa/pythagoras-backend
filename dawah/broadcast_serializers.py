@@ -114,6 +114,11 @@ class AudienceField(serializers.Field):
 
 # ---------------------------------------------------------------- requests
 
+@extend_schema_field({'type': 'string', 'pattern': '^(plain|rich)$'})  # pattern: avoids an enum-name collision
+class BodyFormatField(StrictCharField):
+    pass
+
+
 RICH_BODY_SENT = 'Rich drafts do not accept body; the server generates the text fallback from body_html.'
 HTML_FOR_PLAIN = 'body_html applies only to rich drafts; send body_format "rich" with it.'
 
@@ -134,7 +139,7 @@ class BroadcastWriteSerializer(StrictWriteMixin, serializers.ModelSerializer):
     body = StrictCharField(required=False, trim_whitespace=False, max_length=broadcast_content.BODY_MAX_LENGTH,
                            help_text='Plain drafts only: message text (line breaks kept). Required to create a '
                                      'plain draft; never sent for rich drafts (server-generated fallback).')
-    body_format = StrictCharField(required=False, help_text='"plain" (default) or "rich".')
+    body_format = BodyFormatField(required=False, help_text='"plain" (default) or "rich".')
     body_html = StrictCharField(
         required=False, trim_whitespace=False, max_length=broadcast_content.RICH_HTML_MAX_LENGTH,
         error_messages={'max_length': broadcast_content.TOO_LONG_MESSAGE, 'blank': 'Enter the message.'},

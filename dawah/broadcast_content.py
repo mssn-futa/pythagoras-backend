@@ -277,10 +277,7 @@ def _inline(nodes, in_link=False):
         if isinstance(node, str):
             text = _clean_text(node)
             if text:
-                if out and isinstance(out[-1], str):
-                    out[-1] += text
-                else:
-                    out.append(text)
+                out.append(text)
             continue
         if node.tag == 'br' or node.tag == 'hr':
             if node.tag == 'br' or out:
@@ -306,7 +303,7 @@ def _merge_text(nodes):
     merged = []
     for node in nodes:
         if isinstance(node, str) and merged and isinstance(merged[-1], str):
-            merged[-1] += node
+            merged[-1] = _HTML_SPACE.sub(' ', merged[-1] + node)
         else:
             merged.append(node)
     return merged
