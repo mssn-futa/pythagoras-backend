@@ -23,7 +23,8 @@ Lifecycle invariants live in four layers:
   server-clock timing (A10). ASSESS-03/04 build on those, not on raw writes.
 
 Foreign keys that would cascade history (quiz -> event/course, attempts and
-submissions -> quiz/student/attempt) use ``PROTECT``.
+submissions -> quiz/student/attempt, enrollments -> course/student, module
+attachments -> resource) use ``PROTECT``.
 """
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
@@ -32,7 +33,7 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 from accounts.models import CustomUser
-from dawah.models import Event
+from dawah.models import Event, EventResource
 
 from .errors import InvalidTransition, QuizImmutable, SubmissionImmutable
 
@@ -47,25 +48,153 @@ CONTENT_LOCKED_MESSAGE = ('Questions and options cannot be added, changed, reord
 
 
 class Course(models.Model):
+    """A course record; ``kind="arabic"`` rows are the Phase 1 Arabic classes (D3).
+
+    Rows that existed before ASSESS-07 are ``general`` (legacy/general
+    academic): they are kept unchanged and never surfaced by the class API.
+    Arabic class lifecycle: draft -> published -> closed (terminal), changed
+    only by ``quiz.learning.publish_class``/``close_class``.
+    """
+
+    class Kind(models.TextChoices):
+        ARABIC = 'arabic', 'Arabic class'
+        GENERAL = 'general', 'General academic (legacy)'
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        PUBLISHED = 'published', 'Published'
+        CLOSED = 'closed', 'Closed'
+
     code = models.CharField(max_length=7)
     title = models.CharField(max_length=100)
-    department = models.CharField(max_length=100)
-    level = models.CharField(max_length=3, choices=CustomUser.LEVEL_CHOICES)
-    semester = models.CharField(max_length=10)
+    # Department/level/semester describe general academic courses; an Arabic
+    # class leaves them blank (no proficiency/department gate is invented).
+    department = models.CharField(max_length=100, blank=True, default='')
+    level = models.CharField(max_length=3, choices=CustomUser.LEVEL_CHOICES, blank=True,
+                             default='')
+    semester = models.CharField(max_length=10, blank=True, default='')
+
+    kind = models.CharField(max_length=7, choices=Kind, default=Kind.GENERAL)
+    description = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=9, choices=Status, default=Status.DRAFT)
+    published_at = models.DateTimeField(null=True, blank=True, editable=False)
+    closed_at = models.DateTimeField(null=True, blank=True, editable=False)
+    # Null for rows that existed before ASSESS-07 (their times are unknown).
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(kind__in=['arabic', 'general']),
+                                   name='quiz_course_kind_valid'),
+            models.CheckConstraint(condition=Q(status__in=['draft', 'published', 'closed']),
+                                   name='quiz_course_status_valid'),
+            models.CheckConstraint(
+                condition=Q(status='draft') | Q(published_at__isnull=False),
+                name='quiz_course_released_has_published_at'),
+            models.CheckConstraint(
+                condition=(Q(status='closed', closed_at__isnull=False)
+                           | (~Q(status='closed') & Q(closed_at__isnull=True))),
+                name='quiz_course_closed_at_matches_status'),
+        ]
 
     def __str__(self):
         return self.title
 
 
 class Enrollment(models.Model):
-    course = models.ForeignKey(to=Course, on_delete=models.CASCADE)
-    student = models.ForeignKey(to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    """One record per (course, student); withdrawal and re-enrollment change its
+    status, never create a second row (D3). Rows from before ASSESS-07 are
+    ``active`` with unknown (null) timestamps."""
+
+    class Status(models.TextChoices):
+        ACTIVE = 'active', 'Active'
+        WITHDRAWN = 'withdrawn', 'Withdrawn'
+
+    # PROTECT: deleting a class or a user never silently drops roster history.
+    course = models.ForeignKey(to=Course, on_delete=models.PROTECT)
+    student = models.ForeignKey(to=settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    status = models.CharField(max_length=9, choices=Status, default=Status.ACTIVE)
+    # Most recent (re)activation; null for legacy rows.
+    enrolled_at = models.DateTimeField(null=True, blank=True)
+    # Most recent withdrawal; set exactly while withdrawn.
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
 
     class Meta:
         unique_together = ["course", "student"]
+        constraints = [
+            models.CheckConstraint(condition=Q(status__in=['active', 'withdrawn']),
+                                   name='quiz_enrollment_status_valid'),
+            models.CheckConstraint(
+                condition=(Q(status='withdrawn', withdrawn_at__isnull=False)
+                           | Q(status='active', withdrawn_at__isnull=True)),
+                name='quiz_enrollment_withdrawn_at_matches_status'),
+        ]
 
     def __str__(self):
         return f"{self.student.email} -> {self.course.title}"
+
+
+class LearningModule(models.Model):
+    """An ordered digital learning module of an Arabic class (D3).
+
+    Plain-text ``body`` plus attached published Da'wah resources (by ID, via
+    ``ModuleResource``). ``order`` is unique per class (deferred constraint, so
+    an atomic reorder can permute it). Students read a module only while it and
+    its class are published and they hold an active enrollment.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        PUBLISHED = 'published', 'Published'
+
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='modules')
+    title = models.CharField(max_length=250)
+    body = models.TextField(blank=True, default='')
+    order = models.PositiveIntegerField()
+    status = models.CharField(max_length=9, choices=Status, default=Status.DRAFT)
+    published_at = models.DateTimeField(null=True, blank=True, editable=False)
+    resources = models.ManyToManyField(EventResource, through='ModuleResource',
+                                       related_name='learning_modules', blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['course', 'order'], name='quiz_module_order_unique',
+                                    deferrable=models.Deferrable.DEFERRED),
+            models.CheckConstraint(condition=Q(order__gte=1), name='quiz_module_order_positive'),
+            models.CheckConstraint(condition=Q(status__in=['draft', 'published']),
+                                   name='quiz_module_status_valid'),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class ModuleResource(models.Model):
+    """Attachment of a Da'wah resource to a module, in ``position`` order.
+
+    ``resource`` is PROTECT: an attached resource (or its event) cannot be
+    deleted; detach it or unpublish it instead. Deleting a module removes its
+    attachments only.
+    """
+
+    module = models.ForeignKey(LearningModule, on_delete=models.CASCADE,
+                               related_name='attachments')
+    resource = models.ForeignKey(EventResource, on_delete=models.PROTECT, related_name='+')
+    position = models.PositiveIntegerField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['module', 'resource'],
+                                    name='quiz_module_resource_unique'),
+            models.UniqueConstraint(fields=['module', 'position'],
+                                    name='quiz_module_resource_position_unique',
+                                    deferrable=models.Deferrable.DEFERRED),
+        ]
 
 
 def quiz_content_locked(quiz_id):

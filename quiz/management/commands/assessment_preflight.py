@@ -6,7 +6,9 @@ Exits nonzero when duplicate submissions per student/quiz exist; those block
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connections
 
-from quiz.preflight import find_duplicate_submissions, format_duplicates, legacy_notes
+from quiz.preflight import (
+    find_duplicate_submissions, format_duplicates, learning_notes, legacy_notes,
+)
 
 
 class Command(BaseCommand):
@@ -21,7 +23,7 @@ class Command(BaseCommand):
         if 'quiz_submission' not in connection.introspection.table_names():
             self.stdout.write(self.style.SUCCESS('No quiz tables yet; nothing to check.'))
             return
-        for note in legacy_notes(connection):
+        for note in [*legacy_notes(connection), *learning_notes(connection)]:
             self.stdout.write(f'note: {note}')
         duplicates = find_duplicate_submissions(connection)
         if duplicates:

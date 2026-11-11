@@ -51,3 +51,22 @@ def legacy_notes(connection):
             notes.append(f'{count} existing submissions keep their score/answers and are marked '
                          'legacy (no attempt, total_points or snapshot is fabricated)')
     return notes
+
+
+def learning_notes(connection):
+    """Non-blocking facts about how quiz.0008 (ASSESS-07) carries legacy course
+    data forward (counts/IDs only; columns that exist before and after it)."""
+    notes = []
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT id FROM quiz_course ORDER BY id')
+        courses = [row[0] for row in cursor.fetchall()]
+        if courses:
+            notes.append('existing courses kept unchanged as general (legacy) academic courses, '
+                         'not surfaced as Arabic classes: course IDs '
+                         + ', '.join(map(str, courses)))
+        cursor.execute('SELECT COUNT(*) FROM quiz_enrollment')
+        count = cursor.fetchone()[0]
+        if count:
+            notes.append(f'{count} existing enrollments kept (status active, unknown enrolled '
+                         'time left null); memberships lost by quiz.0002 are not recreated')
+    return notes
