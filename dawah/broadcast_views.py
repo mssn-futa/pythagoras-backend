@@ -5,6 +5,7 @@ drafts, snapshots or recipient addresses. Queue and retry only persist outbox
 work (202): nothing here sends mail.
 """
 from django.http import Http404
+from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, extend_schema
 from rest_framework import generics
 from rest_framework.exceptions import ValidationError
@@ -45,7 +46,7 @@ class BroadcastView(generics.GenericAPIView):
     serializer_class = BroadcastSerializer
 
     def respond(self, broadcast_id, message, status=200):
-        broadcast = broadcasts.with_counts(Broadcast.objects.filter(pk=broadcast_id)).get()
+        broadcast = get_object_or_404(broadcasts.with_counts(Broadcast.objects.all()), pk=broadcast_id)
         return success_response(BroadcastSerializer(broadcast).data, message, status=status)
 
     @staticmethod

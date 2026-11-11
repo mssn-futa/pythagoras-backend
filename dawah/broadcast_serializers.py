@@ -88,12 +88,16 @@ class AudienceField(serializers.Field):
             raise serializers.ValidationError('A level applies only to a level audience.')
         values = {'audience_type': kind, 'audience_department': '', 'audience_level': ''}
         if kind == AudienceType.DEPARTMENT:
-            if type(department) is not str or not department.strip():
+            if department is None:
                 raise serializers.ValidationError('Enter a department.')
-            department = department.strip()
-            if len(department) > DEPARTMENT_MAX_LENGTH:
-                raise serializers.ValidationError(
-                    f'Department must be {DEPARTMENT_MAX_LENGTH} characters or fewer.')
+            # Shared CharField rules: string only, trimmed, length, no NUL/surrogates.
+            field = StrictCharField(max_length=DEPARTMENT_MAX_LENGTH, error_messages={
+                'blank': 'Enter a department.', 'invalid': 'Enter the department as text.',
+                'max_length': f'Department must be {DEPARTMENT_MAX_LENGTH} characters or fewer.'})
+            try:
+                department = field.run_validation(department)
+            except serializers.ValidationError as error:
+                raise serializers.ValidationError(list(error.detail)) from None
             if broadcast_content.subject_error(department):
                 raise serializers.ValidationError('Department must be plain single-line text.')
             values['audience_department'] = department
