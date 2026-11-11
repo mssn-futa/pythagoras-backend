@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import broadcast_views, views
 
 
 def legacy_alias(view_class):
@@ -30,6 +30,18 @@ urlpatterns = [
     path('uploads/<int:upload_id>/finalize/', views.UploadFinalizeView.as_view(), name='upload-finalize'),
     path('resources/<int:resource_id>/', views.ResourceDetailView.as_view(), name='resource-detail'),
     path('archive/', views.ArchiveView.as_view(), name='archive'),
+
+    # Broadcasts (D4, admin only).
+    path('broadcasts/', broadcast_views.BroadcastListView.as_view(), name='broadcasts-list'),
+    path('broadcasts/<int:broadcast_id>/', broadcast_views.BroadcastDetailView.as_view(), name='broadcast-detail'),
+    path('broadcasts/<int:broadcast_id>/preview/', broadcast_views.BroadcastPreviewView.as_view(),
+         name='broadcast-preview'),
+    path('broadcasts/<int:broadcast_id>/queue/', broadcast_views.BroadcastQueueView.as_view(),
+         name='broadcast-queue'),
+    path('broadcasts/<int:broadcast_id>/deliveries/', broadcast_views.BroadcastDeliveriesView.as_view(),
+         name='broadcast-deliveries'),
+    path('broadcasts/<int:broadcast_id>/retry/', broadcast_views.BroadcastRetryView.as_view(),
+         name='broadcast-retry'),
 
     # Legacy aliases (no trailing slash).
     path('events/<int:event_id>', legacy_alias(views.EventDetailView), name='event-detail-legacy'),
