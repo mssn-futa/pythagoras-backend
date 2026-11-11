@@ -114,10 +114,19 @@ assert client.get('/accounts/login/').status_code == 405
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_invalid_configuration_fails_without_disclosing_value(self):
-        for variable in ['DEBUG', 'RESEND_TIMEOUT_SECONDS', 'R2_PREVIEW_TTL_SECONDS']:
+        for variable in ['DEBUG', 'RESEND_TIMEOUT_SECONDS', 'R2_PREVIEW_TTL_SECONDS', 'AUTH_REFRESH_RATE']:
             result = self.run_process('import pythagoras.settings', **{variable: 'private-sentinel'})
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn('private-sentinel', result.stderr)
+
+    def test_auth_throttle_rates_are_configurable(self):
+        code = "from django.conf import settings; print(settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'])"
+        default = self.run_process(code)
+        self.assertIn("'auth_refresh': '10/min'", default.stdout)
+        tuned = self.run_process(code, AUTH_REFRESH_RATE='120/min', AUTH_LOGIN_RATE='30/min')
+        self.assertEqual(tuned.returncode, 0, tuned.stderr)
+        self.assertIn("'auth_refresh': '120/min'", tuned.stdout)
+        self.assertIn("'auth_login': '30/min'", tuned.stdout)
 
 
 class AdminAndOriginTests(SimpleTestCase):
