@@ -10,7 +10,10 @@ from rest_framework import serializers
 from pythagoras.serializers import UTCDateTimeField
 
 from . import broadcast_content, broadcasts
-from .models import AudienceType, BodyFormat, Broadcast, BroadcastState, Delivery, DeliveryState
+from .models import (
+    AudienceType, BodyFormat, Broadcast, BroadcastState, Delivery, DeliveryAttempt, DeliveryGeneration,
+    DeliveryState,
+)
 from .serializers import StrictWriteMixin
 
 LEVELS = ('100', '200', '300', '400', '500')
@@ -285,3 +288,68 @@ class DeliverySerializer(serializers.ModelSerializer):
     @extend_schema_field({'type': 'array', 'items': {'type': 'string', 'enum': ['retry']}})
     def get_eligible_actions(self, obj):
         return ['retry'] if obj.is_retry_eligible else []
+
+
+class DeliveryAttemptSerializer(serializers.ModelSerializer):
+    """One provider handoff (or pre-handoff decision). Safe codes only."""
+    outcome = serializers.ChoiceField(choices=DeliveryAttempt.Outcome.choices, read_only=True, allow_blank=True,
+                                      help_text='Blank while the attempt is in flight.')
+    started_at = UTCDateTimeField(read_only=True)
+    finished_at = UTCDateTimeField(read_only=True, allow_null=True)
+    late_outcome = serializers.ChoiceField(choices=DeliveryAttempt.Outcome.choices, read_only=True,
+                                           allow_blank=True,
+                                           help_text='Result reported after this attempt lost its lease.')
+    late_recorded_at = UTCDateTimeField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = DeliveryAttempt
+        fields = ['generation', 'attempt', 'started_at', 'finished_at', 'outcome', 'error_code',
+                  'provider_email_id', 'late_outcome', 'late_error_code', 'late_recorded_at']
+        read_only_fields = fields
+
+
+class DeliveryGenerationSerializer(serializers.ModelSerializer):
+    """A closed retry generation's provider request identity and outcome."""
+    state = serializers.ChoiceField(choices=DeliveryState.choices, read_only=True)
+    first_dispatch_at = UTCDateTimeField(read_only=True, allow_null=True)
+    idempotency_deadline_at = UTCDateTimeField(read_only=True, allow_null=True)
+    requested_at = UTCDateTimeField(read_only=True, allow_null=True)
+    requested_by_id = serializers.IntegerField(read_only=True, allow_null=True)
+    closed_at = UTCDateTimeField(read_only=True)
+    closed_by_id = serializers.IntegerField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = DeliveryGeneration
+        fields = ['generation', 'state', 'attempt_count', 'error_code', 'nonacceptance_known', 'provider_email_id',
+                  'idempotency_key', 'request_hash', 'first_dispatch_at', 'idempotency_deadline_at',
+                  'requested_at', 'requested_by_id', 'closed_at', 'closed_by_id']
+        read_only_fields = fields
+
+
+class DeliveryDetailSerializer(DeliverySerializer):
+    """Admin delivery detail: current request identity plus closed generations
+    and every attempt. Never the request snapshot or message content."""
+    next_attempt_at = UTCDateTimeField(read_only=True, allow_null=True)
+    first_dispatch_at = UTCDateTimeField(read_only=True, allow_null=True)
+    idempotency_deadline_at = UTCDateTimeField(read_only=True, allow_null=True)
+    retry_requested_at = UTCDateTimeField(read_only=True, allow_null=True)
+    retry_requested_by_id = serializers.IntegerField(read_only=True, allow_null=True)
+    generations = serializers.SerializerMethodField()
+    attempts = serializers.SerializerMethodField()
+
+    class Meta(DeliverySerializer.Meta):
+        fields = DeliverySerializer.Meta.fields + [
+            'broadcast_id', 'nonacceptance_known', 'next_attempt_at', 'idempotency_key', 'request_hash',
+            'first_dispatch_at', 'idempotency_deadline_at', 'retry_requested_at', 'retry_requested_by_id',
+            'generations', 'attempts']
+        read_only_fields = fields
+
+    @extend_schema_field(DeliveryGenerationSerializer(many=True))
+    def get_generations(self, obj):
+        rows = DeliveryGeneration.objects.filter(delivery=obj).order_by('generation')
+        return DeliveryGenerationSerializer(rows, many=True).data
+
+    @extend_schema_field(DeliveryAttemptSerializer(many=True))
+    def get_attempts(self, obj):
+        rows = DeliveryAttempt.objects.filter(delivery=obj).order_by('generation', 'attempt')
+        return DeliveryAttemptSerializer(rows, many=True).data

@@ -539,6 +539,13 @@ class DeliveryAttempt(models.Model):
     finished_at = models.DateTimeField(blank=True, null=True)
     outcome = models.CharField(max_length=12, choices=Outcome.choices, blank=True, default='')
     error_code = models.CharField(max_length=64, blank=True, default='')
+    provider_email_id = models.CharField(max_length=128, blank=True, default='',
+                                         help_text='Provider email ID returned to this attempt, if any.')
+    # Evidence from a worker that finished this attempt after losing its lease.
+    late_outcome = models.CharField(max_length=12, choices=Outcome.choices, blank=True, default='',
+                                    help_text='Transport outcome reported after the lease was lost.')
+    late_error_code = models.CharField(max_length=64, blank=True, default='')
+    late_recorded_at = models.DateTimeField(blank=True, null=True)
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=['delivery', 'generation', 'attempt'],
