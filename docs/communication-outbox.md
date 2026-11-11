@@ -113,7 +113,7 @@ The Cloudflare job role is `outbox-once` (fixed argv
 `python manage.py dawah_outbox --once`, see the RELEASE-09 entrypoint); it
 needs the web role's mail settings (`RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`,
 `EMAIL_REPLY_TO`, `EMAIL_IDEMPOTENCY_NAMESPACE`, `RESEND_TIMEOUT_SECONDS`,
-`RESEND_REQUESTS_PER_SECOND`, `OUTBOX_REQUESTS_PER_SECOND`) plus
+`OUTBOX_REQUESTS_PER_SECOND`) plus
 `SECRET_KEY`/`DATABASE_URL`. Run exactly one worker per environment (the
 singleton job). Correctness does not depend on it: claims, leases and tokens
 make concurrent workers safe, but rate pacing is per process.
@@ -183,13 +183,14 @@ IDEMPOTENCY_WINDOW_EXPIRED` with `nonacceptance_known`.
 
 ### Rate budget
 
-`RESEND_REQUESTS_PER_SECOND` (default 2) is the Resend account limit;
-`OUTBOX_REQUESTS_PER_SECOND` (default 1, must be > 0 and not above the account
-limit) is the outbox's process-wide pacing (one slot per interval, no bursts).
-The difference is headroom for welcome/transactional mail, which sends inline
-and is not paced. Anything that still hits the account limit gets 429 and
-backs off with Retry-After as above. Pacing waits count against the `--once`
-budget. Tune both with the Resend account's actual rate/quota.
+`OUTBOX_REQUESTS_PER_SECOND` (default 1, above 0 and at most 100) paces the
+outbox process: one handoff slot per interval, no bursts, shared by every
+worker thread in the process. Set it below the Resend account rate; the
+difference is headroom for welcome/transactional mail, which sends inline and
+is not paced. There is deliberately no account-wide limiter setting (welcome
+and outbox share no counter); anything that still hits the account limit gets
+429 and backs off with Retry-After as above. Pacing waits count against the
+`--once` budget. Tune it against the Resend account's actual rate/quota.
 
 ### Backlog and logs
 

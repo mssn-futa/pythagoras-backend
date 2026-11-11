@@ -153,7 +153,7 @@ unimplemented; filling them does not enable a provider or prove its readiness.
 | `EMAIL_REPLY_TO` | Optional reply-to; blank default |
 | `RESEND_TIMEOUT_SECONDS` | 30-second total wall-clock bound per HTTPS request |
 | `WELCOME_EMAIL_TIMEOUT_SECONDS`, `EMAIL_IDEMPOTENCY_NAMESPACE` | 10 s welcome bound / `local` key namespace; see `identity-auth.md` |
-| `RESEND_REQUESTS_PER_SECOND`, `OUTBOX_REQUESTS_PER_SECOND` | 2 (account limit) / 1 (outbox pacing, > 0 and not above the account limit); see `communication-outbox.md` |
+| `OUTBOX_REQUESTS_PER_SECOND` | 1; outbox worker pacing (> 0, at most 100), set below the Resend account rate; see `communication-outbox.md` |
 | `R2_ACCOUNT_ID`, `R2_S3_ENDPOINT_URL` | Account and S3 API endpoint |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Bucket-scoped backend-only credentials |
 | `R2_PRIVATE_BUCKET`, `R2_PUBLIC_BUCKET` | Private staging/ready and separate public delivery buckets |
