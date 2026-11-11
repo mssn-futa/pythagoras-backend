@@ -45,6 +45,15 @@ def env_positive_int(name, default):
     raise ImproperlyConfigured(f'{name} must be a positive integer.')
 
 
+def env_rate(name, default):
+    """A DRF throttle rate such as '10/min' (periods: sec, min, hour, day)."""
+    value = os.getenv(name, default).strip()
+    match = re.fullmatch(r'([1-9]\d*)/(s|sec|second|m|min|minute|h|hour|d|day)', value)
+    if not match:
+        raise ImproperlyConfigured(f'{name} must be a rate such as 10/min.')
+    return value
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
@@ -203,12 +212,14 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'pythagoras.pagination.StandardPagination',
     'PAGE_SIZE': 20,
     'DATETIME_FORMAT': 'iso-8601',
-    # D5 engineering starting limits, per client IP. Counters use the default
-    # cache; a shared cache is required for deployment-wide enforcement.
+    # D5 engineering starting limits, per client IP, tunable per deployment
+    # (e.g. raise AUTH_REFRESH_RATE when many students share a campus NAT IP).
+    # Counters use the default cache; a shared cache is required for
+    # deployment-wide enforcement.
     'DEFAULT_THROTTLE_RATES': {
-        'auth_register': '5/min',
-        'auth_login': '10/min',
-        'auth_refresh': '10/min',
+        'auth_register': env_rate('AUTH_REGISTER_RATE', '5/min'),
+        'auth_login': env_rate('AUTH_LOGIN_RATE', '10/min'),
+        'auth_refresh': env_rate('AUTH_REFRESH_RATE', '10/min'),
     },
     # Client IP is REMOTE_ADDR unless the verified Cloudflare router is trusted,
     # in which case the address it appends to X-Forwarded-For is used.
