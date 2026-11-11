@@ -53,6 +53,7 @@ The entrypoint takes **at most one** argument (a role) or `PYTHAGORAS_ROLE`
 |------|----------|------|
 | `web` | `gunicorn pythagoras.wsgi:application` on `$PORT` (default 8000), 2 workers x 4 threads (`WEB_CONCURRENCY` overrides workers), `--forwarder-headers ""`, `PGCONNECT_TIMEOUT` default 10 s, `exec` so SIGTERM reaches gunicorn | gunicorn |
 | `job-probe` | `timeout` around `python -m pythagoras.job_probe`: Django `check --database default`, connect, `SELECT 1`, report server major version, `pg_stat_ssl` TLS flag and `sslmode` as one JSON line. **For PostgreSQL it exits 1 unless the session uses TLS and `sslmode=verify-full`**; `JOB_PROBE_ALLOW_INSECURE_DB=yes` is a local/CI-only opt-out. Hard watchdog at `JOB_PROBE_BUDGET_SECONDS` (default 240) | 0 ok, 1 failure, 124 budget exceeded |
+| `outbox-once` | COMM-02 broadcast outbox: `timeout` around the fixed argv `python manage.py dawah_outbox --once --budget-seconds $OUTBOX_BUDGET_SECONDS` (default 240; the controller sets `JOB_BUDGET_SECONDS`). The command stops new dispatch when a bounded Resend call plus margin no longer fits, releases unused claims and exits; `timeout` (budget + 30 s, SIGTERM first) is only a backstop. Requires the COMM-02 command in the image. In the allow-list; the Cron job still starts `job-probe` until RELEASE-03 switches it (`OUTBOX_ROLE` in `src/config.ts`) | 0 ok, nonzero on error, 124 backstop |
 | `migrate` | **Operator only.** `manage.py migrate --noinput`; refuses unless `PYTHAGORAS_ALLOW_MIGRATE=yes`. Not in the controller allow-list, never run by `web` or `job-probe`. | 78 without opt-in |
 | anything else | rejected | 64 |
 
@@ -126,7 +127,7 @@ Worker Secrets (`wrangler secret put`/`--secrets-file`; declared in
 |------|---------|-------|
 | `SECRET_KEY` | web, job-probe | required |
 | `DATABASE_URL` | web, job-probe | required; use `?sslmode=verify-full&sslrootcert=system` (the job probe refuses anything weaker) |
-| `RESEND_API_KEY` | web only | forwarded when bound (PLAT-03 / COMM) |
+| `RESEND_API_KEY` | web, outbox-once | forwarded when bound (PLAT-03 / COMM) |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | web only | forwarded when bound (DAWAH-02); distinct from the deploy token |
 
 Non-secret `vars` (placeholders in `wrangler.jsonc`, `*.staging.invalid`; override
@@ -135,7 +136,10 @@ per environment): `PUBLIC_API_HOST` (controller only), `ALLOWED_HOSTS`,
 `SECURE_SSL_REDIRECT`, `WEB_CONCURRENCY`; plus any of the other names in
 `WEB_PLAIN_NAMES` (`src/config.ts`) when those features land. `job-probe` receives
 only `SECRET_KEY`, `DATABASE_URL`, `JOB_PROBE_BUDGET_SECONDS`, `PYTHAGORAS_ROLE`,
-`PORT`. Missing required secrets make the Worker answer `503 service_misconfigured`
+`PORT`. `outbox-once` receives `OUTBOX_FORWARDED_NAMES` (database, `RESEND_API_KEY`,
+`DEBUG`, `DEFAULT_FROM_EMAIL`, `EMAIL_REPLY_TO`, `EMAIL_IDEMPOTENCY_NAMESPACE`,
+`RESEND_TIMEOUT_SECONDS`, `OUTBOX_REQUESTS_PER_SECOND`,
+`AUTOMATION_*`) plus `OUTBOX_BUDGET_SECONDS`, `PYTHAGORAS_ROLE`, `PORT`. Missing required secrets make the Worker answer `503 service_misconfigured`
 and the cron tick skip, logging the missing **names** only.
 
 Deploy credentials (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`) are separate,
@@ -412,10 +416,12 @@ error; do not treat the design assumption as passed.
 
 ## Handoff to RELEASE-03
 
-Extend, do not replace: swap the `job-probe` role for the bounded outbox command
-(`JOB_BUDGET_SECONDS` already 240; stop dispatching when the remaining budget cannot
-cover a Resend call plus shutdown margin), add `job-outbox` to `ROLES` in
-`docker-entrypoint.sh` **and** `cloudflare/src/config.ts` together, add
+Extend, do not replace: swap the job's `job-probe` role for `OUTBOX_ROLE`
+(`outbox-once`, already in `ROLES` and `docker-entrypoint.sh`; the command itself
+stops dispatching when the remaining budget cannot cover a Resend call plus
+shutdown margin; `JOB_BUDGET_SECONDS` already 240), bind the mail vars it
+forwards (note `EMAIL_IDEMPOTENCY_NAMESPACE` must also reach `web` so welcome keys
+are environment-scoped), add
 `CSRF`/CORS/R2 vars, move the cron to the final environment-specific binding name,
 and decide `migrate` orchestration (separate operator-triggered step before the
 image/Worker rollout; new container starts never migrate).
