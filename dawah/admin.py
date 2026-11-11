@@ -65,14 +65,23 @@ class EventAdmin(ReadOnlyStateAdmin):
     inlines = [EventResourceInline]
 
     def save_model(self, request, obj, form, change):
-        """A start/end change here is a reschedule too (COMM-06): bump the
-        revision and cancel obsolete unsent reminders under the event lock."""
-        if not (change and {'start_time', 'end_time'} & set(form.changed_data)):
+        """Edits write only the form's changed fields under the event lock, so
+        state columns and ``schedule_revision`` are never written from a stale
+        copy. A start/end change is a reschedule (COMM-06): the revision is
+        incremented from the locked row and obsolete unsent reminders are
+        cancelled, as ``services.update_event`` does."""
+        if not change:
             return super().save_model(request, obj, form, change)
         with transaction.atomic():
-            obj.schedule_revision = Event.objects.select_for_update().get(pk=obj.pk).schedule_revision + 1
-            super().save_model(request, obj, form, change)
-            automations.cancel_event_reminders(obj, automations.SOURCE_RESCHEDULED)
+            locked = Event.objects.select_for_update().get(pk=obj.pk)
+            fields = [name for name in form.changed_data if name in {f.name for f in Event._meta.concrete_fields}]
+            rescheduled = (locked.start_time, locked.end_time) != (obj.start_time, obj.end_time)
+            obj.schedule_revision = locked.schedule_revision + (1 if rescheduled else 0)
+            if rescheduled:
+                fields.append('schedule_revision')
+            obj.save(update_fields=[*dict.fromkeys(fields), 'updated_at'])
+            if rescheduled:
+                automations.cancel_event_reminders(obj, automations.SOURCE_RESCHEDULED)
 
 
 @admin.register(EventResource)

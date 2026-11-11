@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.db.models.functions import Lower, Trim
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -65,6 +66,12 @@ WEEKLY_WINDOW = timedelta(days=7)
 WEEKLY_HORIZON = timedelta(days=28)
 REMINDER_HORIZON = timedelta(days=7)
 REMINDER_EVENT_LIMIT = 200  # events considered per reminder rule and tick
+# Digest size caps: keep a typical digest far below the 50,000-character text
+# and 400,000-character email limits that queue enforces.
+DIGEST_MAX_EVENTS = 20
+DIGEST_SUMMARY_MAX_CHARS = 1500
+DIGEST_LINKS_PER_EVENT = 10
+MATERIALIZE_ATTEMPTS = 3  # consecutive failures of one occurrence before it is recorded failed
 
 
 def weekly_catch_up():
@@ -87,6 +94,9 @@ OWNER_INACTIVE = 'owner_inactive'
 CONTENT_INVALID = 'content_invalid'
 PROVIDER_FAILURE = 'provider_failure'
 DELIVERY_UNCERTAIN = 'delivery_uncertain'
+SUPERSEDED_AFTER_HANDOFF = 'superseded_after_handoff'
+WINDOW_OVERLAP = 'window_overlap'
+MATERIALIZE_ERROR = 'materialize_error'
 # Preview only: no upcoming event matches a reminder rule.
 NO_UPCOMING_EVENT = 'no_upcoming_event'
 
@@ -99,7 +109,7 @@ RUN_STATES = ['pending', 'queued', 'processing', 'completed', 'completed_with_er
               'skipped', 'missed', 'cancelled', 'blocked']
 REASON_CODES = [NO_ELIGIBLE_SUMMARIES, NO_RECIPIENTS, MISSED_CATCH_UP_WINDOW, REMINDER_GRACE_ELAPSED,
                 SOURCE_UNPUBLISHED, SOURCE_RESCHEDULED, RULE_DISABLED, OWNER_INACTIVE, CONTENT_INVALID,
-                PROVIDER_FAILURE, DELIVERY_UNCERTAIN]
+                PROVIDER_FAILURE, DELIVERY_UNCERTAIN, SUPERSEDED_AFTER_HANDOFF, WINDOW_OVERLAP, MATERIALIZE_ERROR]
 
 # ---------------------------------------------------------------- placeholders
 
@@ -261,11 +271,14 @@ class Source:
     window_end: datetime | None = None
     events: list = field(default_factory=list)
     event: Event | None = None
+    omitted: int = 0  # eligible events left out by DIGEST_MAX_EVENTS
 
     def as_dict(self):
         data = {'window_start': self.window_start and _iso(self.window_start),
                 'window_end': self.window_end and _iso(self.window_end),
                 'events': [_event_summary(e) for e in self.events]}
+        if self.omitted:
+            data['events_omitted'] = self.omitted
         if self.event is not None:
             data['event'] = _event_summary(self.event)
             data['event_revision'] = self.event.schedule_revision
@@ -274,9 +287,20 @@ class Source:
 
 def weekly_source(rule, scheduled_at):
     start = scheduled_at - WEEKLY_WINDOW
-    events = list(_matching_events(rule).filter(start_time__gte=start, start_time__lt=scheduled_at)
-                  .exclude(summary__isnull=True).exclude(summary__regex=r'^\s*$').order_by('start_time', 'id'))
-    return Source(scheduled_at=scheduled_at, window_start=start, window_end=scheduled_at, events=events)
+    eligible = (_matching_events(rule).filter(start_time__gte=start, start_time__lt=scheduled_at)
+                .exclude(summary__isnull=True).exclude(summary__regex=r'^\s*$').order_by('start_time', 'id'))
+    events = list(eligible[:DIGEST_MAX_EVENTS + 1])
+    omitted = 0
+    if len(events) > DIGEST_MAX_EVENTS:
+        omitted = eligible.count() - DIGEST_MAX_EVENTS
+        events = events[:DIGEST_MAX_EVENTS]
+    return Source(scheduled_at=scheduled_at, window_start=start, window_end=scheduled_at, events=events,
+                  omitted=omitted)
+
+
+def _clip(text, limit):
+    text = (text or '').strip()
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + '…'
 
 
 def placeholder_values(rule, source, rich):
@@ -288,15 +312,21 @@ def placeholder_values(rule, source, rich):
         text_parts, html_parts = [], []
         for event in source.events:
             when = format_local(event.start_time, zone)
-            lines = [f'{event.title} ({when})', (event.summary or '').strip()]
-            lines += [f'- {title}: {url}' for title, url in links.get(event.pk, [])]
+            summary = _clip(event.summary, DIGEST_SUMMARY_MAX_CHARS)
+            event_links = links.get(event.pk, [])[:DIGEST_LINKS_PER_EVENT]
+            lines = [f'{event.title} ({when})', summary]
+            lines += [f'- {title}: {url}' for title, url in event_links]
             text_parts.append('\n'.join(lines))
             item = f'<h3>{html.escape(event.title)}</h3><p><em>{html.escape(when)}</em></p>'
-            item += _paragraphs_html(event.summary)
-            if links.get(event.pk):
+            item += _paragraphs_html(summary)
+            if event_links:
                 item += '<ul>' + ''.join(f'<li><p><a href="{html.escape(url)}">{html.escape(title)}</a></p></li>'
-                                         for title, url in links[event.pk]) + '</ul>'
+                                         for title, url in event_links) + '</ul>'
             html_parts.append(item)
+        if source.omitted:
+            more = f'…and {source.omitted} more event{"s" if source.omitted != 1 else ""} this week.'
+            text_parts.append(more)
+            html_parts.append(f'<p>{html.escape(more)}</p>')
         return {
             'week_start': esc(format_local(source.window_start, zone)),
             'week_end': esc(format_local(source.window_end, zone)),
@@ -334,12 +364,6 @@ def compose(rule, source):
                 'body': sanitized.text}
     body = broadcast_content.normalize_body(_substitute(rule.body, values))
     return {'subject': subject, 'body_format': BodyFormat.PLAIN, 'body_html': None, 'body': body}
-
-
-def render_preview(rule, source):
-    fields = compose(rule, source)
-    return broadcast_content.render_content(fields['subject'], fields['body_format'], fields['body'],
-                                            fields['body_html'])
 
 
 # ---------------------------------------------------------------- runs
@@ -386,6 +410,33 @@ def _materialize(rule, run, source):
     return 1
 
 
+def _attempt(rule, key, scheduled_at, source, **fields):
+    """Record and materialize one due occurrence inside a savepoint. An
+    unexpected error rolls the occurrence back so the next pass retries it;
+    after ``MATERIALIZE_ATTEMPTS`` consecutive failures of the same occurrence
+    it is recorded ``failed`` (``materialize_error``) and never retried."""
+    try:
+        with transaction.atomic():
+            run, new = _record(rule, key, scheduled_at, source=source.as_dict(), **fields)
+            created = _materialize(rule, run, source) if new else 0
+    except Exception as error:
+        failures = rule.failure_count + 1 if rule.failure_key == key else 1
+        logger.error('automation_materialize_failed rule=%s attempt=%s error=%s', rule.pk, failures,
+                     type(error).__name__)
+        if failures >= MATERIALIZE_ATTEMPTS:
+            _record(rule, key, scheduled_at, state=AutomationRunState.FAILED, reason_code=MATERIALIZE_ERROR,
+                    **fields)
+            rule.failure_key, rule.failure_count = '', 0
+        else:
+            rule.failure_key, rule.failure_count = key, failures
+        rule.save(update_fields=['failure_key', 'failure_count'])
+        return 0
+    if rule.failure_key == key:
+        rule.failure_key, rule.failure_count = '', 0
+        rule.save(update_fields=['failure_key', 'failure_count'])
+    return created
+
+
 def _close(run, state, reason):
     run.state, run.reason_code = state, reason
     run.save(update_fields=['state', 'reason_code', 'updated_at'])
@@ -415,13 +466,15 @@ def _tick_weekly(rule, now):
             _record(rule, key, moment, state=AutomationRunState.MISSED, reason_code=MISSED_CATCH_UP_WINDOW,
                     **window)
             continue
+        # A schedule edit can put a new occurrence inside a window already sent.
+        if AutomationRun.objects.filter(rule=rule, broadcast__isnull=False, window_start__lt=moment,
+                                        window_end__gt=moment - WEEKLY_WINDOW).exists():
+            _record(rule, key, moment, state=AutomationRunState.SKIPPED, reason_code=WINDOW_OVERLAP, **window)
+            continue
         if owner_blocked_reason(rule):
             _record(rule, key, moment, state=AutomationRunState.BLOCKED, reason_code=OWNER_INACTIVE, **window)
             continue
-        source = weekly_source(rule, moment)
-        run, new = _record(rule, key, moment, source=source.as_dict(), **window)
-        if new:
-            created += _materialize(rule, run, source)
+        created += _attempt(rule, key, moment, weekly_source(rule, moment), **window)
     return created
 
 
@@ -452,14 +505,28 @@ def _tick_reminders(rule, now):
             _record(rule, key, scheduled_at, state=AutomationRunState.MISSED, reason_code=REMINDER_GRACE_ELAPSED,
                     source=source.as_dict(), **fields)
             continue
+        if _handed_off_before(rule, event):
+            # An earlier revision's reminder already reached (or may have reached)
+            # the provider: a correction is a separately authorized message.
+            _record(rule, key, scheduled_at, state=AutomationRunState.SKIPPED, reason_code=SUPERSEDED_AFTER_HANDOFF,
+                    source=source.as_dict(), **fields)
+            continue
         if owner_blocked_reason(rule):
             _record(rule, key, scheduled_at, state=AutomationRunState.BLOCKED, reason_code=OWNER_INACTIVE,
                     source=source.as_dict(), **fields)
             continue
-        run, new = _record(rule, key, scheduled_at, source=source.as_dict(), **fields)
-        if new:
-            created += _materialize(rule, run, source)
+        created += _attempt(rule, key, scheduled_at, source, **fields)
     return created
+
+
+def _handed_off_before(rule, event):
+    """Whether any earlier run of this rule for this event has a delivery that
+    was or may have been accepted (sending/sent/uncertain, or failed without
+    known nonacceptance)."""
+    handed_off = (Q(state__in=[DeliveryState.SENDING, DeliveryState.SENT, DeliveryState.UNCERTAIN])
+                  | Q(state=DeliveryState.FAILED, nonacceptance_known=False))
+    return Delivery.objects.filter(handed_off, broadcast__automation_run__rule=rule,
+                                   broadcast__automation_run__event_id=event.pk).exists()
 
 
 def tick(now=None):
@@ -491,7 +558,8 @@ def tick(now=None):
 def _cancel_unsent(broadcast_id, delivery_code):
     """Cancel queued/claimed-before-handoff deliveries of one broadcast.
     Rows with an earlier ambiguous same-key attempt become ``uncertain``
-    instead (they may already have been accepted). Returns rows changed."""
+    instead (they may already have been accepted). Returns
+    ``(cancelled, uncertain)`` row counts."""
     from .outbox import _ambiguous_history  # outbox imports this module lazily too
 
     broadcast = Broadcast.objects.select_for_update().get(pk=broadcast_id)
@@ -506,16 +574,31 @@ def _cancel_unsent(broadcast_id, delivery_code):
                                 'updated_at'])
     if rows:
         broadcasts.refresh_state(broadcast)
-    return len(rows)
+    cancelled = sum(row.state == DeliveryState.CANCELLED for row in rows)
+    return cancelled, len(rows) - cancelled
+
+
+def _note_cancellation(run, reason, cancelled):
+    """Keep the cancel reason in the run's provenance; the run itself becomes
+    ``cancelled`` only when at least one delivery actually was."""
+    run.source = {**(run.source or {}), 'cancel_reason': reason}
+    fields = ['source', 'updated_at']
+    if cancelled:
+        run.state, run.reason_code = AutomationRunState.CANCELLED, reason
+        fields += ['state', 'reason_code']
+    run.save(update_fields=fields)
+    logger.info('automation_run_cancelled rule=%s run=%s reason=%s cancelled=%s', run.rule_id, run.pk, reason,
+                cancelled)
 
 
 def _cancel_run(run, reason):
-    changed = _cancel_unsent(run.broadcast_id, DELIVERY_CODES.get(reason, reason.upper())) if run.broadcast_id else 0
-    if run.broadcast_id and not changed:
+    if not run.broadcast_id:
+        _note_cancellation(run, reason, True)
+        return True
+    cancelled, uncertain = _cancel_unsent(run.broadcast_id, DELIVERY_CODES.get(reason, reason.upper()))
+    if not (cancelled or uncertain):
         return False  # everything was already handed off or resolved: history stays as it is
-    run.state, run.reason_code = AutomationRunState.CANCELLED, reason
-    run.save(update_fields=['state', 'reason_code', 'updated_at'])
-    logger.info('automation_run_cancelled rule=%s run=%s reason=%s cancelled=%s', run.rule_id, run.pk, reason, changed)
+    _note_cancellation(run, reason, cancelled)
     return True
 
 
@@ -550,22 +633,30 @@ def stale_reminder_code(run, event, now):
     return None
 
 
-def mark_run_cancelled(run_id, reason):
-    AutomationRun.objects.filter(pk=run_id, state=AutomationRunState.QUEUED).update(
-        state=AutomationRunState.CANCELLED, reason_code=reason, updated_at=timezone.now())
+def mark_run_cancelled(run_id, reason, cancelled=True):
+    """Handoff recheck outcome for one delivery (caller holds event ->
+    broadcast -> delivery locks)."""
+    run = AutomationRun.objects.select_for_update().filter(pk=run_id).first()
+    if run is None or run.state not in (AutomationRunState.QUEUED, AutomationRunState.CANCELLED):
+        return
+    _note_cancellation(run, reason, cancelled and run.state == AutomationRunState.QUEUED)
 
 
 # ---------------------------------------------------------------- run presentation
 
 def run_state(run, broadcast=None, counts=None):
     """(state, reason_code) shown for a run: stored for unmaterialized or
-    cancelled runs, otherwise derived from its broadcast's aggregate state."""
-    if run.state != AutomationRunState.QUEUED or run.broadcast_id is None:
+    cancelled runs, otherwise derived from its broadcast's aggregate state.
+    An uncertain broadcast always shows ``uncertain`` (possible acceptance
+    outranks a stored cancellation)."""
+    if run.broadcast_id is None:
         return run.state, run.reason_code or None
     broadcast = broadcast or run.broadcast
     state = broadcast.state
     if state == BroadcastState.UNCERTAIN:
         return 'uncertain', DELIVERY_UNCERTAIN
+    if run.state != AutomationRunState.QUEUED:
+        return run.state, run.reason_code or None
     if state == BroadcastState.COMPLETED_WITH_ERRORS:
         counts = counts or broadcasts.counts_of(broadcast)
         if not counts['sent']:
@@ -710,11 +801,16 @@ def preview(rule_id, version, now=None):
     count = broadcasts.audience_recipients(rule.audience_type, rule.audience_department, rule.audience_level).count()
     if not count and skip is None:
         skip = NO_RECIPIENTS
+    subject = _one_line(_substitute(rule.subject, placeholder_values(rule, source, rich=False)))
     try:
-        rendered = render_preview(rule, source)
-    except broadcast_content.ContentError as error:
-        raise APIError('VALIDATION_ERROR', 'Correct the highlighted fields.', status_code=400,
-                       fields={'template': [str(error)]}) from None
+        fields = compose(rule, source)
+        rendered = broadcasts.checked_render(fields['subject'], fields['body_format'], fields['body'],
+                                             fields['body_html'])
+    except (broadcast_content.ContentError, APIError):
+        # Exactly what queue would refuse: this occurrence would be recorded content_invalid.
+        rendered = broadcast_content.Rendered(subject=subject, text='', html='',
+                                              template_version=broadcast_content.TEMPLATE_VERSION)
+        skip = CONTENT_INVALID
     data = source.as_dict()
     if source.event is not None and source.event.pk == 0:
         data = {**data, 'event': None, 'event_revision': None}

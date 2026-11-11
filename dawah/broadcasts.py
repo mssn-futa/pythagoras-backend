@@ -161,38 +161,50 @@ def delete_draft(broadcast_id):
         broadcast.delete()
 
 
-def _checked_render(broadcast):
-    """Stored drafts were validated on save; recheck (and re-sanitize rich
-    HTML) before preview/queue so a draft edited outside the API cannot freeze
-    invalid or unsafe content. Returns the rendering preview shows and queue
-    freezes."""
+def checked_render(subject, body_format, body, body_html):
+    """The checks queue applies before freezing content, on raw content
+    fields: subject line, plain body limits or rich re-sanitization, and the
+    rendered email size. Returns the rendering preview shows and queue
+    freezes; raises ``APIError`` (400 VALIDATION_ERROR) otherwise. Shared by
+    broadcast preview/queue and automation preview (COMM-06)."""
     errors = {}
-    subject = (broadcast.subject or '').strip()
-    if not subject:
+    stripped = (subject or '').strip()
+    if not stripped:
         errors['subject'] = ['Enter a subject.']
-    elif len(subject) > broadcast_content.SUBJECT_MAX_LENGTH or broadcast_content.subject_error(subject):
-        errors['subject'] = [broadcast_content.subject_error(subject) or 'Subject is too long.']
-    if broadcast.body_format == BodyFormat.RICH:
+    elif len(stripped) > broadcast_content.SUBJECT_MAX_LENGTH or broadcast_content.subject_error(stripped):
+        errors['subject'] = [broadcast_content.subject_error(stripped) or 'Subject is too long.']
+    if body_format == BodyFormat.RICH:
         try:
-            rendered = broadcast_content.render(broadcast)
+            rendered = broadcast_content.render_content(subject, body_format, body, body_html)
         except broadcast_content.ContentError as error:
             errors['body_html'] = [str(error)]
-    elif broadcast.body_format == BodyFormat.PLAIN:
-        body = broadcast_content.normalize_body(broadcast.body or '')
-        if not body.strip():
-            errors['body'] = ['Enter the message text.']
-        elif broadcast_content.body_error(body):
-            errors['body'] = [broadcast_content.body_error(body)]
         else:
-            rendered = broadcast_content.render(broadcast)
+            if len(rendered.text) > broadcast_content.BODY_MAX_LENGTH:
+                errors['body_html'] = [f'The message text must be {broadcast_content.BODY_MAX_LENGTH:,} '
+                                       'characters or fewer.']
+    elif body_format == BodyFormat.PLAIN:
+        normalized = broadcast_content.normalize_body(body or '')
+        if not normalized.strip():
+            errors['body'] = ['Enter the message text.']
+        elif broadcast_content.body_error(normalized):
+            errors['body'] = [broadcast_content.body_error(normalized)]
+        else:
+            rendered = broadcast_content.render_content(subject, body_format, body, body_html)
     else:
         errors['body_format'] = ['Choose "plain" or "rich".']
     if not errors and len(rendered.html) > broadcast_content.EMAIL_HTML_MAX_LENGTH:
-        errors['body_html' if broadcast.body_format == BodyFormat.RICH else 'body'] = [
+        errors['body_html' if body_format == BodyFormat.RICH else 'body'] = [
             'The rendered email is too large. Shorten the message.']
     if errors:
         raise APIError('VALIDATION_ERROR', 'Correct the highlighted fields.', status_code=400, fields=errors)
     return rendered
+
+
+def _checked_render(broadcast):
+    """Stored drafts were validated on save; recheck (and re-sanitize rich
+    HTML) before preview/queue so a draft edited outside the API cannot freeze
+    invalid or unsafe content."""
+    return checked_render(broadcast.subject, broadcast.body_format, broadcast.body, broadcast.body_html)
 
 
 def preview(broadcast_id, version):

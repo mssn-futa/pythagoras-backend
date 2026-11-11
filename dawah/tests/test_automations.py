@@ -458,6 +458,8 @@ class OutboxIntegrationTests(AutomationBase):
         self.assertEqual((second.state, second.error_code), ('cancelled', 'SOURCE_RESCHEDULED'))
         run.refresh_from_db()
         self.assertEqual((run.state, run.reason_code), ('cancelled', 'source_rescheduled'))
+        # Possible acceptance outranks the stored cancellation in the API.
+        self.assertEqual(automations.run_state(run), ('uncertain', 'delivery_uncertain'))
 
     def test_failed_and_uncertain_runs_are_visible(self):
         rule_obj, event = self.reminder_due_now()
@@ -515,3 +517,135 @@ class DjangoAdminRescheduleTests(AutomationBase):
         event.refresh_from_db()
         self.assertEqual(event.schedule_revision, 2)
         self.assertEqual([(r.state, r.reason_code) for r in runs(rule_obj)], [('cancelled', 'source_rescheduled')])
+
+
+# ---------------------------------------------------------------- review fixes
+
+@MAIL_SETTINGS
+class ReviewFixTests(AutomationBase):
+    def worker(self, transport, **kwargs):
+        return outbox.OutboxWorker(outbox.OutboxConfig(send_timeout=30, **kwargs), transport=transport,
+                                   limiter=None)
+
+    def reminder_due_now(self):
+        now = timezone.now()
+        rule_obj = rule(kind='event_reminder', owner=self.admin, offset_minutes=60,
+                        active_from=now - timedelta(hours=1))
+        event = make_event(status=PUBLISHED, start=now + timedelta(minutes=55), category='jumuah')
+        return rule_obj, event
+
+    def test_end_time_change_after_send_never_resends(self):
+        rule_obj, event = self.reminder_due_now()
+        transport = FakeTransport()
+        self.worker(transport).run_once()
+        self.assertEqual(len(transport.calls), 2)
+        self.as_admin()
+        self.data(self.client.patch(f'/dawah/events/{event.pk}/', {
+            'end_time': (event.end_time + timedelta(minutes=30)).isoformat()}, format='json'))
+        self.worker(transport).run_once()
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual([(r.occurrence_key.rsplit(':', 1)[1], r.state, r.reason_code) for r in runs(rule_obj)],
+                         [('rev-1', 'queued', ''), ('rev-2', 'skipped', 'superseded_after_handoff')])
+
+    def test_only_ambiguous_unsent_keeps_run_uncertain_not_cancelled(self):
+        rule_obj, event = self.reminder_due_now()
+        automations.tick(timezone.now())
+        (run,) = runs(rule_obj)
+        now = timezone.now()
+        for delivery in Delivery.objects.filter(broadcast=run.broadcast):
+            DeliveryAttempt.objects.create(delivery=delivery, generation=0, attempt=1, started_at=now,
+                                           finished_at=now, outcome='uncertain', error_code='TIMEOUT')
+        Delivery.objects.filter(broadcast=run.broadcast).update(attempt_count=1)
+        self.as_admin()
+        self.data(self.client.post(f'/dawah/events/{event.pk}/unpublish/'))
+        run.refresh_from_db()
+        self.assertEqual((run.state, run.source['cancel_reason']), ('queued', 'source_unpublished'))
+        self.assertEqual(automations.run_state(run), ('uncertain', 'delivery_uncertain'))
+
+    def test_preview_reports_content_invalid_like_queue(self):
+        rule_obj = rule(owner=self.admin, enabled=False, body='{{summaries}}')
+        self.as_admin()
+        data = self.data(self.client.post(f'{A}{rule_obj.pk}/preview/', {'version': 1}, format='json'))
+        self.assertEqual((data['skip_reason_code'], data['rendered_html']), ('content_invalid', ''))
+
+    def test_large_digest_is_capped_and_sent(self):
+        rule_obj = rule(owner=self.admin)
+        for index in range(automations.DIGEST_MAX_EVENTS + 5):
+            make_event(status=PUBLISHED, start=MONDAY_8_LAGOS - timedelta(days=2, minutes=index),
+                       summary='x <&> ' * 4000)
+        _, rendered, _, skip, source = automations.preview(rule_obj.pk, 1, now=MONDAY_8_LAGOS - timedelta(hours=1))
+        self.assertEqual((skip, source['events_omitted']), (None, 5))
+        automations.tick(MONDAY_8_LAGOS)
+        (run,) = runs(rule_obj)
+        self.assertEqual(run.state, 'queued')
+        self.assertEqual(run.broadcast.snapshot_html, rendered.html)  # preview/send equivalence
+        self.assertLess(len(run.broadcast.snapshot_text), 50_000)
+        self.assertIn('and 5 more events', run.broadcast.snapshot_text)
+
+    def test_schedule_edit_does_not_resend_an_overlapping_window(self):
+        rule_obj = rule(owner=self.admin)
+        make_event(status=PUBLISHED, start=MONDAY_8_LAGOS - timedelta(days=1))
+        automations.tick(MONDAY_8_LAGOS)
+        AutomationRule.objects.filter(pk=rule_obj.pk).update(weekday=2)  # Wednesday
+        rule_obj.refresh_from_db()
+        wednesday = MONDAY_8_LAGOS + timedelta(days=2)
+        self.assertEqual(automations.tick(wednesday), 0)
+        self.assertEqual([(r.state, r.reason_code) for r in runs(rule_obj)][-1], ('skipped', 'window_overlap'))
+        self.assertEqual(Broadcast.objects.count(), 1)
+
+    def test_materialize_errors_are_bounded(self):
+        rule_obj = rule(owner=self.admin)
+        make_event(status=PUBLISHED, start=MONDAY_8_LAGOS - timedelta(days=1))
+        with mock.patch.object(automations, '_materialize', side_effect=RuntimeError('boom')), \
+                self.assertLogs('dawah.automations', level=logging.ERROR):
+            for attempt in range(3):
+                self.assertEqual(automations.tick(MONDAY_8_LAGOS + timedelta(minutes=attempt)), 0)
+                self.assertEqual(len(runs(rule_obj)), 0 if attempt < 2 else 1)
+        (run,) = runs(rule_obj)
+        self.assertEqual((run.state, run.reason_code), ('failed', 'materialize_error'))
+        self.assertEqual(automations.tick(MONDAY_8_LAGOS + timedelta(minutes=5)), 0)
+        self.assertFalse(Broadcast.objects.exists())
+
+    def test_long_drain_reruns_scheduler_tick_between_batches(self):
+        clock = [1000.0]
+        ticks = []
+        drafts = []
+        for _ in range(2):
+            draft = Broadcast.objects.create(created_by=self.admin, subject='S', body='B', audience_type='all')
+            drafts.append(draft)
+            from dawah import broadcasts
+            broadcasts.queue(draft.pk, 1, self.admin)
+
+        def on_send(message):
+            clock[0] += outbox.TICK_INTERVAL_SECONDS + 1
+
+        worker = outbox.OutboxWorker(outbox.OutboxConfig(send_timeout=30, batch_size=1), limiter=None,
+                                     transport=FakeTransport(on_send=on_send), clock=lambda: clock[0])
+        with mock.patch.object(outbox, 'scheduler_tick', side_effect=lambda now: ticks.append(now) or 0):
+            worker.run_once(budget_seconds=10_000)
+        self.assertGreaterEqual(len(ticks), 4)  # initial tick plus one between each later batch
+
+    def test_admin_edit_never_moves_revision_backwards(self):
+        from django.contrib import admin as django_admin
+
+        from dawah.admin import EventAdminForm
+
+        event = make_event(status=PUBLISHED, start=datetime(2026, 11, 13, 12, tzinfo=UTC))
+        stale = Event.objects.get(pk=event.pk)
+        Event.objects.filter(pk=event.pk).update(schedule_revision=5)
+        data = {'title': 'Renamed', 'category': stale.category, 'tags': '', 'speakers': 's', 'location': 'l',
+                'summary': 'x', 'start_time': '2026-11-13 12:00:00', 'end_time': '2026-11-13 13:00:00'}
+        form = EventAdminForm(data, instance=stale)
+        self.assertTrue(form.is_valid(), form.errors)
+        django_admin.site._registry[Event].save_model(None, form.save(commit=False), form, True)
+        event.refresh_from_db()
+        self.assertEqual((event.title, event.schedule_revision, event.status), ('Renamed', 5, PUBLISHED))
+
+    def test_frontend_base_url_check(self):
+        from dawah.checks import frontend_base_url_check
+
+        for value, errors in (('http://app.test', 1), ('https://u:p@app.test', 1), ('https://app.test', 0)):
+            with self.subTest(value=value), override_settings(DEBUG=False, FRONTEND_BASE_URL=value):
+                self.assertEqual(len(frontend_base_url_check(None)), errors)
+        with override_settings(DEBUG=True, FRONTEND_BASE_URL='http://localhost:5173'):
+            self.assertEqual(frontend_base_url_check(None), [])

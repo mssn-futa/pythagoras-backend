@@ -92,9 +92,12 @@ rendered_html, audience_count, skip_reason_code, source}`. Weekly previews the
 the next matching published event. `source = {window_start, window_end,
 scheduled_at, events[{id, title, category, start_time}], event?,
 event_revision?}`. `skip_reason_code`: `no_eligible_summaries`,
-`no_recipients`, or `no_upcoming_event` (reminder without a matching event:
-the preview then uses sample values and `source.event` is null). Nothing is
-written.
+`no_recipients`, `content_invalid` (the composed message fails the same
+`broadcasts.checked_render` checks queue applies: subject, body limits, rich
+sanitization, 50,000-character text and 400,000-character email limits;
+`rendered_html`/`rendered_text` are then empty), or `no_upcoming_event`
+(reminder without a matching event: the preview then uses sample values and
+`source.event` is null). Nothing is written.
 
 ### Run payload
 
@@ -108,12 +111,18 @@ States: stored `skipped`, `missed`, `blocked`, `cancelled`, `failed`
 (content), `pending` (transient, never committed by the current tick);
 materialized runs show the broadcast's state: `queued`, `processing`,
 `completed`, `completed_with_errors`, `failed` (every delivery failed, reason
-`provider_failure`), `uncertain` (reason `delivery_uncertain`).
+`provider_failure`), `uncertain` (reason `delivery_uncertain`). An
+uncertain broadcast always shows `uncertain`, even when the stored run state
+is `cancelled`. A run is stored `cancelled` only when at least one of its
+deliveries actually became `cancelled`; the cancel reason is always kept in
+`source.cancel_reason`. Weekly sources carry `events_omitted` when the digest
+cap left events out.
 
 Reason codes: `no_eligible_summaries`, `no_recipients`,
 `missed_catch_up_window`, `reminder_grace_elapsed`, `source_unpublished`,
 `source_rescheduled`, `rule_disabled`, `owner_inactive`, `content_invalid`,
-`provider_failure`, `delivery_uncertain`.
+`provider_failure`, `delivery_uncertain`, `superseded_after_handoff`,
+`window_overlap`, `materialize_error`.
 
 Example (weekly, materialized):
 
@@ -133,12 +142,18 @@ Reminder example: `occurrence_key "rule-4:event-5:rev-2"`, `source.event
 
 The outbox scheduler tick (`outbox.scheduler_tick` → `automations.tick(now)`)
 runs at the start of every `dawah_outbox --once` pass and every continuous
-loop iteration. Each enabled rule is evaluated in its own transaction holding
+poll, and again between claim batches (no claims held) whenever the last tick
+is at least 60 s old (`outbox.TICK_INTERVAL_SECONDS`), so a long drain does
+not delay occurrences. Each enabled rule is evaluated in its own transaction holding
 its row lock (`SELECT ... FOR UPDATE SKIP LOCKED`: a concurrent pass skips it).
 `AutomationRun` is unique per `(rule, occurrence_key)`; a repeated pass,
 restart or race finds the existing run and creates nothing. The run, the
-broadcast, its snapshot and deliveries are committed together. A failing rule
-is logged (ids only) and does not stop other rules or the drain.
+broadcast, its snapshot and deliveries are committed together (savepoint per
+occurrence). An unexpected materialization error rolls that occurrence back
+for a retry on the next pass; after 3 consecutive failures of the same
+occurrence it is recorded `failed` (`materialize_error`) and never retried.
+A failing rule is logged (ids and exception class only) and does not stop
+other rules or the drain.
 
 - **Window/time**: computed from the scheduled occurrence, never from worker
   execution time. Only occurrences scheduled at/after `active_from` (last
@@ -151,16 +166,30 @@ is logged (ids only) and does not stop other rules or the drain.
   summaries or no active recipients → `skipped` (no empty mail). Only the
   latest due occurrence is sent, and only within the catch-up window (default
   24 h, `AUTOMATION_WEEKLY_CATCH_UP_MINUTES`); older unprocessed occurrences
-  within 28 days are recorded `missed` (`missed_catch_up_window`).
+  within 28 days are recorded `missed` (`missed_catch_up_window`). An
+  occurrence whose window overlaps the window of an already materialized run
+  of the same rule (e.g. after a weekday/time edit) is `skipped`
+  (`window_overlap`), so no event is digested twice.
+- **Digest size caps**: at most 20 events per digest (earliest first; the
+  rest are counted in `source.events_omitted` and mentioned as "…and N more
+  events"), summaries clipped to 1,500 characters, at most 10 resource links
+  per event. A typical full digest stays far below the 50,000-character text
+  and 400,000-character email limits; anything over them is `content_invalid`.
 - **Reminder**: occurrence at `start_time - offset_minutes` for each
   published matching event; key `rule-{id}:event-{event}:rev-{revision}`. Sent
   only within the grace (default 15 min, `AUTOMATION_REMINDER_GRACE_MINUTES`)
   and before the event starts; otherwise `missed` (`reminder_grace_elapsed`).
-  Horizon 7 days; at most 200 events per rule and pass.
+  Horizon 7 days; at most 200 events per rule and pass. If any earlier run of
+  the same rule for the same event (another revision) has a delivery that was
+  or may have been handed off (`sending`, `sent`, `uncertain`, or `failed`
+  without known nonacceptance), the new revision is `skipped`
+  (`superseded_after_handoff`): a correction is a separately authorized
+  message. The revision increments on any start **or** end change (D4).
 - **Owner**: an inactive or non-admin owner (or a deleted one) records the due
   occurrence as `blocked` (`owner_inactive`); nothing is queued until the rule
   is reassigned (later occurrences only; blocked ones are not replayed).
-- **Reschedule/unpublish**: `services.update_event` increments
+- **Reschedule/unpublish**: `services.update_event` (and the Django admin
+  event form, from the locked row) increments
   `Event.schedule_revision` when `start_time`/`end_time` change and, under the
   event lock, cancels unsent deliveries (`queued`/`claimed`) of reminder runs
   for older revisions; `unpublish_event` does the same for all of the event's
@@ -190,7 +219,9 @@ held during provider I/O.
   Rules, occurrences and deduplication live only in PostgreSQL. A pass that
   does not run within the catch-up/grace window records `missed`, it never
   sends late.
-- Environment: `FRONTEND_BASE_URL` (reminder links, optional),
+- Environment: `FRONTEND_BASE_URL` (reminder links, optional; with
+  `DEBUG=false` it must be `https` without user info, system check
+  `dawah.E001`),
   `AUTOMATION_WEEKLY_CATCH_UP_MINUTES` / `AUTOMATION_REMINDER_GRACE_MINUTES`
   (Django settings overrides, optional); delivery itself uses the outbox
   settings (`docs/communication-outbox.md`).
@@ -201,6 +232,8 @@ held during provider I/O.
 
 - After provider handoff a cancelled reminder may still be delivered; the
   delivery stays `sent`/`uncertain` with its evidence.
+- An event unpublished and republished at the same revision does not get a
+  new reminder (its run stays `cancelled`).
 - Event time changes made outside `services.update_event` and the Django
   admin (shell, raw SQL) do not bump `schedule_revision`; the handoff recheck
   still blocks sending after the event starts or once unpublished.

@@ -333,7 +333,8 @@ outcome/code/time). It never contains the request snapshot, subject or body.
   explicitly authorized broadcast.
 - **Schema changes to Delivery state:** stop the scheduled job (or let the
   current run finish), migrate, deploy, re-enable; leases make a killed run safe.
-- `scheduler_tick(now)` in `dawah/outbox.py` runs first in every pass and
+- `scheduler_tick(now)` in `dawah/outbox.py` runs first in every pass (and
+  between claim batches once 60 s have passed since the last tick) and
   materializes due weekly digests/event reminders (COMM-06,
   `docs/communication-automations.md`); `materialized` in the summary line is
   the number of broadcasts it created. Before handing off a delivery of an

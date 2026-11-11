@@ -603,6 +603,9 @@ class AutomationRule(models.Model):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True,
                               related_name='+', help_text='Must be an active admin for new runs.')
     version = models.PositiveIntegerField(default=1)
+    # Bounded materialization retries: consecutive failures of one occurrence.
+    failure_key = models.CharField(max_length=200, blank=True, default='')
+    failure_count = models.PositiveSmallIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
