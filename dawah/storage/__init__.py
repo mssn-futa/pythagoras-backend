@@ -68,8 +68,11 @@ class ObjectStorage:
         """Signed browser PUT to a *private staging* key; Content-Type and Content-Length are signed."""
         raise NotImplementedError
 
-    def presign_get(self, key: str, *, expires_in: int, content_type: str, filename: str) -> str:
-        """Short-lived signed GET of a private object (admin preview)."""
+    def presign_get(self, key: str, *, expires_in: int, content_type: str, filename: str,
+                    disposition: str = 'inline') -> str:
+        """Short-lived signed GET of a private object (admin preview).
+
+        ``disposition`` is ``inline`` or ``attachment`` (response Content-Disposition)."""
         raise NotImplementedError
 
     def head(self, key: str, *, bucket: str = PRIVATE) -> ObjectInfo | None:

@@ -51,8 +51,8 @@ class InMemoryObjectStorage(ObjectStorage):
         return (f'https://{FAKE_HOST}/private/{quote(key)}?X-Amz-Expires={expires_in}'
                 f'&X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost&X-Amz-Signature={token}')
 
-    def presign_get(self, key, *, expires_in, content_type, filename):
-        self._record('presign_get', key=key)
+    def presign_get(self, key, *, expires_in, content_type, filename, disposition='inline'):
+        self._record('presign_get', key=key, content_type=content_type, disposition=disposition)
         return (f'https://{FAKE_HOST}/private/{quote(key)}?X-Amz-Expires={expires_in}'
                 f'&X-Amz-Signature={secrets.token_hex(16)}')
 
