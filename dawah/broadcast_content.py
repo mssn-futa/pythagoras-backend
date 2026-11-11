@@ -213,6 +213,7 @@ def _hidden_or_space(char):
     return char.isspace() or unicodedata.category(char)[0] in 'CZ'
 
 
+_HOST = re.compile(r'[a-z0-9_-][a-z0-9_.-]*')
 _PATH_SAFE = "/%:@!$&'()*+,;=-._~"
 _QUERY_SAFE = _PATH_SAFE + '?'
 
@@ -249,7 +250,7 @@ def normalize_link(href):
             host = host.encode('idna').decode('ascii').lower()
         except UnicodeError:
             return None
-        if not host or host.startswith('.') or '..' in host:
+        if not _HOST.fullmatch(host) or '..' in host:
             return None
     if port is not None and (scheme, port) not in {('http', 80), ('https', 443)}:
         host = f'{host}:{port}'

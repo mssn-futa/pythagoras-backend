@@ -159,7 +159,8 @@ class SanitizerSecurityTests(SimpleTestCase):
         for href in ('javascript:alert(1)', 'data:text/html,x', 'vbscript:x', 'mailto:a@example.test',
                      'ftp://example.test/', '/path', '//example.test/', 'https://user:pw@example.test/',
                      'https://exa mple.test/', 'https://example.test/‮gnp.exe', 'https://example.test/​',
-                     'https:example.test', 'https://', 'http://[::1', 'https://example.test:99999/',
+                     'https:example.test', 'https://', 'http://[::1', 'https://a<b>.test/', 'https://.test/',
+                     'https://ex%41mple.test/', 'https://example.test:99999/',
                      'https://' + 'a' * 2000 + '.test/'):
             with self.subTest(href=href):
                 result = sanitize_rich_html(f'<p>Go <a href="{href}">there</a></p>')
