@@ -187,6 +187,9 @@ def _checked_render(broadcast):
             rendered = broadcast_content.render(broadcast)
     else:
         errors['body_format'] = ['Choose "plain" or "rich".']
+    if not errors and len(rendered.html) > broadcast_content.EMAIL_HTML_MAX_LENGTH:
+        errors['body_html' if broadcast.body_format == BodyFormat.RICH else 'body'] = [
+            'The rendered email is too large. Shorten the message.']
     if errors:
         raise APIError('VALIDATION_ERROR', 'Correct the highlighted fields.', status_code=400, fields=errors)
     return rendered

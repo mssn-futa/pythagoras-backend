@@ -63,6 +63,11 @@ REMOVED_WITH_CONTENT = frozenset({
 EMPTY_MESSAGE = 'The message has no text left after removing unsupported content.'
 TOO_LONG_MESSAGE = f'The formatted message must be {RICH_HTML_MAX_LENGTH:,} characters or fewer.'
 TOO_DEEP_MESSAGE = 'The formatted message is nested too deeply. Simplify lists and quotes.'
+TOO_COMPLEX_MESSAGE = 'The formatted message has too many tags. Simplify the formatting.'
+# Cheap bound on author input checked before parsing (``check_rich_input``).
+RICH_HTML_MAX_TAGS = 20_000
+# The rendered email document (template + inline styles) must stay bounded too.
+EMAIL_HTML_MAX_LENGTH = 400_000
 
 # Header injection: any line break / control / Unicode separator in a subject.
 _SUBJECT_FORBIDDEN = re.compile('[\x00-\x1f\x7f-\x9f  ]')
@@ -216,6 +221,8 @@ def _hidden_or_space(char):
 _HOST = re.compile(r'[a-z0-9_-][a-z0-9_.-]*')
 _PATH_SAFE = "/%:@!$&'()*+,;=-._~"
 _QUERY_SAFE = _PATH_SAFE + '?'
+_FRAGMENT_SAFE = _QUERY_SAFE + '#'
+_BAD_PERCENT = re.compile('%(?![0-9A-Fa-f]{2})')
 
 
 def normalize_link(href):
@@ -230,7 +237,7 @@ def normalize_link(href):
     value = href.strip(' \t\n\r\f')
     if not value or len(value) > LINK_MAX_LENGTH or any(_hidden_or_space(char) for char in value):
         return None
-    if '\\' in value:
+    if '\\' in value or _BAD_PERCENT.search(value):
         return None
     try:
         parts = urlsplit(value)
@@ -243,6 +250,8 @@ def normalize_link(href):
     if '@' in parts.netloc or not parts.hostname:
         return None
     host = parts.hostname
+    if '[' in parts.netloc and ':' not in host:  # brackets are only for IPv6 literals
+        return None
     if ':' in host:  # IPv6 literal
         host = f'[{host}]'
     else:
@@ -258,7 +267,7 @@ def normalize_link(href):
     if parts.query:
         url += '?' + quote(parts.query, safe=_QUERY_SAFE)
     if parts.fragment:
-        url += '#' + quote(parts.fragment, safe=_QUERY_SAFE)
+        url += '#' + quote(parts.fragment, safe=_FRAGMENT_SAFE)
     if len(url) > LINK_MAX_LENGTH:
         return None
     return url
@@ -465,7 +474,9 @@ def _inline_text(nodes):
             out.append('\n')
         elif node.tag == 'a':
             text = _inline_text(node.children)
-            out.append(text if text.strip() == node.href else f'{text} ({node.href})')
+            bare = text.strip()
+            same = bare == node.href or normalize_link(bare) == node.href  # e.g. autolinked "https://x.com"
+            out.append(text if same else f'{text} ({node.href})')
         else:
             out.append(_inline_text(node.children))
     return ''.join(out)
@@ -507,15 +518,31 @@ def _sanitized_tree(raw):
         raise ContentError(EMPTY_MESSAGE)
     if _depth(blocks) > MAX_NESTING_DEPTH:
         raise ContentError(TOO_DEEP_MESSAGE)
+    if len(_serialize(blocks)) > RICH_HTML_MAX_LENGTH:  # canonical output cap (links gain rel=...)
+        raise ContentError(TOO_LONG_MESSAGE)
     return blocks
+
+
+def check_rich_input(raw):
+    """Cheap checks on author input before any parsing: size and a tag-count
+    bound, so pathological markup (e.g. 25,000 nested lists) fails fast.
+    Raises ``ContentError``. Stored canonical HTML is not re-checked here (its
+    size is capped by ``sanitize_rich_html``)."""
+    if not isinstance(raw, str):
+        raise ContentError(EMPTY_MESSAGE)
+    if len(raw) > RICH_HTML_MAX_LENGTH:
+        raise ContentError(TOO_LONG_MESSAGE)
+    if raw.count('<') > RICH_HTML_MAX_TAGS:
+        raise ContentError(TOO_COMPLEX_MESSAGE)
 
 
 def sanitize_rich_html(raw):
     """Author HTML → canonical safe HTML and its text fallback.
 
-    Raises ``ContentError`` when nothing readable is left or the structure is
-    too deep. Input size is checked by callers (``RICH_HTML_MAX_LENGTH``)
-    before calling, so re-sanitizing stored canonical HTML never fails on size.
+    Raises ``ContentError`` when nothing readable is left, the structure is
+    too deep or the canonical HTML exceeds ``RICH_HTML_MAX_LENGTH``. Callers
+    run ``check_rich_input`` on author input first. Canonical output is a
+    fixed point, so re-sanitizing stored HTML gives the same result.
     """
     blocks = _sanitized_tree(raw)
     return SanitizedRich(html=_serialize(blocks), text=text_fallback(blocks))

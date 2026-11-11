@@ -160,7 +160,8 @@ class SanitizerSecurityTests(SimpleTestCase):
                      'ftp://example.test/', '/path', '//example.test/', 'https://user:pw@example.test/',
                      'https://exa mple.test/', 'https://example.test/‮gnp.exe', 'https://example.test/​',
                      'https:example.test', 'https://', 'http://[::1', 'https://a<b>.test/', 'https://.test/',
-                     'https://ex%41mple.test/', 'https://example.test:99999/',
+                     'https://ex%41mple.test/', 'https://[example.test]/', 'https://[example.test]:443/',
+                     'https://example.test/100%', 'https://example.test/%zz', 'https://example.test/?q=%2', 'https://example.test:99999/',
                      'https://' + 'a' * 2000 + '.test/'):
             with self.subTest(href=href):
                 result = sanitize_rich_html(f'<p>Go <a href="{href}">there</a></p>')
@@ -214,6 +215,8 @@ class SanitizerFormattingTests(SimpleTestCase):
             'https://example.test/a%20b': 'https://example.test/a%20b',
             'https://example.test/"x"<y>': 'https://example.test/%22x%22%3Cy%3E',
             'https://[2001:db8::1]/': 'https://[2001:db8::1]/',
+            'https://example.test/p#a#b': 'https://example.test/p#a#b',
+            'https://example.test/%7e%41': 'https://example.test/%7e%41',
         }
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
@@ -259,6 +262,25 @@ class SanitizerFormattingTests(SimpleTestCase):
                 sanitize_rich_html(raw)
             self.assertEqual(str(caught.exception), bc.TOO_DEEP_MESSAGE)
 
+    def test_canonical_output_is_capped(self):
+        raw = '<p><a href="https://x.com/a">x</a></p>' * 2300  # under the input limit; rel= pushes it over
+        self.assertLessEqual(len(raw), bc.RICH_HTML_MAX_LENGTH)
+        with self.assertRaises(ContentError) as caught:
+            sanitize_rich_html(raw)
+        self.assertEqual(str(caught.exception), bc.TOO_LONG_MESSAGE)
+
+    def test_tag_count_precheck_fails_fast(self):
+        import time
+        for raw in ('<ul>' * 25000, '<b>' * 20001):
+            started = time.monotonic()
+            with self.subTest(raw=raw[:8]), self.assertRaises(ContentError) as caught:
+                bc.check_rich_input(raw)
+            self.assertEqual(str(caught.exception), bc.TOO_COMPLEX_MESSAGE)
+            self.assertLess(time.monotonic() - started, 0.5)
+        bc.check_rich_input('<b>' * 20000)  # at the bound
+        with self.assertRaises(ContentError):
+            bc.check_rich_input('x' * (bc.RICH_HTML_MAX_LENGTH + 1))
+
     def test_idempotent_on_random_input(self):
         tokens = ['<p>', '</p>', '<b>', '</b>', '<strong>', '</strong>', '<em>', '</em>', '<ul>', '</ul>', '<ol>',
                   '</ol>', '<li>', '</li>', '<blockquote>', '</blockquote>', '<h1>', '<h2>', '</h2>', '<h3>',
@@ -281,12 +303,13 @@ class SanitizerFormattingTests(SimpleTestCase):
 
     def test_large_input_is_bounded_in_time(self):
         import time
-        raw = '<p>Text <strong>bold</strong> <a href="https://example.test/x">link</a></p>' * 1300
+        raw = ('<p>Text <strong>bold</strong> <a href="https://example.test/x">link</a></p>' * 600
+               + '<ul><li><em>item</em> text</li></ul>' * 400)
         self.assertLessEqual(len(raw), bc.RICH_HTML_MAX_LENGTH)
         started = time.monotonic()
         result = sanitize_rich_html(raw)
         self.assertLess(time.monotonic() - started, 5)
-        self.assertEqual(result.html.count('<p>'), 1300)
+        self.assertEqual(result.html.count('<p>'), 1000)
 
 
 class TextFallbackTests(SimpleTestCase):
@@ -307,6 +330,10 @@ class TextFallbackTests(SimpleTestCase):
             '<p>See <a href="https://example.test/x">the notes</a>.</p>': 'See the notes (https://example.test/x).',
             '<p><a href="https://example.test/x">https://example.test/x</a></p>': 'https://example.test/x',
             '<p><a href="https://example.test">https://example.test/</a></p>': 'https://example.test/',
+            # Bare-host autolink: the text normalizes to the href, so no "(href)" is added.
+            '<p><a href="https://x.com">https://x.com</a></p>': 'https://x.com',
+            '<p><a href="https://X.com/">HTTPS://x.COM</a></p>': 'HTTPS://x.COM',
+            '<p><a href="https://x.com/a">https://x.com/b</a></p>': 'https://x.com/b (https://x.com/a)',
             '<p><strong>Bold</strong> and <em>it</em></p>': 'Bold and it',
             '<blockquote><p>q1</p><p>q2</p></blockquote><p>after</p>': 'q1\n\nq2\n\nafter',
             '<ul><li><p>a</p><ul><li><p>n</p></li></ul></li></ul>': '- a\n- n',
@@ -409,6 +436,46 @@ class RichDraftApiTests(BroadcastTestCase):
         self.assertIn('subject', self.fields(self.client.post(LIST, rich_payload(subject='a\r\nBcc: x@example.test'),
                                                               format='json')))
         self.assertEqual(Broadcast.objects.count(), count)
+
+    def test_output_cap_and_tag_bound_are_field_errors(self):
+        count = Broadcast.objects.count()
+        response = self.client.post(LIST, rich_payload(body_html='<p><a href="https://x.com/a">x</a></p>' * 2300),
+                                    format='json')
+        self.assertEqual(self.fields(response), {'body_html': [bc.TOO_LONG_MESSAGE]})
+        response = self.client.post(LIST, rich_payload(body_html='<ul>' * 25000), format='json')
+        self.assertEqual(self.fields(response), {'body_html': [bc.TOO_COMPLEX_MESSAGE]})
+        created = self.create_rich()
+        response = self.patch(created['id'], {'body_html': '<ul>' * 25000, 'version': 1})
+        self.assertEqual(self.fields(response), {'body_html': [bc.TOO_COMPLEX_MESSAGE]})
+        self.assertEqual(Broadcast.objects.count(), count + 1)
+
+    def test_patch_sanitizes_before_taking_the_row_lock(self):
+        created = self.create_rich()
+        calls = []
+        real_sanitize, real_update = bc.sanitize_rich_html, broadcasts.update_draft
+
+        def sanitize(raw):
+            calls.append('sanitize')
+            return real_sanitize(raw)
+
+        def update(*args, **kwargs):
+            calls.append('lock')
+            return real_update(*args, **kwargs)
+
+        with mock.patch.object(bc, 'sanitize_rich_html', sanitize), mock.patch.object(broadcasts, 'update_draft', update):
+            data = self.data(self.patch(created['id'], {'body_html': '<p>new <em>text</em></p>', 'version': 1}))
+        self.assertEqual(data['body_html'], '<p>new <em>text</em></p>')
+        self.assertEqual(calls, ['sanitize', 'lock'])  # sanitized once, before the lock
+
+    def test_rendered_email_size_is_guarded(self):
+        make_student()
+        created = self.create_rich()
+        with mock.patch.object(bc, 'EMAIL_HTML_MAX_LENGTH', 100):
+            for suffix in ('preview/', 'queue/'):
+                response = self.client.post(detail(created['id'], suffix), {'version': 1}, format='json')
+                self.assertEqual(self.fields(response),
+                                 {'body_html': ['The rendered email is too large. Shorten the message.']})
+        self.assertEqual(Delivery.objects.count(), 0)
 
     def test_largest_allowed_input_is_accepted(self):
         block = '<p><strong><em>' + 'x' * 20 + '</em></strong></p>'  # mostly markup: text stays under the body limit

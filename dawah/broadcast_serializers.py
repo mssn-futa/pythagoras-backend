@@ -114,6 +114,25 @@ class AudienceField(serializers.Field):
 
 # ---------------------------------------------------------------- requests
 
+def presanitize(raw):
+    """Author ``body_html`` → ``SanitizedRich``; raises ``ContentError``."""
+    broadcast_content.check_rich_input(raw)
+    return broadcast_content.sanitize_rich_html(raw)
+
+
+def sanitize_context(data):
+    """Serializer context with ``body_html`` already sanitized, so the
+    (CPU-bound) sanitizer runs before ``update_draft`` takes the row lock.
+    Invalid input is left for the serializer to report."""
+    raw = data.get('body_html') if hasattr(data, 'get') else None
+    if type(raw) is not str:
+        return {}
+    try:
+        return {'sanitized_body_html': (raw, presanitize(raw))}
+    except broadcast_content.ContentError:
+        return {}
+
+
 @extend_schema_field({'type': 'string', 'pattern': '^(plain|rich)$'})  # pattern: avoids an enum-name collision
 class BodyFormatField(StrictCharField):
     pass
@@ -210,10 +229,13 @@ class BroadcastWriteSerializer(StrictWriteMixin, serializers.ModelSerializer):
             if current != BodyFormat.RICH:
                 raise serializers.ValidationError({'body_html': ['Enter the message.']})
             return  # subject/audience edit of a rich draft
-        try:
-            sanitized = broadcast_content.sanitize_rich_html(attrs['body_html'])
-        except broadcast_content.ContentError as error:
-            raise serializers.ValidationError({'body_html': [str(error)]}) from None
+        sanitized = self.context.get('sanitized_body_html')  # pre-sanitized outside the row lock (PATCH)
+        if sanitized is None or sanitized[0] != attrs['body_html']:
+            try:
+                sanitized = (attrs['body_html'], presanitize(attrs['body_html']))
+            except broadcast_content.ContentError as error:
+                raise serializers.ValidationError({'body_html': [str(error)]}) from None
+        sanitized = sanitized[1]
         if len(sanitized.text) > broadcast_content.BODY_MAX_LENGTH:
             raise serializers.ValidationError({'body_html': [
                 f'The message text must be {broadcast_content.BODY_MAX_LENGTH:,} characters or fewer.']})

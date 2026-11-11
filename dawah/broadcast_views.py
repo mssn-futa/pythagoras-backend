@@ -17,6 +17,7 @@ from . import broadcasts, examples
 from .broadcast_serializers import (
     BroadcastSerializer, BroadcastWriteSerializer, DeliveryDetailSerializer, DeliverySerializer,
     PreviewSerializer, RetryRequestSerializer, VersionSerializer, parse_version, patch_version, preview_payload,
+    sanitize_context,
 )
 from .models import Broadcast, BroadcastState, Delivery, DeliveryState
 from .throttles import BroadcastSendRateThrottle
@@ -140,9 +141,10 @@ class BroadcastDetailView(BroadcastView):
     def patch(self, request, broadcast_id):
         self.require(broadcast_id)
         version = patch_version(request.data)
+        context = sanitize_context(request.data)  # sanitize before the row lock
         broadcast = broadcasts.update_draft(
             broadcast_id, version,
-            lambda locked: BroadcastWriteSerializer(locked, data=request.data, partial=True))
+            lambda locked: BroadcastWriteSerializer(locked, data=request.data, partial=True, context=context))
         return self.respond(broadcast.pk, 'Draft saved.')
 
     @extend_schema(operation_id='dawah_broadcasts_destroy', responses={204: None},

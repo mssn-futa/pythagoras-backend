@@ -42,8 +42,12 @@ PATCH also takes `version`. A rich draft may be patched without
 body}` on a rich draft (omit `body` to keep the current fallback as the plain
 text). `body_html` on a plain draft is a 400. All content errors are under
 `fields.body_html`: empty after sanitization ("The message has no text left
-after removing unsupported content."), more than 100,000 characters of input,
-nesting deeper than 20 levels, or a fallback over 50,000 characters.
+after removing unsupported content."), more than 100,000 characters of input
+or of canonical output (links gain `rel=...`), more than 20,000 `<` in the
+input (checked before parsing), nesting deeper than 20 levels, or a fallback
+over 50,000 characters. Preview/queue also reject a rendered email document
+over 400,000 characters. PATCH sanitizes `body_html` before taking the draft
+row lock.
 
 **Allowlist**: `p br strong em h2 h3 ul ol li blockquote a`; the only attribute
 is `a[href]` with an absolute `http`/`https` URL (no user info, whitespace or
@@ -61,7 +65,9 @@ inline runs are wrapped in `<p>`; list items always contain blocks
 boundaries as paragraphs (cells and preformatted lines become `<br>`);
 formatting without text, empty blocks and edge `<br>`/spaces are removed;
 whitespace runs collapse to one space; links get lower-case scheme/host, an
-IDNA host, a percent-encoded path, no default port, and
+IDNA host, a percent-encoded path (a `%` not followed by two hex digits and
+bracketed non-IPv6 hosts are rejected; `#` inside a fragment is kept), no
+default port, and
 `rel="noopener noreferrer nofollow"`. No `target` is emitted: mail clients
 open links outside the message, and the preview sandbox sets its own base
 target. The function is idempotent: `sanitize(sanitize(x)) == sanitize(x)`.
@@ -71,7 +77,8 @@ names only), so re-parsing cannot change its structure.
 **Text fallback** (generated `body` and the email text part): blocks separated
 by a blank line; list items one per line prefixed `- ` or `1. ` (nested items
 follow without indentation; a quote is its paragraphs); links `text (href)`, or
-just the text when it equals the URL; `<br>` is a newline. Example:
+just the text when it equals the URL (also after normalization, so an
+autolinked `https://x.com` stays `https://x.com`); `<br>` is a newline. Example:
 `<p><strong>Key lessons</strong></p><ul><li><p>Read the <a href="https://example.test/r">recording</a>.</p></li></ul>`
 → `Key lessons\n\n- Read the recording (https://example.test/r).`
 
