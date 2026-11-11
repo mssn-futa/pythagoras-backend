@@ -5,8 +5,7 @@ from rest_framework import serializers
 from pythagoras.serializers import UTCDateTimeField
 
 from . import uploads, youtube
-from .media import MP3_CONTENT_TYPE, MP3_MAX_BYTES
-from .models import Event, EventResource, PublicationStatus
+from .models import Event, EventResource, PublicationStatus, UploadIntent
 
 PROTECTED_FIELD = 'This field cannot be set or changed here.'
 
@@ -41,13 +40,23 @@ def is_admin_context(serializer):
 
 # ---------------------------------------------------------------- read shapes
 
+FEATURED_IMAGE_URL_HELP = ('Public URL of the validated featured image (custom media domain); '
+                           'null unless the event is published and has one.')
+
+
 class EventSummarySerializer(serializers.ModelSerializer):
     start_time = UTCDateTimeField(read_only=True)
+    featured_image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
-        fields = ['id', 'title', 'speakers', 'category', 'start_time', 'summary']
+        fields = ['id', 'title', 'speakers', 'category', 'start_time', 'summary', 'featured_image_url',
+                  'featured_image_alt']
         read_only_fields = fields
+
+    @extend_schema_field(serializers.URLField(allow_null=True, help_text=FEATURED_IMAGE_URL_HELP))
+    def get_featured_image_url(self, obj):
+        return obj.featured_image_url
 
 
 class ResourceFieldsMixin(serializers.Serializer):
@@ -62,6 +71,7 @@ class ResourceFieldsMixin(serializers.Serializer):
     uploaded_at = UTCDateTimeField(read_only=True, allow_null=True)
     content_type = serializers.SerializerMethodField()
     size_bytes = serializers.SerializerMethodField()
+    file_name = serializers.SerializerMethodField()
     preview_url = serializers.SerializerMethodField()
 
     @extend_schema_field(serializers.URLField(
@@ -76,6 +86,11 @@ class ResourceFieldsMixin(serializers.Serializer):
     @extend_schema_field(serializers.IntegerField(allow_null=True, help_text='Validated asset size in bytes.'))
     def get_size_bytes(self, obj):
         return obj.size_bytes if obj.has_asset else None
+
+    @extend_schema_field(serializers.CharField(
+        allow_null=True, help_text='Sanitized download file name of the validated asset (e.g. agenda.pdf).'))
+    def get_file_name(self, obj):
+        return (obj.file_name or None) if obj.has_asset else None
 
     @extend_schema_field(serializers.URLField(
         allow_null=True, help_text='Admin readers only: short-lived signed preview of the private ready asset '
@@ -102,7 +117,7 @@ class ResourceFieldsMixin(serializers.Serializer):
 
 
 RESOURCE_FIELDS = ['id', 'event_id', 'title', 'type', 'status', 'storage_status', 'duration',
-                   'media_url', 'playback', 'content_type', 'size_bytes', 'uploaded_at', 'preview_url',
+                   'media_url', 'playback', 'content_type', 'size_bytes', 'file_name', 'uploaded_at', 'preview_url',
                    'published_at', 'created_at', 'updated_at', 'created_by', 'legacy_file_present']
 
 
@@ -132,18 +147,29 @@ class EventSerializer(serializers.ModelSerializer):
     created_at = UTCDateTimeField(read_only=True)
     updated_at = UTCDateTimeField(read_only=True)
     featured_image_url = serializers.SerializerMethodField()
+    featured_image_preview_url = serializers.SerializerMethodField()
+    featured_image_uploaded_at = UTCDateTimeField(read_only=True, allow_null=True)
     created_by = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
         fields = ['id', 'title', 'category', 'tags', 'description', 'summary', 'speakers', 'location',
                   'start_time', 'end_time', 'status', 'published_at', 'featured_image_url',
-                  'created_at', 'updated_at', 'created_by']
+                  'featured_image_preview_url', 'featured_image_storage_status', 'featured_image_uploaded_at',
+                  'featured_image_alt', 'created_at', 'updated_at', 'created_by']
         read_only_fields = fields
 
-    @extend_schema_field(serializers.URLField(allow_null=True, help_text='Ready featured image (DAWAH-07).'))
+    @extend_schema_field(serializers.URLField(allow_null=True, help_text=FEATURED_IMAGE_URL_HELP))
     def get_featured_image_url(self, obj):
         return obj.featured_image_url
+
+    @extend_schema_field(serializers.URLField(
+        allow_null=True, help_text='Admin readers only: short-lived signed preview of the private validated '
+                                   'featured image (any event state). Never persist or share it. Null otherwise.'))
+    def get_featured_image_preview_url(self, obj):
+        if not is_admin_context(self):
+            return None
+        return uploads.image_preview_url(obj)
 
     @extend_schema_field(serializers.IntegerField(allow_null=True, help_text='Admin readers only; null otherwise.'))
     def get_created_by(self, obj):
@@ -175,10 +201,19 @@ class EventWriteSerializer(StrictWriteMixin, serializers.ModelSerializer):
     description = serializers.CharField(required=False, allow_blank=True, allow_null=True, trim_whitespace=False)
     summary = serializers.CharField(required=False, allow_blank=True, allow_null=True, trim_whitespace=False)
 
+    featured_image_alt = serializers.CharField(
+        max_length=250, required=False, allow_blank=True,
+        help_text='Optional plain-text alternative text for the featured image (at most 250 characters).')
+
     class Meta:
         model = Event
         fields = ['title', 'category', 'tags', 'description', 'summary', 'speakers', 'location',
-                  'start_time', 'end_time']
+                  'start_time', 'end_time', 'featured_image_alt']
+
+    def validate_featured_image_alt(self, value):
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value) or '<' in value or '>' in value:
+            raise serializers.ValidationError('Enter plain text without markup or control characters.')
+        return value
 
     def validate(self, attrs):
         start = attrs.get('start_time', getattr(self.instance, 'start_time', None))
@@ -229,11 +264,17 @@ class EventResourceWriteSerializer(StrictWriteMixin, serializers.ModelSerializer
 
 # ---------------------------------------------------------------- uploads
 
-class AudioUploadIntentSerializer(serializers.Serializer):
-    """Upload-intent metadata. Bytes go directly to storage, never to Django."""
+class UploadIntentSerializer(serializers.Serializer):
+    """Upload-intent metadata. Bytes go directly to storage, never to Django.
+    Subclasses name the upload kind; its rules come from ``uploads.SPECS``."""
+    kind = None
     file_name = serializers.CharField(max_length=255)
     content_type = serializers.CharField(max_length=100)
     size_bytes = serializers.IntegerField(min_value=1)
+
+    @property
+    def spec(self):
+        return uploads.SPECS[self.kind]
 
     def to_internal_value(self, data):
         if hasattr(data, 'keys'):
@@ -241,6 +282,40 @@ class AudioUploadIntentSerializer(serializers.Serializer):
             if rejected:
                 raise serializers.ValidationError({name: [PROTECTED_FIELD] for name in rejected})
         return super().to_internal_value(data)
+
+    def types_label(self):
+        return ', '.join(self.spec.types)
+
+    def validate_file_name(self, value):
+        if any(ord(ch) < 32 or ch in '/\\' for ch in value):
+            raise serializers.ValidationError('Enter a plain file name without folders.')
+        lowered = value.lower()
+        extensions = [ext for exts in (v[1] for v in self.spec.types.values()) for ext in exts]
+        if not any(lowered.endswith(ext) and len(value) > len(ext) for ext in extensions):
+            raise serializers.ValidationError(f'Only {" / ".join(extensions)} files are accepted.')
+        return value
+
+    def validate_content_type(self, value):
+        normalized = value.strip().lower()
+        if normalized not in self.spec.types:
+            raise serializers.ValidationError(f'Only {self.types_label()} is accepted.')
+        return normalized
+
+    def validate_size_bytes(self, value):
+        if value > self.spec.max_bytes:
+            raise serializers.ValidationError(f'The file exceeds the {self.spec.limit_label} limit.')
+        return value
+
+    def validate(self, attrs):
+        content_type, name = attrs['content_type'], attrs['file_name'].lower()
+        if not any(name.endswith(ext) for ext in self.spec.accepted_extensions(content_type)):
+            raise serializers.ValidationError(
+                {'file_name': ['The file extension does not match the declared content type.']})
+        return attrs
+
+
+class AudioUploadIntentSerializer(UploadIntentSerializer):
+    kind = UploadIntent.Kind.AUDIO
 
     def validate_file_name(self, value):
         if any(ord(ch) < 32 or ch in '/\\' for ch in value):
@@ -250,19 +325,23 @@ class AudioUploadIntentSerializer(serializers.Serializer):
         return value
 
     def validate_content_type(self, value):
-        if value.strip().lower() != MP3_CONTENT_TYPE:
+        if value.strip().lower() not in self.spec.types:
             raise serializers.ValidationError('Only MP3 audio (audio/mpeg) is accepted.')
-        return MP3_CONTENT_TYPE
+        return value.strip().lower()
 
-    def validate_size_bytes(self, value):
-        if value > MP3_MAX_BYTES:
-            raise serializers.ValidationError('The file exceeds the 100 MiB audio limit.')
-        return value
+
+class DocumentUploadIntentSerializer(UploadIntentSerializer):
+    kind = UploadIntent.Kind.DOCUMENT
+
+
+class ImageUploadIntentSerializer(UploadIntentSerializer):
+    kind = UploadIntent.Kind.IMAGE
 
 
 class UploadIntentResponseSerializer(serializers.Serializer):
     upload_id = serializers.IntegerField()
-    resource_id = serializers.IntegerField()
+    resource_id = serializers.IntegerField(allow_null=True, help_text='Null for a featured-image upload.')
+    event_id = serializers.IntegerField()
     method = serializers.ChoiceField(choices=['PUT'])
     upload_url = serializers.URLField(help_text='Short-lived signed S3 PUT URL on the R2 S3 API host. Send the '
                                                 'bytes with exactly `headers`; no Authorization header or cookies.')
@@ -273,7 +352,9 @@ class UploadIntentResponseSerializer(serializers.Serializer):
 
 class UploadStateSerializer(serializers.Serializer):
     id = serializers.IntegerField()
-    resource_id = serializers.IntegerField()
+    kind = serializers.CharField(help_text='audio, document or image.')
+    resource_id = serializers.IntegerField(allow_null=True, help_text='Null for a featured-image upload.')
+    event_id = serializers.IntegerField()
     # Plain string (not a schema enum, to avoid colliding with the publication
     # ``status`` enum name): issued | validating | ready | rejected | failed | expired.
     status = serializers.CharField(help_text='Upload state: issued, validating, ready, rejected, failed or expired.')
@@ -285,13 +366,19 @@ class UploadStateSerializer(serializers.Serializer):
 
 class FinalizeResponseSerializer(serializers.Serializer):
     upload = UploadStateSerializer()
-    resource = EventResourceSerializer()
+    resource = EventResourceSerializer(allow_null=True, help_text='Audio/document uploads; null for an image.')
+    event = EventSerializer(allow_null=True, help_text='Featured-image uploads; null otherwise.')
     preview_url = serializers.URLField(allow_null=True)
+
+
+def upload_event_id(intent):
+    return intent.event_id if intent.event_id else intent.resource.event_id
 
 
 def upload_state(intent):
     return {
-        'id': intent.pk, 'resource_id': intent.resource_id, 'status': intent.status,
+        'id': intent.pk, 'kind': intent.kind, 'resource_id': intent.resource_id,
+        'event_id': upload_event_id(intent), 'status': intent.status,
         'error_code': intent.error_code or None, 'message': intent.error_message or None,
         'expires_at': UTCDateTimeField().to_representation(intent.expires_at),
         'finalized_at': UTCDateTimeField().to_representation(intent.finalized_at) if intent.finalized_at else None,

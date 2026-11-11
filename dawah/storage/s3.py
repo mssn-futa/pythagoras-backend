@@ -126,11 +126,11 @@ class S3ObjectStorage(ObjectStorage):
                           Params={'Bucket': self._bucket(PRIVATE), 'Key': key, 'ContentType': content_type,
                                   'ContentLength': int(content_length)})
 
-    def presign_get(self, key, *, expires_in, content_type, filename):
+    def presign_get(self, key, *, expires_in, content_type, filename, disposition='inline'):
         return self._call('generate_presigned_url', ClientMethod='get_object', ExpiresIn=expires_in,
                           Params={'Bucket': self._bucket(PRIVATE), 'Key': key,
                                   'ResponseContentType': content_type,
-                                  'ResponseContentDisposition': inline_disposition(filename)})
+                                  'ResponseContentDisposition': content_disposition(disposition, filename)})
 
     def head(self, key, *, bucket=PRIVATE):
         try:
@@ -157,6 +157,14 @@ class S3ObjectStorage(ObjectStorage):
         info = self.head(dst_key, bucket=dst_bucket)
         if info is None:
             raise StorageError('COPY_NOT_VISIBLE')
+        return info
+
+    def put_object(self, key, data, *, content_type, bucket=PRIVATE):
+        self._call('put_object', Bucket=self._bucket(bucket), Key=key, Body=bytes(data), ContentType=content_type,
+                   ContentLength=len(data))
+        info = self.head(key, bucket=bucket)
+        if info is None:
+            raise StorageError('PUT_NOT_VISIBLE')
         return info
 
     def open_stream(self, key, *, bucket=PRIVATE, byte_range=None, if_match=None):
@@ -196,7 +204,13 @@ class _SafeStream:
             pass
 
 
+def content_disposition(disposition, filename):
+    """``inline``/``attachment`` with an ASCII-safe quoted filename (callers pass sanitized names)."""
+    if disposition not in ('inline', 'attachment'):
+        raise ValueError('unsupported disposition')
+    safe = ''.join(ch for ch in filename if ch.isascii() and (ch.isalnum() or ch in '._-')) or 'file'
+    return f'{disposition}; filename="{safe}"'
+
+
 def inline_disposition(filename):
-    """``inline`` with an ASCII-safe filename (callers pass sanitized names)."""
-    safe = ''.join(ch for ch in filename if ch.isascii() and (ch.isalnum() or ch in '._-')) or 'audio.mp3'
-    return f'inline; filename="{safe}"'
+    return content_disposition('inline', filename)

@@ -81,8 +81,9 @@ class IntentTests(UploadTestCase):
     def test_intent_contract(self):
         before = timezone.now()
         data = self.issue()
-        self.assertEqual(set(data), {'upload_id', 'resource_id', 'method', 'upload_url', 'headers', 'expires_at',
-                                     'max_size_bytes'})
+        self.assertEqual(set(data), {'upload_id', 'resource_id', 'event_id', 'method', 'upload_url', 'headers',
+                                     'expires_at', 'max_size_bytes'})
+        self.assertEqual(data['event_id'], self.event.pk)
         self.assertEqual((data['resource_id'], data['method'], data['headers'], data['max_size_bytes']),
                          (self.resource.pk, 'PUT', {'Content-Type': 'audio/mpeg'}, 100 * 1024 * 1024))
         self.assertNotIn('Authorization', data['headers'])
@@ -176,8 +177,10 @@ class FinalizeTests(UploadTestCase):
     def test_happy_path_ready_private_metadata_and_preview(self):
         intent = self.upload()
         data = self.finalize(intent['upload_id'])
-        self.assertEqual(set(data), {'upload', 'resource', 'preview_url'})
+        self.assertEqual(set(data), {'upload', 'resource', 'event', 'preview_url'})
+        self.assertIsNone(data['event'])
         self.assertEqual(data['upload']['status'], 'ready')
+        self.assertEqual((data['upload']['kind'], data['upload']['event_id']), ('audio', self.event.pk))
         self.assertEqual((data['upload']['id'], data['upload']['resource_id']),
                          (intent['upload_id'], self.resource.pk))
         resource = data['resource']

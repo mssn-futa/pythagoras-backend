@@ -88,7 +88,53 @@ class DawahSchemaTests(DawahAPITestCase, TestCase):
         archive_params = {p['name'] for p in paths['/dawah/archive/']['get']['parameters']}
         self.assertEqual(archive_params, {'page', 'page_size', 'type', 'search', 'speaker', 'category',
                                           'date_from', 'date_to'})
-        # DAWAH-02 upload routes are the only upload operations, and are admin protocol routes.
-        self.assertEqual(sorted(p for p in paths if 'upload' in p or p.endswith('/audio/')),
-                         ['/dawah/events/{event_id}/resources/{resource_id}/audio/',
+        # DAWAH-02/07 upload routes are the only upload operations, and are admin protocol routes.
+        upload_suffixes = ('/audio/', '/document/', '/featured-image/')
+        self.assertEqual(sorted(p for p in paths if 'upload' in p or p.endswith(upload_suffixes)),
+                         ['/dawah/events/{event_id}/featured-image/',
+                          '/dawah/events/{event_id}/resources/{resource_id}/audio/',
+                          '/dawah/events/{event_id}/resources/{resource_id}/document/',
                           '/dawah/uploads/{upload_id}/finalize/'])
+
+    def test_document_and_image_responses_match_schema(self):
+        from django.core.cache import cache
+
+        from . import files
+        event = make_event(status=PUBLISHED)
+        doc = make_resource(event, type='doc')
+        self.as_admin()
+        pdf, png = files.pdf_bytes(), files.image_bytes('PNG')
+        doc_intent = self.client.post(f'/dawah/events/{event.pk}/resources/{doc.pk}/document/',
+                                      {'file_name': 'a.pdf', 'content_type': 'application/pdf',
+                                       'size_bytes': len(pdf)}, format='json')
+        image_intent = self.client.post(f'/dawah/events/{event.pk}/featured-image/',
+                                        {'file_name': 'a.png', 'content_type': 'image/png', 'size_bytes': len(png)},
+                                        format='json')
+        self.storage.client_put(doc_intent.json()['data']['upload_url'], pdf, content_type='application/pdf')
+        self.storage.client_put(image_intent.json()['data']['upload_url'], png, content_type='image/png')
+        doc_final = self.client.post(f'/dawah/uploads/{doc_intent.json()["data"]["upload_id"]}/finalize/')
+        image_final = self.client.post(f'/dawah/uploads/{image_intent.json()["data"]["upload_id"]}/finalize/')
+        doc_published = self.client.post(f'/dawah/events/{event.pk}/resources/{doc.pk}/publish/')
+        cache.clear()
+        cases = [
+            ('/dawah/events/{event_id}/resources/{resource_id}/document/', 'post', '201', doc_intent),
+            ('/dawah/events/{event_id}/featured-image/', 'post', '201', image_intent),
+            ('/dawah/uploads/{upload_id}/finalize/', 'post', '200', doc_final),
+            ('/dawah/uploads/{upload_id}/finalize/', 'post', '200', image_final),
+            ('/dawah/events/{event_id}/resources/{resource_id}/publish/', 'post', '200', doc_published),
+            ('/dawah/events/{event_id}/', 'patch', '200',
+             self.client.patch(f'/dawah/events/{event.pk}/', {'featured_image_alt': 'Poster'}, format='json')),
+        ]
+        self.as_user(None)
+        cases += [
+            ('/dawah/events/{event_id}/', 'get', '200', self.client.get(f'/dawah/events/{event.pk}/')),
+            ('/dawah/resources/{resource_id}/', 'get', '200', self.client.get(f'/dawah/resources/{doc.pk}/')),
+            ('/dawah/archive/', 'get', '200', self.client.get('/dawah/archive/', {'type': 'doc'})),
+        ]
+        for path, method, status, response in cases:
+            with self.subTest(path=path, method=method, status=status):
+                self.assertEqual(str(response.status_code), status, response.content)
+                content = self.validate(path, method, status, response.json())
+                for example in content.get('examples', {}).values():
+                    self.validate(path, method, status, example['value'])
+        self.assertIsNotNone(cases[-3][3].json()['data']['featured_image_url'])
