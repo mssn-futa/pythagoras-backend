@@ -8,7 +8,7 @@ from django.utils import timezone
 from drf_spectacular.generators import SchemaGenerator
 from jsonschema import Draft4Validator, RefResolver
 
-from dawah import broadcasts
+from dawah import broadcast_content, broadcasts
 from dawah.models import Broadcast, Delivery, DeliveryAttempt, DeliveryGeneration, DeliveryState
 from pythagoras.mail import memory
 
@@ -167,11 +167,12 @@ class DraftValidationTests(BroadcastTestCase):
         created = self.create(body='Line one\r\nLine two\n\n')
         self.assertEqual(created['body'], 'Line one\nLine two')
 
-    def test_body_format_and_html_are_not_accepted_yet(self):
-        self.assertIn('body_format', self.fields(draft_payload(body_format='rich')))
+    def test_body_format_and_html_rules_for_plain_drafts(self):
+        # COMM-04 accepts rich drafts (dawah/tests/test_rich_content.py); a plain draft never takes HTML.
+        self.assertIn('body', self.fields(draft_payload(body_format='rich')))  # rich never sends body
         self.assertIn('body_format', self.fields(draft_payload(body_format='markdown')))
         self.assertEqual(self.fields(draft_payload(body_html='<p>x</p>')), {
-            'body_html': ['This field cannot be set or changed here.']})
+            'body_html': ['body_html applies only to rich drafts; send body_format "rich" with it.']})
         self.assertEqual(self.create(body_format='plain')['body_format'], 'plain')
 
     def test_protected_fields_are_rejected(self):
@@ -289,8 +290,13 @@ class QueueTests(BroadcastTestCase):
         self.assertEqual(broadcast.queued_by, self.admin)
         self.assertEqual(broadcast.snapshot_subject, 'Weekly Da’wah summary')
         self.assertEqual(broadcast.snapshot_text, 'Hello <b>all</b>\n\nBye')
-        self.assertEqual(broadcast.snapshot_html, '<p>Hello &lt;b&gt;all&lt;/b&gt;</p><p>Bye</p>')
-        self.assertEqual(broadcast.snapshot_template_version, 'plain-v1')
+        # COMM-04 email template around the escaped paragraphs.
+        self.assertEqual(broadcast.snapshot_html, broadcast_content.render_content(
+            'Weekly Da’wah summary', 'plain', 'Hello <b>all</b>\n\nBye').html)
+        self.assertIn('<p style="margin:0 0 16px;">Hello &lt;b&gt;all&lt;/b&gt;</p>'
+                      '<p style="margin:0 0 16px;">Bye</p>', broadcast.snapshot_html)
+        self.assertNotIn('<b>', broadcast.snapshot_html)
+        self.assertEqual(broadcast.snapshot_template_version, 'email-v2')
         rows = {d.student_id: d for d in Delivery.objects.filter(broadcast=broadcast)}
         self.assertEqual(rows[first.pk].snapshot_email, first.email)
         self.assertEqual(rows[second.pk].snapshot_email, second.email)
@@ -376,8 +382,10 @@ class PreviewTests(BroadcastTestCase):
         data = self.data(response)
         self.assertEqual(set(data), {'subject', 'body', 'body_format', 'body_html', 'rendered_text',
                                      'rendered_html', 'audience_count'})
-        self.assertEqual(data['rendered_html'],
-                         '<p>&lt;script&gt;alert(1)&lt;/script&gt;<br>line</p><p>para &amp; more</p>')
+        self.assertIn('<p style="margin:0 0 16px;">&lt;script&gt;alert(1)&lt;/script&gt;<br>line</p>'
+                      '<p style="margin:0 0 16px;">para &amp; more</p>', data['rendered_html'])
+        self.assertIn('<title>Hi &lt;there&gt;</title>', data['rendered_html'])
+        self.assertNotIn('<script', data['rendered_html'])
         self.assertEqual(data['rendered_text'], '<script>alert(1)</script>\nline\n\n\npara & more')
         self.assertEqual((data['subject'], data['body_format'], data['body_html'], data['audience_count']),
                          ('Hi <there>', 'plain', None, 3))

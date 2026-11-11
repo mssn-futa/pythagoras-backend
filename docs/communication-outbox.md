@@ -22,6 +22,86 @@ Lock order for every write: broadcast row, then its deliveries in ascending id.
 After changing delivery outcomes, call `broadcasts.refresh_state(broadcast)`
 while holding the broadcast lock; never hold locks during provider I/O.
 
+## Rich content, preview and email template (COMM-04)
+
+Code: `dawah/broadcast_content.py` (sanitizer, text fallback, template),
+`dawah/broadcast_serializers.py` (request rules), `dawah/broadcasts.py`
+(re-sanitize before preview/queue). Sanitizer dependency: `nh3==0.3.7`
+(ammonia, HTML5 parser), pinned in `requirements.txt`.
+
+**Requests** (frozen for COMM-05):
+
+| Format | Create / PATCH body | Stored |
+|---|---|---|
+| plain | `{subject, body, audience}`; `body_format: "plain"` optional | `body` as sent (normalized), `body_html: null` |
+| rich | `{subject, body_format: "rich", body_html, audience}`, never `body` | canonical `body_html`; `body` = generated text fallback |
+
+PATCH also takes `version`. A rich draft may be patched without
+`body_format`; `body` on a rich draft is a 400 (`fields.body`). Converting:
+`{body_format: "rich", body_html}` on a plain draft, `{body_format: "plain",
+body}` on a rich draft (omit `body` to keep the current fallback as the plain
+text). `body_html` on a plain draft is a 400. All content errors are under
+`fields.body_html`: empty after sanitization ("The message has no text left
+after removing unsupported content."), more than 100,000 characters of input
+or of canonical output (links gain `rel=...`), more than 20,000 `<` in the
+input (checked before parsing), nesting deeper than 20 levels, or a fallback
+over 50,000 characters. Preview/queue also reject a rendered email document
+over 400,000 characters. PATCH sanitizes `body_html` before taking the draft
+row lock.
+
+**Allowlist**: `p br strong em h2 h3 ul ol li blockquote a`; the only attribute
+is `a[href]` with an absolute `http`/`https` URL (no user info, whitespace or
+hidden characters, ≤2000 characters). Everything else is removed: script,
+style, iframe, form, img/media, svg/math, comments (including conditional
+comments), event handlers, `style`/`class`/`id`/`target`, and javascript:,
+data:, vbscript:, relative and scheme-relative links (the link text is kept).
+Raw-text and embedded elements (script, style, iframe, noscript, template,
+textarea, select, svg, math, ...) are removed with their content.
+
+**Canonical form** (what reload returns and what the editor should load):
+inline runs are wrapped in `<p>`; list items always contain blocks
+(`<li><p>x</p></li>`, as the editor produces); pasted `h1` becomes `h2`,
+`h4`–`h6` become `h3`; `div`/`section`/tables/`pre`/`hr` keep their block
+boundaries as paragraphs (cells and preformatted lines become `<br>`);
+formatting without text, empty blocks and edge `<br>`/spaces are removed;
+whitespace runs collapse to one space; links get lower-case scheme/host, an
+IDNA host, a percent-encoded path (a `%` not followed by two hex digits and
+bracketed non-IPv6 hosts are rejected; `#` inside a fragment is kept), no
+default port, and
+`rel="noopener noreferrer nofollow"`. No `target` is emitted: mail clients
+open links outside the message, and the preview sandbox sets its own base
+target. The function is idempotent: `sanitize(sanitize(x)) == sanitize(x)`.
+The output is serialized by our code (escaped text/attributes, allowlisted tag
+names only), so re-parsing cannot change its structure.
+
+**Text fallback** (generated `body` and the email text part): blocks separated
+by a blank line; list items one per line prefixed `- ` or `1. ` (nested items
+follow without indentation; a quote is its paragraphs); links `text (href)`, or
+just the text when it equals the URL (also after normalization, so an
+autolinked `https://x.com` stays `https://x.com`); `<br>` is a newline. Example:
+`<p><strong>Key lessons</strong></p><ul><li><p>Read the <a href="https://example.test/r">recording</a>.</p></li></ul>`
+→ `Key lessons\n\n- Read the recording (https://example.test/r).`
+
+**One rendering.** `broadcast_content.render_content(subject, body_format,
+body, body_html)` (`render(broadcast)` for drafts) re-sanitizes rich HTML (or
+escapes plain text into `<p>`/`<br>`), wraps it in the single email template
+(an HTML document whose inline styles are generated from `EMAIL_STYLES`; no
+author CSS, no `<style>` block) and returns subject, text and HTML plus
+`TEMPLATE_VERSION` (`email-v2`; COMM-01 snapshots say `plain-v1`). Preview
+returns exactly that as `rendered_html`/`rendered_text`; queue freezes the same
+values into `snapshot_*`; the worker sends only `snapshot_*`. Template or
+fallback changes must bump `TEMPLATE_VERSION`; queued broadcasts keep the
+content and version they were frozen with. Clients show `rendered_html` only
+in a sandboxed frame (no scripts/forms/subresources). Automated messages
+(COMM-06) must call `render_content`/`sanitize_rich_html` rather than build
+their own HTML.
+
+**Data**: migration `0009` makes every existing row that is not a complete
+rich row plain with `body_html = NULL` (all pre-COMM-04 rows were plain) and
+adds the `dawah_broadcast_body_format_html` check constraint (plain ⇒ null
+HTML; rich ⇒ non-empty HTML). `body` and every `snapshot_*` field are
+untouched.
+
 ## Retry eligibility (frozen contract)
 
 Manual retry requires **positive evidence that the provider did not accept**

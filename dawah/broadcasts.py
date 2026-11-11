@@ -16,7 +16,7 @@ from pythagoras.utils import APIError
 
 from . import broadcast_content
 from .models import (
-    OUTSTANDING_DELIVERY_STATES, AudienceType, Broadcast, BroadcastState, Delivery,
+    OUTSTANDING_DELIVERY_STATES, AudienceType, BodyFormat, Broadcast, BroadcastState, Delivery,
     DeliveryGeneration, DeliveryState,
 )
 
@@ -161,24 +161,38 @@ def delete_draft(broadcast_id):
         broadcast.delete()
 
 
-def _check_content(broadcast):
-    """Stored drafts were validated on save; recheck before preview/queue so a
-    draft edited outside the API cannot freeze invalid content."""
+def _checked_render(broadcast):
+    """Stored drafts were validated on save; recheck (and re-sanitize rich
+    HTML) before preview/queue so a draft edited outside the API cannot freeze
+    invalid or unsafe content. Returns the rendering preview shows and queue
+    freezes."""
     errors = {}
     subject = (broadcast.subject or '').strip()
     if not subject:
         errors['subject'] = ['Enter a subject.']
     elif len(subject) > broadcast_content.SUBJECT_MAX_LENGTH or broadcast_content.subject_error(subject):
         errors['subject'] = [broadcast_content.subject_error(subject) or 'Subject is too long.']
-    body = broadcast_content.normalize_body(broadcast.body or '')
-    if not body.strip():
-        errors['body'] = ['Enter the message text.']
-    elif broadcast_content.body_error(body):
-        errors['body'] = [broadcast_content.body_error(body)]
-    if broadcast.body_format != 'plain':
-        errors['body_format'] = ['Rich content is not available yet.']
+    if broadcast.body_format == BodyFormat.RICH:
+        try:
+            rendered = broadcast_content.render(broadcast)
+        except broadcast_content.ContentError as error:
+            errors['body_html'] = [str(error)]
+    elif broadcast.body_format == BodyFormat.PLAIN:
+        body = broadcast_content.normalize_body(broadcast.body or '')
+        if not body.strip():
+            errors['body'] = ['Enter the message text.']
+        elif broadcast_content.body_error(body):
+            errors['body'] = [broadcast_content.body_error(body)]
+        else:
+            rendered = broadcast_content.render(broadcast)
+    else:
+        errors['body_format'] = ['Choose "plain" or "rich".']
+    if not errors and len(rendered.html) > broadcast_content.EMAIL_HTML_MAX_LENGTH:
+        errors['body_html' if broadcast.body_format == BodyFormat.RICH else 'body'] = [
+            'The rendered email is too large. Shorten the message.']
     if errors:
         raise APIError('VALIDATION_ERROR', 'Correct the highlighted fields.', status_code=400, fields=errors)
+    return rendered
 
 
 def preview(broadcast_id, version):
@@ -189,8 +203,8 @@ def preview(broadcast_id, version):
         raise already_queued()
     if version != broadcast.version:
         raise version_conflict(broadcast.version)
-    _check_content(broadcast)
-    return broadcast, broadcast_content.render(broadcast), broadcast_recipients(broadcast).count()
+    rendered = _checked_render(broadcast)
+    return broadcast, rendered, broadcast_recipients(broadcast).count()
 
 
 # ---------------------------------------------------------------- queue
@@ -210,7 +224,7 @@ def queue(broadcast_id, version, user):
             raise already_queued()
         if version != broadcast.version:
             raise version_conflict(broadcast.version)
-        _check_content(broadcast)
+        rendered = _checked_render(broadcast)
         recipients = list(broadcast_recipients(broadcast).order_by('id').values_list('id', 'email'))
         if not recipients:
             raise APIError('VALIDATION_ERROR', NO_RECIPIENTS, status_code=400, fields={'audience': [NO_RECIPIENTS]})
@@ -219,7 +233,6 @@ def queue(broadcast_id, version, user):
             Delivery(broadcast=broadcast, student_id=student_id, snapshot_email=email, next_attempt_at=now)
             for student_id, email in recipients
         ])
-        rendered = broadcast_content.render(broadcast)
         broadcast.state = BroadcastState.QUEUED
         broadcast.queued_at = now
         broadcast.queued_by = user

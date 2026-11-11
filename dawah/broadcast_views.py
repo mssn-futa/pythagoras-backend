@@ -17,6 +17,7 @@ from . import broadcasts, examples
 from .broadcast_serializers import (
     BroadcastSerializer, BroadcastWriteSerializer, DeliveryDetailSerializer, DeliverySerializer,
     PreviewSerializer, RetryRequestSerializer, VersionSerializer, parse_version, patch_version, preview_payload,
+    sanitize_context,
 )
 from .models import Broadcast, BroadcastState, Delivery, DeliveryState
 from .throttles import BroadcastSendRateThrottle
@@ -98,11 +99,17 @@ class BroadcastListView(BroadcastView):
         operation_id='dawah_broadcasts_create',
         request=BroadcastWriteSerializer,
         responses={201: BroadcastSerializer},
-        description='Admin: save a plain-text draft (version 1). Subject: one line, ≤200 characters; audience '
-                    'all/department/level. Nothing is sent.',
+        description='Admin: save a draft (version 1). Subject: one line, ≤200 characters; audience '
+                    'all/department/level. Plain: `{subject, body, audience}`. Rich: `{subject, body_format: '
+                    '"rich", body_html, audience}` without `body`; `body_html` is sanitized to the D4 allowlist '
+                    '(stored canonical form returned) and `body` is the generated text fallback. Content that is '
+                    'empty after sanitization is a 400 under `fields.body_html`. Nothing is sent.',
         examples=[OpenApiExample('Create draft', request_only=True, value=examples.BROADCAST_CREATE),
+                  OpenApiExample('Create rich draft', request_only=True, value=examples.BROADCAST_RICH_CREATE),
                   OpenApiExample('Created', response_only=True, status_codes=['201'],
-                                 value={**examples.BROADCAST_DRAFT, 'version': 1})],
+                                 value={**examples.BROADCAST_DRAFT, 'version': 1}),
+                  OpenApiExample('Created rich draft', response_only=True, status_codes=['201'],
+                                 value=examples.BROADCAST_RICH_DRAFT)],
     )
     def post(self, request):
         serializer = BroadcastWriteSerializer(data=request.data)
@@ -124,16 +131,20 @@ class BroadcastDetailView(BroadcastView):
         request=BroadcastWriteSerializer,
         responses={200: BroadcastSerializer},
         description='Admin: edit a draft. `version` is required and must equal the stored version '
-                    '(409 BROADCAST_VERSION_CONFLICT otherwise); success increments it. Queued broadcasts '
-                    'are immutable: 409 BROADCAST_ALREADY_QUEUED.',
-        examples=[OpenApiExample('Edit draft', request_only=True, value=examples.BROADCAST_PATCH)],
+                    '(409 BROADCAST_VERSION_CONFLICT otherwise); success increments it. Rich drafts take '
+                    '`body_html` (never `body`); send `body_format` "plain" with `body` to convert to plain, '
+                    'or "rich" with `body_html` to convert to rich. Queued broadcasts are immutable: 409 '
+                    'BROADCAST_ALREADY_QUEUED.',
+        examples=[OpenApiExample('Edit draft', request_only=True, value=examples.BROADCAST_PATCH),
+                  OpenApiExample('Edit rich draft', request_only=True, value=examples.BROADCAST_RICH_PATCH)],
     )
     def patch(self, request, broadcast_id):
         self.require(broadcast_id)
         version = patch_version(request.data)
+        context = sanitize_context(request.data)  # sanitize before the row lock
         broadcast = broadcasts.update_draft(
             broadcast_id, version,
-            lambda locked: BroadcastWriteSerializer(locked, data=request.data, partial=True))
+            lambda locked: BroadcastWriteSerializer(locked, data=request.data, partial=True, context=context))
         return self.respond(broadcast.pk, 'Draft saved.')
 
     @extend_schema(operation_id='dawah_broadcasts_destroy', responses={204: None},
@@ -150,11 +161,13 @@ class BroadcastPreviewView(BroadcastView):
         operation_id='dawah_broadcasts_preview',
         request=VersionSerializer,
         responses={200: PreviewSerializer},
-        description='Admin: escaped rendering of the stored draft and the current audience count. No side '
-                    'effects: no snapshot, no deliveries, no send. 409 BROADCAST_VERSION_CONFLICT (stale '
-                    'version), BROADCAST_ALREADY_QUEUED.',
+        description='Admin: the exact email (subject, text part, HTML document) that queue would freeze and '
+                    'the worker sends, from the stored draft re-sanitized now, plus the current audience '
+                    'count. No side effects: no snapshot, no deliveries, no send. 409 '
+                    'BROADCAST_VERSION_CONFLICT (stale version), BROADCAST_ALREADY_QUEUED.',
         examples=[OpenApiExample('Preview request', request_only=True, value=examples.VERSION_REQUEST),
-                  OpenApiExample('Preview', response_only=True, value=examples.BROADCAST_PREVIEW)],
+                  OpenApiExample('Preview', response_only=True, value=examples.BROADCAST_PREVIEW),
+                  OpenApiExample('Rich preview', response_only=True, value=examples.BROADCAST_RICH_PREVIEW)],
     )
     def post(self, request, broadcast_id):
         self.require(broadcast_id)
