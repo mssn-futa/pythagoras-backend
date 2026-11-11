@@ -233,6 +233,11 @@ SPECTACULAR_SETTINGS = {
     'ENUM_NAME_OVERRIDES': {
         'QuestionTypeEnum': 'quiz.models.Question.Type',
         'EventResourceTypeEnum': 'dawah.models.EventResource.Type',
+        # Keep the COMM-01 component names stable now that delivery detail reuses them.
+        'BroadcastStateEnum': 'dawah.models.BroadcastState',
+        'DeliveryStateEnum': 'dawah.models.DeliveryState',
+        'DeliveryEligibleActionsEnum': [('retry', 'retry')],
+        'DeliveryAttemptOutcomeEnum': 'dawah.models.DeliveryAttempt.Outcome',
     },
 }
 

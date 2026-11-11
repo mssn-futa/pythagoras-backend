@@ -765,6 +765,78 @@ class DeliveryHistoryAPITests(OutboxMixin, DawahAPITestCase, TestCase):
 
 
 @MAIL_SETTINGS
+class DeliveryDetailAPITests(OutboxMixin, DawahAPITestCase, TestCase):
+    def url(self, broadcast_id, delivery_id):
+        return f'/dawah/broadcasts/{broadcast_id}/deliveries/{delivery_id}/'
+
+    def make_history(self):
+        broadcast, _ = self.queue()
+        transport = FakeTransport(SendResult.failed('VALIDATION_ERROR'), SendResult.uncertain('TIMEOUT'))
+        self.worker(transport).run_once()
+        delivery = self.one(broadcast)
+        broadcasts.retry(broadcast.pk, [delivery.pk], self.admin)
+        self.worker(transport).run_once()
+        self.make_due()
+        self.worker(transport).run_once()
+        return broadcast, self.one(broadcast)
+
+    def test_detail_includes_generations_and_attempts_without_content(self):
+        broadcast, delivery = self.make_history()
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(self.url(broadcast.pk, delivery.pk))
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()['data']
+        self.assertEqual((data['id'], data['broadcast_id'], data['state'], data['retry_generation'],
+                          data['provider_email_id'], data['idempotency_key']),
+                         (delivery.pk, broadcast.pk, 'sent', 1, 'em_3',
+                          f'test/broadcast/{delivery.pk}/generation/1'))
+        self.assertTrue(data['first_dispatch_at'].endswith('Z'))
+        (generation,) = data['generations']
+        self.assertEqual((generation['generation'], generation['state'], generation['error_code'],
+                          generation['nonacceptance_known'], generation['idempotency_key'], generation['closed_by_id']),
+                         (0, 'failed', 'VALIDATION_ERROR', True, f'test/broadcast/{delivery.pk}/generation/0',
+                          self.admin.pk))
+        self.assertEqual([(a['generation'], a['attempt'], a['outcome'], a['error_code'], a['provider_email_id'])
+                          for a in data['attempts']],
+                         [(0, 1, 'failed', 'VALIDATION_ERROR', ''), (1, 1, 'uncertain', 'TIMEOUT', ''),
+                          (1, 2, 'accepted', '', 'em_3')])
+        text = json.dumps(data)
+        for content in (SUBJECT, BODY, SENDER, 'request_snapshot', 'html'):
+            self.assertNotIn(content, text)
+
+    def test_detail_permissions_and_scoping(self):
+        broadcast, delivery = self.make_history()
+        other, _ = self.queue()
+        url = self.url(broadcast.pk, delivery.pk)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(url).status_code, 401)
+        for user in (self.student, self.staff_student, self.inactive_admin):
+            self.client.force_authenticate(user)
+            self.assertIn(self.client.get(url).status_code, (401, 403))
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(self.client.get(self.url(other.pk, delivery.pk)).status_code, 404)
+        self.assertEqual(self.client.get(self.url(broadcast.pk, 999999)).status_code, 404)
+        self.assertEqual(self.client.post(url, {}).status_code, 405)
+
+    def test_detail_response_and_example_match_schema(self):
+        from drf_spectacular.generators import SchemaGenerator
+        from jsonschema import Draft4Validator, RefResolver
+
+        from dawah import examples
+        from .test_schema import draft4
+
+        json_schema = draft4(SchemaGenerator().get_schema(public=True))
+        resolver = RefResolver.from_schema(json_schema)
+        path = json_schema['paths']['/dawah/broadcasts/{broadcast_id}/deliveries/{delivery_id}/']['get']
+        schema = path['responses']['200']['content']['application/json']['schema']
+        broadcast, delivery = self.make_history()
+        self.client.force_authenticate(self.admin)
+        Draft4Validator(schema, resolver=resolver).validate(self.client.get(self.url(broadcast.pk, delivery.pk)).json())
+        Draft4Validator(json_schema['components']['schemas']['DeliveryDetail'], resolver=resolver).validate(
+            examples.DELIVERY_DETAIL)
+
+
+@MAIL_SETTINGS
 class NoLockDuringSendTests(OutboxMixin, TransactionTestCase):
     def test_send_runs_outside_any_transaction_and_holds_no_row_locks(self):
         self.queue(recipients=2)

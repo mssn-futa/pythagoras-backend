@@ -15,8 +15,8 @@ from pythagoras.utils import success_response
 
 from . import broadcasts, examples
 from .broadcast_serializers import (
-    BroadcastSerializer, BroadcastWriteSerializer, DeliverySerializer, PreviewSerializer,
-    RetryRequestSerializer, VersionSerializer, parse_version, patch_version, preview_payload,
+    BroadcastSerializer, BroadcastWriteSerializer, DeliveryDetailSerializer, DeliverySerializer,
+    PreviewSerializer, RetryRequestSerializer, VersionSerializer, parse_version, patch_version, preview_payload,
 )
 from .models import Broadcast, BroadcastState, Delivery, DeliveryState
 from .throttles import BroadcastSendRateThrottle
@@ -212,6 +212,23 @@ class BroadcastDeliveriesView(BroadcastView):
         response = self.get_paginated_response(DeliverySerializer(page, many=True).data)
         response.message = 'Deliveries retrieved.'
         return response
+
+
+class BroadcastDeliveryDetailView(BroadcastView):
+    serializer_class = DeliveryDetailSerializer
+
+    @extend_schema(
+        operation_id='dawah_broadcasts_delivery_retrieve',
+        responses={200: DeliveryDetailSerializer},
+        description='Admin: one delivery of this broadcast with its current provider request identity '
+                    '(idempotency key, request hash, first dispatch and safety deadline), closed retry '
+                    'generations and every attempt (safe codes, timestamps, provider email IDs, late results '
+                    'after a lost lease). Never message content. 404 if the delivery belongs to another broadcast.',
+        examples=[OpenApiExample('Delivery detail', response_only=True, value=examples.DELIVERY_DETAIL)],
+    )
+    def get(self, request, broadcast_id, delivery_id):
+        delivery = get_object_or_404(Delivery, pk=delivery_id, broadcast_id=broadcast_id)
+        return success_response(DeliveryDetailSerializer(delivery).data, 'Delivery retrieved.')
 
 
 class BroadcastRetryView(BroadcastView):

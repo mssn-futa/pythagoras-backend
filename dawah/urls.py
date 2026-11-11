@@ -40,6 +40,8 @@ urlpatterns = [
          name='broadcast-queue'),
     path('broadcasts/<int:broadcast_id>/deliveries/', broadcast_views.BroadcastDeliveriesView.as_view(),
          name='broadcast-deliveries'),
+    path('broadcasts/<int:broadcast_id>/deliveries/<int:delivery_id>/',
+         broadcast_views.BroadcastDeliveryDetailView.as_view(), name='broadcast-delivery-detail'),
     path('broadcasts/<int:broadcast_id>/retry/', broadcast_views.BroadcastRetryView.as_view(),
          name='broadcast-retry'),
 

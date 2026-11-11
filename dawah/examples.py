@@ -146,5 +146,34 @@ DELIVERY_QUEUED = {
     'created_at': '2026-11-10T09:30:00Z', 'updated_at': '2026-11-10T09:30:00Z', 'eligible_actions': [],
 }
 
+DELIVERY_DETAIL = {
+    'id': 12, 'student_id': 31, 'snapshot_email': 'student@example.test', 'state': 'sent', 'attempt_count': 2,
+    'retry_generation': 1, 'provider_email_id': '4ef9a417-02e9-4d39-ad75-9611e0fcc33c', 'error_code': None,
+    'sent_at': '2026-11-10T10:02:05Z', 'created_at': '2026-11-10T09:30:00Z', 'updated_at': '2026-11-10T10:02:05Z',
+    'eligible_actions': [], 'broadcast_id': 7, 'nonacceptance_known': False, 'next_attempt_at': None,
+    'idempotency_key': 'production/broadcast/12/generation/1',
+    'request_hash': '9f2c4a0e5b7d1c3e8a6f4b2d0c9e7a5b3d1f8e6c4a2b0d9f7e5c3a1b8d6f4e2c',
+    'first_dispatch_at': '2026-11-10T10:01:00Z', 'idempotency_deadline_at': '2026-11-11T09:01:00Z',
+    'retry_requested_at': '2026-11-10T10:00:30Z', 'retry_requested_by_id': 2,
+    'generations': [{
+        'generation': 0, 'state': 'failed', 'attempt_count': 1, 'error_code': 'VALIDATION_ERROR',
+        'nonacceptance_known': True, 'provider_email_id': '', 'idempotency_key': 'production/broadcast/12/generation/0',
+        'request_hash': '1b3d5f7a9c2e4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c',
+        'first_dispatch_at': '2026-11-10T09:31:00Z', 'idempotency_deadline_at': '2026-11-11T08:31:00Z',
+        'requested_at': None, 'requested_by_id': None, 'closed_at': '2026-11-10T10:00:30Z', 'closed_by_id': 2,
+    }],
+    'attempts': [
+        {'generation': 0, 'attempt': 1, 'started_at': '2026-11-10T09:31:00Z', 'finished_at': '2026-11-10T09:31:01Z',
+         'outcome': 'failed', 'error_code': 'VALIDATION_ERROR', 'provider_email_id': '', 'late_outcome': '',
+         'late_error_code': '', 'late_recorded_at': None},
+        {'generation': 1, 'attempt': 1, 'started_at': '2026-11-10T10:01:00Z', 'finished_at': '2026-11-10T10:01:30Z',
+         'outcome': 'uncertain', 'error_code': 'TIMEOUT', 'provider_email_id': '', 'late_outcome': '',
+         'late_error_code': '', 'late_recorded_at': None},
+        {'generation': 1, 'attempt': 2, 'started_at': '2026-11-10T10:02:04Z', 'finished_at': '2026-11-10T10:02:05Z',
+         'outcome': 'accepted', 'error_code': '', 'provider_email_id': '4ef9a417-02e9-4d39-ad75-9611e0fcc33c',
+         'late_outcome': '', 'late_error_code': '', 'late_recorded_at': None},
+    ],
+}
+
 VERSION_REQUEST = {'version': 3}
 RETRY_REQUEST = {'delivery_ids': [12, 13]}
