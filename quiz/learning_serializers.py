@@ -249,4 +249,3 @@ class AdminEnrollmentWriteSerializer(RejectUnknownFieldsMixin, serializers.Seria
         if value not in Enrollment.Status.values:
             raise serializers.ValidationError('Select active or withdrawn.')
         return value
-
