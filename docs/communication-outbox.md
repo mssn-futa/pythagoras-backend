@@ -33,19 +33,26 @@ the current generation. A delivery is retry-eligible only when all hold:
 - `sent_at is None`
 
 `nonacceptance_known` defaults to `False` and is set **only by the worker**,
-together with `state="failed"`, for:
+together with `state="failed"`, in exactly these cases:
 
 - a definitive provider rejection of this request (e.g. Resend 4xx for an
-  invalid recipient, unverified sender/domain, invalid content), or
+  invalid recipient, unverified sender/domain, invalid content) when no
+  earlier handoff of this generation was ambiguous;
 - a failure that happened before any provider handoff for this generation
   (no request was sent, e.g. invalid snapshot address, payload construction
-  error).
+  error);
+- a generation whose **every** handoff received an explicit provider
+  non-acceptance (429 rate limit or quota) when its safety window ends.
 
 Never set it for outcomes where acceptance cannot be ruled out. These are
 stored as `uncertain` (or `failed` with `nonacceptance_known=False`) and are
 **never** retry-eligible:
 
 - idempotency payload conflict (`IDEMPOTENCY_PAYLOAD_CONFLICT`),
+- concurrent idempotent request (409 `CONCURRENT_IDEMPOTENT_REQUESTS`: an
+  earlier request with this key is still in flight and may be accepted); it is
+  recorded as an ambiguous (`uncertain`) attempt and never contributes to
+  `nonacceptance_known`,
 - safety deadline expired (`idempotency_deadline_at` passed) while unresolved,
 - timeout / connection error / 5xx / malformed success without an email ID,
 - any lease loss after `sending` was persisted.
@@ -97,12 +104,12 @@ python manage.py dawah_outbox --status                    # backlog JSON; sends 
 | `--once` | off | Scheduler tick, lease recovery, bounded drain, release unused claims, exit 0. |
 | `--status` | off | Print backlog JSON (below) and exit. Mutually exclusive with `--once`. |
 | `--budget-seconds` | 240 | `--once` wall budget. No new handoff starts once the remaining budget is below `RESEND_TIMEOUT_SECONDS` + 10 s margin. |
-| `--max-sends` | none | Cap on handoffs in this run (request budget). |
+| `--max-sends` | none | Cap on real provider handoffs in this run (skips and pre-handoff failures do not count). |
 | `--batch-size` | 20 | Rows claimed per batch. |
 | `--poll-seconds` | 5 | Idle poll interval in continuous mode. |
 
 Each run prints one JSON summary on stdout
-(`{"mode","claimed","released","recovered","materialized","outcomes","stop_reason","elapsed_seconds"}`,
+(`{"mode","claimed","released","recovered","materialized","handoffs","outcomes","stop_reason","elapsed_seconds"}`,
 `stop_reason` one of `drained`, `budget`, `max_sends`, `signal`). SIGTERM/SIGINT
 stop new claims, let the in-flight send finish (bounded by
 `RESEND_TIMEOUT_SECONDS`), release unused claims and exit 0. An unexpected error
@@ -155,14 +162,32 @@ make concurrent workers safe, but rate pacing is per process.
 | `failed` payload conflict (`INVALID_IDEMPOTENT_REQUEST`, memory `IDEMPOTENCY_PAYLOAD_MISMATCH`) | `failed IDEMPOTENCY_PAYLOAD_CONFLICT`, `nonacceptance_known=False`: investigate, never rotate the key |
 | `failed` other, no ambiguous prior attempt | `failed <code>`, `nonacceptance_known=True` (retry-eligible) |
 | `failed` other after an ambiguous prior attempt | `uncertain <code>` |
-| `retryable` (429, concurrent idempotent request) | `queued`, same key, `next_attempt_at = now + max(budget delay, Retry-After)`; when budget/window is spent: `failed` + `nonacceptance_known` if every attempt was a definite non-acceptance, else `uncertain` |
+| `retryable` 429 rate limit / quota (`RATE_LIMIT_EXCEEDED`, `DAILY_QUOTA_EXCEEDED`, ...) | attempt `retryable`; the **whole process** pauses for Retry-After (default 60 s, clamped to the safety window), the current batch ends and its unused claims are released; the row is requeued with the same key at now + pause. Does **not** spend the attempt budget; only the safety window bounds it. If the pause no longer fits the window: `failed` + `nonacceptance_known` when every handoff was a 429/quota, else `uncertain` |
+| `retryable` 409 `CONCURRENT_IDEMPOTENT_REQUESTS` | attempt `uncertain` (ambiguous); same key after `max(budget delay, Retry-After)`; budget/window spent: `uncertain` |
 | `uncertain` (timeout, connection, 5xx, 408, other 409, malformed) | `queued`, same key, after the budget delay; when budget/window is spent: `uncertain` |
 
-Budget: 3 handoffs per generation; delays 60 s after the first, 300 s after the
-second. A replay is only scheduled if it (plus one bounded send) still ends
-before `idempotency_deadline_at`. "Ambiguous prior attempt" means an attempt
-row of this generation that is not `retryable`/`skipped` (uncertain,
-interrupted, lease lost, open).
+Budget: 3 budget-counted handoffs per generation (every handoff except
+429/quota rejections); delays 60 s after the first, 300 s after the second. A
+replay is only scheduled if it (plus one bounded send) still ends before
+`idempotency_deadline_at`; a Retry-After beyond the window ends the
+generation instead of overflowing. "Ambiguous prior attempt" means an attempt
+row of this generation that is not `retryable` (429/quota) or `skipped`
+(uncertain, concurrent-key, interrupted, lease lost, open).
+
+**Late results.** A worker that finishes after losing its lease never changes
+the delivery's state; it stores the late result on its attempt row
+(`late_outcome`, `late_error_code`, `late_recorded_at`, `provider_email_id`)
+and logs `outbox_stale_completion`. If that late result is an acceptance with an
+email ID and the delivery is still in the same generation and `uncertain`,
+the delivery is resolved to `sent` with that ID (`outbox_late_acceptance`):
+the provider accepted this exact request/key.
+
+**Startup limits.** `RESEND_TIMEOUT_SECONDS` must be below 110 (120 s lease
+minus 10 s margin) so a live send can never outlast its lease, and
+`OUTBOX_REQUESTS_PER_SECOND` must be between 1/60 and 100; settings refuse to
+load otherwise. Pending claims' leases are also renewed after every pacing
+wait, and 429 pauses are waited out before claiming, never while holding
+claims.
 
 ### Recovery
 
@@ -183,9 +208,10 @@ IDEMPOTENCY_WINDOW_EXPIRED` with `nonacceptance_known`.
 
 ### Rate budget
 
-`OUTBOX_REQUESTS_PER_SECOND` (default 1, above 0 and at most 100) paces the
+`OUTBOX_REQUESTS_PER_SECOND` (default 1, from 1/60 to 100) paces the
 outbox process: one handoff slot per interval, no bursts, shared by every
-worker thread in the process. Set it below the Resend account rate; the
+worker thread in the process; a 429/quota response defers the next slot for
+the whole process. Set it below the Resend account rate; the
 difference is headroom for welcome/transactional mail, which sends inline and
 is not paced. There is deliberately no account-wide limiter setting (welcome
 and outbox share no counter); anything that still hits the account limit gets
@@ -203,6 +229,18 @@ configured) emits `outbox_sending`, `outbox_result`, `outbox_lease_recovered`,
 `outbox_run` with ids, generation, attempt, state, safe code and provider email
 ID only; never addresses, subjects, bodies, request snapshots or credentials.
 
+### Delivery detail API
+
+`GET /dawah/broadcasts/{id}/deliveries/{delivery_id}/` (active admin only; 404
+for a delivery of another broadcast) returns the delivery-list fields plus
+`broadcast_id`, `nonacceptance_known`, `next_attempt_at`, `idempotency_key`,
+`request_hash`, `first_dispatch_at`, `idempotency_deadline_at`,
+`retry_requested_at`/`_by_id`, `generations` (closed generations:
+state, attempt count, safe code, nonacceptance, provider ID, key, hash,
+dispatch/deadline, requested/closed times and admin ids) and `attempts`
+(generation, attempt, started/finished, outcome, safe code, provider ID, late
+outcome/code/time). It never contains the request snapshot, subject or body.
+
 ### Operator procedures
 
 - **Failed (retry-eligible):** fix the cause (sender/domain/key/content), then
@@ -210,7 +248,8 @@ ID only; never addresses, subjects, bodies, request snapshots or credentials.
   sends generation n+1 with a new key.
 - **Uncertain / payload conflict:** never retried automatically or by the API.
   Reconcile with the stored `provider_email_id`, `idempotency_key`,
-  `request_hash`, attempt rows and the Resend dashboard; resending is a separate,
+  `request_hash`, attempt rows (incl. late results; see the delivery detail API)
+  and the Resend dashboard; resending is a separate,
   explicitly authorized broadcast.
 - **Schema changes to Delivery state:** stop the scheduled job (or let the
   current run finish), migrate, deploy, re-enable; leases make a killed run safe.
