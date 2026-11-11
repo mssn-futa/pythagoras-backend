@@ -57,9 +57,20 @@ RECIPIENT_INACTIVE = 'RECIPIENT_INACTIVE'
 INVALID_MESSAGE = 'INVALID_MESSAGE'
 SNAPSHOT_MISMATCH = 'REQUEST_SNAPSHOT_MISMATCH'
 TRANSPORT_EXCEPTION = 'TRANSPORT_EXCEPTION'
+# 409: a request with this key is still in flight; it may yet be accepted.
+CONCURRENT_REQUEST = 'CONCURRENT_IDEMPOTENT_REQUESTS'
+# Pause after a 429/quota response without Retry-After.
+RATE_LIMIT_DEFAULT_SECONDS = 60
 
-# Attempt outcomes that prove the provider did not accept that attempt.
+# Attempt outcomes that prove the provider did not accept that attempt:
+# ``retryable`` is recorded only for explicit 429/quota rejections (a
+# concurrent-key 409 is recorded ``uncertain``); ``skipped`` never handed off.
 _NONACCEPTED_OUTCOMES = (DeliveryAttempt.Outcome.RETRYABLE, DeliveryAttempt.Outcome.SKIPPED)
+
+
+def is_rate_limit(result):
+    """429 rate limit or quota: an explicit provider non-acceptance."""
+    return result.status is SendStatus.RETRYABLE and (result.code or '') != CONCURRENT_REQUEST
 
 
 @dataclass(frozen=True)
@@ -78,6 +89,14 @@ class OutboxConfig:
     def timeout(self):
         return self.send_timeout if self.send_timeout is not None else settings.RESEND_TIMEOUT_SECONDS
 
+    def validate(self):
+        """A bounded send plus margin must fit in the lease, or a live worker's
+        claim could expire mid-send and be replayed concurrently."""
+        if self.timeout + self.shutdown_margin >= self.lease_seconds:
+            raise ValueError('send timeout plus shutdown margin must be shorter than the lease.')
+        if self.max_attempts < 1 or self.batch_size < 1:
+            raise ValueError('max_attempts and batch_size must be positive.')
+
 
 @dataclass(frozen=True)
 class Claim:
@@ -92,6 +111,7 @@ class RunSummary:
     released: int = 0
     recovered: int = 0
     materialized: int = 0
+    handoffs: int = 0
     outcomes: dict = field(default_factory=dict)
     stop_reason: str = ''
     elapsed_seconds: float = 0.0
@@ -100,13 +120,9 @@ class RunSummary:
         outcome = str(outcome)
         self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
 
-    @property
-    def dispatched(self):
-        return sum(self.outcomes.get(key, 0) for key in ('accepted', 'retryable', 'failed', 'uncertain', 'stale'))
-
     def as_dict(self):
         return {'mode': self.mode, 'claimed': self.claimed, 'released': self.released,
-                'recovered': self.recovered, 'materialized': self.materialized,
+                'recovered': self.recovered, 'materialized': self.materialized, 'handoffs': self.handoffs,
                 'outcomes': dict(sorted(self.outcomes.items())), 'stop_reason': self.stop_reason,
                 'elapsed_seconds': round(self.elapsed_seconds, 3)}
 
@@ -133,6 +149,16 @@ class RateLimiter:
             slot = max(now, self._next)
             self._next = slot + self.interval
             return slot - now
+
+    def pending(self):
+        """Seconds until the next slot, without booking it."""
+        with self._lock:
+            return max(0.0, self._next - self._clock())
+
+    def defer(self, seconds):
+        """Pause every handoff in this process (429/quota with Retry-After)."""
+        with self._lock:
+            self._next = max(self._next, self._clock() + max(0.0, seconds))
 
 
 _account_limiter = None
@@ -252,6 +278,14 @@ def _ambiguous_history(delivery, exclude_attempt=None):
     return attempts.exclude(outcome__in=_NONACCEPTED_OUTCOMES).exists()
 
 
+def _budget_used(delivery):
+    """Handoffs of the current generation that count against the attempt
+    budget: every attempt except explicit 429/quota rejections (those are
+    bounded by the safety window instead)."""
+    return (DeliveryAttempt.objects.filter(delivery=delivery, generation=delivery.retry_generation)
+            .exclude(outcome__in=_NONACCEPTED_OUTCOMES).count())
+
+
 _DEFAULT = object()
 
 
@@ -260,6 +294,8 @@ class OutboxWorker:
                  worker_id=None):
         """``limiter=None`` disables pacing (tests); the default is the process-wide account limiter."""
         self.config = config or OutboxConfig()
+        self.config.validate()
+        self._rate_limited = False
         self._transport = transport
         self.limiter = account_limiter() if limiter is _DEFAULT else limiter
         self.stop_event = stop_event or threading.Event()
@@ -287,19 +323,29 @@ class OutboxWorker:
         delivery.lease_token = None
         delivery.lease_expires_at = None
 
+    def _window_at(self, delivery, now, delay):
+        """``now + delay`` if a bounded send started then still ends inside the
+        safety window, else None. ``delay`` is clamped first (huge Retry-After)."""
+        deadline = delivery.idempotency_deadline_at or (now + self.config.safety_window)
+        room = (deadline - now).total_seconds() - self.config.timeout
+        if room < 0:
+            return None
+        delay = max(0.0, float(delay))
+        if delay > room:
+            return None
+        return now + timedelta(seconds=delay)
+
     def _retry_at(self, delivery, now, retry_after=None):
-        """Next same-key attempt time, or None when the budget/window is spent."""
-        if delivery.attempt_count >= self.config.max_attempts:
+        """Next budget-counted same-key attempt time, or None when the budget
+        or safety window is spent."""
+        used = _budget_used(delivery)
+        if used >= self.config.max_attempts:
             return None
         delays = self.config.retry_delays
-        delay = delays[min(max(delivery.attempt_count, 1), len(delays)) - 1]
+        delay = delays[min(max(used, 1), len(delays)) - 1]
         if retry_after:
-            delay = max(delay, int(retry_after))
-        at = now + timedelta(seconds=delay)
-        if delivery.idempotency_deadline_at and at + timedelta(seconds=self.config.timeout) \
-                > delivery.idempotency_deadline_at:
-            return None
-        return at
+            delay = max(delay, retry_after)
+        return self._window_at(delivery, now, delay)
 
     def _finish(self, broadcast, delivery, state, *, error_code='', nonacceptance_known=False):
         delivery.state = state
@@ -392,7 +438,7 @@ class OutboxWorker:
             outcome=DeliveryAttempt.Outcome.UNCERTAIN, error_code=INTERRUPTED, finished_at=now)
         window_ok = (delivery.idempotency_deadline_at is not None
                      and now + timedelta(seconds=self.config.timeout) <= delivery.idempotency_deadline_at)
-        if delivery.attempt_count < self.config.max_attempts and window_ok and delivery.request_snapshot:
+        if _budget_used(delivery) < self.config.max_attempts and window_ok and delivery.request_snapshot:
             # Same request/key replay; the provider deduplicates an accepted original.
             self._requeue(broadcast, delivery, now, INTERRUPTED)
         else:
@@ -491,6 +537,17 @@ class OutboxWorker:
             result = SendResult.uncertain(TRANSPORT_EXCEPTION)
         return result
 
+    @staticmethod
+    def _result_outcome(result):
+        Outcome = DeliveryAttempt.Outcome
+        if result.status is SendStatus.ACCEPTED:
+            return Outcome.ACCEPTED if (result.provider_message_id or '').strip() else Outcome.UNCERTAIN
+        if result.status is SendStatus.FAILED:
+            return Outcome.FAILED
+        if is_rate_limit(result):
+            return Outcome.RETRYABLE
+        return Outcome.UNCERTAIN
+
     def complete(self, prepared, result):
         """Persist the outcome only if this worker still owns the lease."""
         now = timezone.now()
@@ -501,28 +558,56 @@ class OutboxWorker:
             if (delivery.state != DeliveryState.SENDING or delivery.lease_token != prepared.claim.token
                     or delivery.retry_generation != prepared.generation
                     or delivery.attempt_count != prepared.attempt):
-                if attempt is not None and not attempt.outcome:
-                    attempt.outcome = DeliveryAttempt.Outcome.LEASE_LOST
-                    attempt.finished_at = now
-                    attempt.save(update_fields=['outcome', 'finished_at'])
-                logger.warning('outbox_stale_completion worker=%s delivery=%s generation=%s attempt=%s '
-                               'status=%s code=%s provider_id=%s', self.worker_id, prepared.claim.delivery_id,
-                               prepared.generation, prepared.attempt, result.status.value, result.code,
-                               result.provider_message_id)
-                return 'stale'
-            outcome, _state = self._apply(broadcast, delivery, result, now)
+                return self._complete_stale(prepared, result, broadcast, delivery, attempt, now)
+            outcome = self._apply(broadcast, delivery, result, now)
             if attempt is not None:
                 attempt.outcome = outcome
                 attempt.error_code = '' if outcome == DeliveryAttempt.Outcome.ACCEPTED else delivery.error_code
+                attempt.provider_email_id = delivery.provider_email_id
                 attempt.finished_at = now
-                attempt.save(update_fields=['outcome', 'error_code', 'finished_at'])
+                attempt.save(update_fields=['outcome', 'error_code', 'provider_email_id', 'finished_at'])
             level = logging.INFO if outcome == DeliveryAttempt.Outcome.ACCEPTED else logging.WARNING
             self._log(level, 'outbox_result', delivery, outcome=outcome, code=delivery.error_code or None,
                       provider_id=delivery.provider_email_id or None,
                       next_attempt_at=delivery.next_attempt_at.isoformat() if delivery.next_attempt_at else None)
         return outcome
 
+    def _complete_stale(self, prepared, result, broadcast, delivery, attempt, now):
+        """The lease was lost (recovered by another pass) while this send ran.
+        Never overwrite the newer state; keep the late result as evidence on
+        the attempt row. A late acceptance with an ID resolves a same-generation
+        ``uncertain`` delivery to ``sent`` (the provider accepted this exact
+        request/key)."""
+        late = self._result_outcome(result)
+        provider_id = (result.provider_message_id or '').strip()[:128] if late == 'accepted' else ''
+        if attempt is not None:
+            if not attempt.outcome:
+                attempt.outcome = DeliveryAttempt.Outcome.LEASE_LOST
+                attempt.finished_at = now
+            attempt.late_outcome = late
+            attempt.late_error_code = '' if late == 'accepted' else _safe_code(result.code, result.status.value.upper())
+            attempt.late_recorded_at = now
+            if provider_id:
+                attempt.provider_email_id = provider_id
+            attempt.save(update_fields=['outcome', 'finished_at', 'late_outcome', 'late_error_code',
+                                        'late_recorded_at', 'provider_email_id'])
+        logger.warning('outbox_stale_completion worker=%s delivery=%s generation=%s attempt=%s '
+                       'status=%s code=%s provider_id=%s', self.worker_id, prepared.claim.delivery_id,
+                       prepared.generation, prepared.attempt, result.status.value, result.code,
+                       provider_id or None)
+        if (provider_id and delivery.state == DeliveryState.UNCERTAIN
+                and delivery.retry_generation == prepared.generation):
+            previous = delivery.error_code
+            delivery.provider_email_id = provider_id
+            delivery.sent_at = now
+            self._finish(broadcast, delivery, DeliveryState.SENT)
+            self._log(logging.WARNING, 'outbox_late_acceptance', delivery, provider_id=provider_id,
+                      previous_code=previous or None)
+            return 'late_accepted'
+        return 'stale'
+
     def _apply(self, broadcast, delivery, result, now):
+        """Map a current-lease transport result; returns the attempt outcome."""
         Outcome = DeliveryAttempt.Outcome
         status = result.status
         provider_id = (result.provider_message_id or '').strip()
@@ -530,60 +615,86 @@ class OutboxWorker:
             delivery.provider_email_id = provider_id[:128]
             delivery.sent_at = now
             self._finish(broadcast, delivery, DeliveryState.SENT)
-            return Outcome.ACCEPTED, DeliveryState.SENT
+            return Outcome.ACCEPTED
         if status is SendStatus.ACCEPTED:
             status, code = SendStatus.UNCERTAIN, 'MALFORMED_SUCCESS'  # never fabricate sent
         else:
             code = _safe_code(result.code, status.value.upper())
+        earlier_ambiguous = _ambiguous_history(delivery, exclude_attempt=delivery.attempt_count)
 
         if status is SendStatus.FAILED:
             if code in PAYLOAD_CONFLICT_CODES:
                 # A different payload exists under this key: investigate, never rotate the key.
                 self._finish(broadcast, delivery, DeliveryState.FAILED, error_code=PAYLOAD_CONFLICT)
-            elif _ambiguous_history(delivery, exclude_attempt=delivery.attempt_count):
+            elif earlier_ambiguous:
                 # An earlier same-key attempt may have been accepted.
                 self._finish(broadcast, delivery, DeliveryState.UNCERTAIN, error_code=code)
             else:
                 self._finish(broadcast, delivery, DeliveryState.FAILED, error_code=code, nonacceptance_known=True)
-            return Outcome.FAILED, delivery.state
+            return Outcome.FAILED
 
-        if status is SendStatus.RETRYABLE:
-            at = self._retry_at(delivery, now, result.retry_after)
+        if is_rate_limit(result):
+            # Explicit 429/quota non-acceptance: pause the whole process, end the
+            # batch, and retry the same request later without spending the
+            # attempt budget; only the safety window bounds these.
+            pause = float(result.retry_after) if result.retry_after else RATE_LIMIT_DEFAULT_SECONDS
+            pause = min(max(pause, 1.0), self.config.safety_window.total_seconds())
+            if self.limiter:
+                self.limiter.defer(pause)
+            self._rate_limited = True
+            at = self._window_at(delivery, now, pause)
             if at is not None:
                 self._requeue(broadcast, delivery, at, code)
-            elif _ambiguous_history(delivery, exclude_attempt=delivery.attempt_count):
+            elif earlier_ambiguous:
                 self._finish(broadcast, delivery, DeliveryState.UNCERTAIN, error_code=code)
             else:
+                # Every handoff of this generation was explicitly not accepted.
                 self._finish(broadcast, delivery, DeliveryState.FAILED, error_code=code, nonacceptance_known=True)
-            return Outcome.RETRYABLE, delivery.state
+            return Outcome.RETRYABLE
 
-        # Uncertain (timeout, connection, 5xx, malformed success, unknown).
-        at = self._retry_at(delivery, now)
+        # Uncertain: timeout, connection, 5xx, malformed success, concurrent-key
+        # 409 (an earlier request with this key may still be accepted), unknown.
+        at = self._retry_at(delivery, now, result.retry_after)
         if at is not None:
             self._requeue(broadcast, delivery, at, code)  # same request/key later
         else:
             self._finish(broadcast, delivery, DeliveryState.UNCERTAIN, error_code=code)
-        return Outcome.UNCERTAIN, delivery.state
+        return Outcome.UNCERTAIN
 
-    def process(self, claim):
+    def process(self, claim, summary=None):
+        """Prepare, hand off (no lock held) and complete one claim. Only real
+        provider handoffs count toward ``summary.handoffs``."""
         prepared = self.prepare(claim)
         if not isinstance(prepared, _Prepared):
             return prepared
+        if summary is not None:
+            summary.handoffs += 1
         result = self.send(prepared)
         return self.complete(prepared, result)
 
     # ------------------------------------------------------------ loops
+
+    def _wait(self, seconds, dispatch_deadline):
+        """Wait for a pacing slot or rate-limit pause; returns a stop reason or ''."""
+        if seconds <= 0:
+            return ''
+        if dispatch_deadline is not None and self.clock() + seconds >= dispatch_deadline:
+            return 'budget'
+        return 'signal' if self.stop_event.wait(seconds) else ''
 
     def _drain(self, summary, dispatch_deadline, max_sends):
         """Claim and process batches until nothing is due, the budget is spent
         or a stop is requested. Returns the stop reason ('' when drained)."""
         while True:
             reason = self._stop_reason(summary, dispatch_deadline, max_sends)
+            if not reason and self.limiter:
+                # A 429/quota pause is waited out before claiming, never while holding claims.
+                reason = self._wait(self.limiter.pending(), dispatch_deadline)
             if reason:
                 return reason
             limit = self.config.batch_size
             if max_sends is not None:
-                limit = max(1, min(limit, max_sends - summary.dispatched))
+                limit = max(1, min(limit, max_sends - summary.handoffs))
             claims = self.claim_batch(limit)
             summary.claimed += len(claims)
             if not claims:
@@ -592,8 +703,8 @@ class OutboxWorker:
             try:
                 reason = self._process_batch(summary, pending, dispatch_deadline, max_sends)
             finally:
-                # Signal, budget, cap or an unexpected error: unused claims go back now
-                # rather than waiting for lease expiry.
+                # Signal, budget, cap, rate limit or an unexpected error: unused
+                # claims go back now rather than waiting for lease expiry.
                 if pending:
                     try:
                         summary.released += self.release(pending)
@@ -607,25 +718,27 @@ class OutboxWorker:
             return 'signal'
         if dispatch_deadline is not None and self.clock() >= dispatch_deadline:
             return 'budget'
-        if max_sends is not None and summary.dispatched >= max_sends:
+        if max_sends is not None and summary.handoffs >= max_sends:
             return 'max_sends'
         return ''
 
     def _process_batch(self, summary, pending, dispatch_deadline, max_sends):
-        """Process claims in order, popping each from ``pending`` as it is used."""
+        """Process claims in order, popping each from ``pending`` as it is used.
+        Returns a stop reason, or '' when the batch is done or was ended by a
+        429/quota response (the caller releases what is left)."""
         while pending:
             reason = self._stop_reason(summary, dispatch_deadline, max_sends)
             if not reason and self.limiter:
-                wait = self.limiter.reserve()
-                if wait > 0:
-                    if dispatch_deadline is not None and self.clock() + wait >= dispatch_deadline:
-                        reason = 'budget'
-                    elif self.stop_event.wait(wait):
-                        reason = 'signal'
+                reason = self._wait(self.limiter.reserve(), dispatch_deadline)
+                self.renew(pending)  # pacing waits never eat into held leases
             if reason:
                 return reason
             claim = pending.pop(0)
-            summary.count(self.process(claim))
+            self._rate_limited = False
+            summary.count(self.process(claim, summary))
+            if self._rate_limited:
+                self._rate_limited = False
+                return ''
             self.renew(pending)
         return ''
 

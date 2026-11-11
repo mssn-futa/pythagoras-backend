@@ -265,8 +265,15 @@ try:
     OUTBOX_REQUESTS_PER_SECOND = float(os.getenv('OUTBOX_REQUESTS_PER_SECOND', '1'))
 except ValueError:
     OUTBOX_REQUESTS_PER_SECOND = 0.0
-if not 0 < OUTBOX_REQUESTS_PER_SECOND <= 100:
-    raise ImproperlyConfigured('OUTBOX_REQUESTS_PER_SECOND must be a number above 0 and at most 100.')
+# At least one slot per minute so claims never wait for a slot past their lease.
+if not 1 / 60 <= OUTBOX_REQUESTS_PER_SECOND <= 100:
+    raise ImproperlyConfigured('OUTBOX_REQUESTS_PER_SECOND must be a number from 1/60 to 100.')
+# D4 worker lease (fixed). A bounded send plus shutdown margin must fit inside
+# it, so a live worker's lease never expires mid-send.
+OUTBOX_LEASE_SECONDS = 120
+OUTBOX_SHUTDOWN_MARGIN_SECONDS = 10
+if RESEND_TIMEOUT_SECONDS + OUTBOX_SHUTDOWN_MARGIN_SECONDS >= OUTBOX_LEASE_SECONDS:
+    raise ImproperlyConfigured('RESEND_TIMEOUT_SECONDS must be below 110 (outbox lease 120 s minus 10 s margin).')
 
 # Configuration interfaces only; DAWAH-02 owns the S3/R2 implementation.
 R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')

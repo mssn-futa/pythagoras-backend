@@ -4,13 +4,17 @@ import io
 import json
 import os
 import signal
+import subprocess
+import sys
+import tempfile
 import threading
 from datetime import timedelta
 from unittest import mock
 
+from django.conf import settings
 from django.core.management import call_command
 from django.db import connection
-from django.test import TestCase, TransactionTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 # Import the API module first (pre-existing circular import, see test_concurrency).
@@ -250,50 +254,109 @@ class OutcomeTests(OutboxMixin, TestCase):
         self.assertFalse(delivery.is_retry_eligible)
         self.assertEqual(self.state_of(broadcast), 'uncertain')
 
-    def test_rate_limit_uses_retry_after_and_exhausts_to_known_failure(self):
+    def test_rate_limit_uses_retry_after_and_does_not_spend_attempt_budget(self):
         broadcast, _ = self.queue()
         transport = FakeTransport(SendResult.retryable('RATE_LIMIT_EXCEEDED', retry_after=120),
-                                  SendResult.retryable('RATE_LIMIT_EXCEEDED'),
-                                  SendResult.retryable('RATE_LIMIT_EXCEEDED', retry_after=5))
+                                  *[SendResult.retryable('DAILY_QUOTA_EXCEEDED')] * 4)
         before = timezone.now()
         self.worker(transport).run_once()
         delivery = self.one(broadcast)
-        self.assertEqual(delivery.state, 'queued')
+        self.assertEqual((delivery.state, delivery.error_code), ('queued', 'RATE_LIMIT_EXCEEDED'))
         self.assertAlmostEqual((delivery.next_attempt_at - before).total_seconds(), 120, delta=5)
+        for _ in range(5):  # four quota rejections, then acceptance: 6 handoffs > 3-attempt budget
+            self.make_due()
+            before = timezone.now()
+            self.worker(transport).run_once()
+            delivery.refresh_from_db()
+            if delivery.state == 'queued':
+                self.assertAlmostEqual((delivery.next_attempt_at - before).total_seconds(), 60, delta=5)
+        self.assertEqual((delivery.state, delivery.attempt_count, delivery.provider_email_id), ('sent', 6, 'em_6'))
+        self.assertEqual(len(set(transport.keys())), 1)
+        self.assertEqual([row[2] for row in self.attempts(delivery)], ['retryable'] * 5 + ['accepted'])
+
+    def test_rate_limits_only_until_window_end_is_known_failure(self):
+        broadcast, _ = self.queue()
+        transport = FakeTransport(*[SendResult.retryable('RATE_LIMIT_EXCEEDED')] * 2)
+        self.worker(transport).run_once()
         self.make_due()
-        before = timezone.now()
+        self.worker(transport).run_once()
+        delivery = self.one(broadcast)
+        # Next 429 pause (60 s) no longer fits the safety window.
+        Delivery.objects.filter(pk=delivery.pk).update(
+            next_attempt_at=timezone.now(), idempotency_deadline_at=timezone.now() + timedelta(seconds=80))
+        transport.script = [SendResult.retryable('RATE_LIMIT_EXCEEDED')]
         self.worker(transport).run_once()
         delivery.refresh_from_db()
-        self.assertAlmostEqual((delivery.next_attempt_at - before).total_seconds(), 300, delta=5)
-        self.make_due()
-        self.worker(transport).run_once()
-        delivery.refresh_from_db()
-        # Every attempt was a definite non-acceptance: known failure, retry-eligible.
+        # Every handoff was an explicit provider non-acceptance.
         self.assertEqual((delivery.state, delivery.error_code, delivery.nonacceptance_known),
                          ('failed', 'RATE_LIMIT_EXCEEDED', True))
-        self.assertEqual(len(set(transport.keys())), 1)
+        self.assertTrue(delivery.is_retry_eligible)
 
-    def test_concurrent_idempotent_request_retries_same_key(self):
+    def test_huge_retry_after_is_clamped_to_the_window(self):
         broadcast, _ = self.queue()
-        transport = FakeTransport(SendResult.uncertain('TIMEOUT'),
-                                  SendResult.retryable('CONCURRENT_IDEMPOTENT_REQUESTS', retry_after=1))
-        self.worker(transport).run_once()
-        self.make_due()
-        self.worker(transport).run_once()
-        self.make_due()
+        transport = FakeTransport(SendResult.retryable('RATE_LIMIT_EXCEEDED', retry_after=10 ** 12))
+        limiter = outbox.RateLimiter(1000)
+        worker = outbox.OutboxWorker(outbox.OutboxConfig(send_timeout=30), transport=transport, limiter=limiter)
+        worker.run_once()
+        delivery = self.one(broadcast)
+        self.assertEqual((delivery.state, delivery.nonacceptance_known), ('failed', True))
+        self.assertLessEqual(limiter.pending(), timedelta(hours=23).total_seconds())
+
+    def test_rate_limit_pauses_process_and_ends_batch(self):
+        broadcast, _ = self.queue(recipients=5)
+        transport = FakeTransport(SendResult.retryable('RATE_LIMIT_EXCEEDED', retry_after=1000))
+        limiter = outbox.RateLimiter(1000)
+        worker = outbox.OutboxWorker(outbox.OutboxConfig(send_timeout=30), transport=transport, limiter=limiter)
+        summary = worker.run_once()
+        # One handoff; the other four claims go straight back; the 1000 s pause outlasts the budget.
+        self.assertEqual((summary.handoffs, summary.claimed, summary.released, summary.stop_reason),
+                         (1, 5, 4, 'budget'))
+        self.assertEqual(len(transport.calls), 1)
+        self.assertGreater(limiter.pending(), 900)
+        self.assertEqual(sorted(r.state for r in self.deliveries(broadcast)), ['queued'] * 5)
+        self.assertFalse(Delivery.objects.filter(lease_token__isnull=False).exists())
+        # A new pass in the same process waits instead of claiming.
+        again = worker.run_once()
+        self.assertEqual((again.claimed, again.stop_reason, len(transport.calls)), (0, 'budget', 1))
+
+    def test_concurrent_idempotent_request_is_ambiguous_and_retries_same_key(self):
+        broadcast, _ = self.queue()
+        transport = FakeTransport(SendResult.retryable('CONCURRENT_IDEMPOTENT_REQUESTS', retry_after=1))
         self.worker(transport).run_once()
         delivery = self.one(broadcast)
+        self.assertEqual((delivery.state, delivery.error_code), ('queued', 'CONCURRENT_IDEMPOTENT_REQUESTS'))
+        self.assertEqual(self.attempts(delivery), [(0, 1, 'uncertain', 'CONCURRENT_IDEMPOTENT_REQUESTS')])
+        self.make_due()
+        self.worker(transport).run_once()
+        delivery.refresh_from_db()
         self.assertEqual(len(set(transport.keys())), 1)
-        self.assertEqual((delivery.state, delivery.attempt_count), ('sent', 3))
+        self.assertEqual((delivery.state, delivery.attempt_count), ('sent', 2))
 
-    def test_retryable_exhaustion_after_ambiguous_attempt_is_uncertain(self):
+    def test_concurrent_conflict_never_yields_known_nonacceptance(self):
+        for script, code in [
+            ([SendResult.retryable('CONCURRENT_IDEMPOTENT_REQUESTS')] * 3, 'CONCURRENT_IDEMPOTENT_REQUESTS'),
+            ([SendResult.retryable('CONCURRENT_IDEMPOTENT_REQUESTS'), SendResult.failed('VALIDATION_ERROR')],
+             'VALIDATION_ERROR'),
+        ]:
+            with self.subTest(code=code):
+                broadcast, _ = self.queue()
+                transport = FakeTransport(*script)
+                for _ in range(len(script)):
+                    self.worker(transport).run_once()
+                    self.make_due()
+                delivery = self.one(broadcast)
+                self.assertEqual((delivery.state, delivery.error_code, delivery.nonacceptance_known),
+                                 ('uncertain', code, False))
+
+    def test_rate_limit_window_end_after_ambiguous_attempt_is_uncertain(self):
         broadcast, _ = self.queue()
-        transport = FakeTransport(SendResult.uncertain('TIMEOUT'), SendResult.retryable('RATE_LIMIT_EXCEEDED'),
-                                  SendResult.retryable('RATE_LIMIT_EXCEEDED'))
-        for _ in range(3):
-            self.worker(transport).run_once()
-            self.make_due()
+        transport = FakeTransport(SendResult.uncertain('TIMEOUT'), SendResult.retryable('RATE_LIMIT_EXCEEDED'))
+        self.worker(transport).run_once()
         delivery = self.one(broadcast)
+        Delivery.objects.filter(pk=delivery.pk).update(
+            next_attempt_at=timezone.now(), idempotency_deadline_at=timezone.now() + timedelta(seconds=80))
+        self.worker(transport).run_once()
+        delivery.refresh_from_db()
         self.assertEqual((delivery.state, delivery.nonacceptance_known), ('uncertain', False))
 
     def test_definitive_failure_after_ambiguous_attempt_is_uncertain(self):
@@ -483,6 +546,70 @@ class LeaseAndRecoveryTests(OutboxMixin, TestCase):
         delivery = self.one(broadcast)
         self.assertEqual((delivery.state, delivery.provider_email_id, delivery.error_code), ('sent', 'em_1', ''))
         self.assertEqual(self.attempts(delivery), [(0, 1, 'uncertain', 'INTERRUPTED'), (0, 2, 'accepted', '')])
+        late = DeliveryAttempt.objects.get(delivery=delivery, attempt=1)
+        self.assertEqual((late.late_outcome, late.late_error_code, late.provider_email_id),
+                         ('failed', 'VALIDATION_ERROR', ''))
+        self.assertIsNotNone(late.late_recorded_at)
+        self.assertEqual(DeliveryAttempt.objects.get(delivery=delivery, attempt=2).provider_email_id, 'em_1')
+
+    def test_late_acceptance_resolves_same_generation_uncertain_to_sent(self):
+        broadcast, _ = self.queue()
+        stale = self.worker(FakeTransport(), max_attempts=1)
+        (claim,) = stale.claim_batch()
+        prepared = stale.prepare(claim)
+        Delivery.objects.update(lease_expires_at=timezone.now() - timedelta(seconds=1))
+        self.worker(FakeTransport(), max_attempts=1).run_once()  # recovery: last attempt -> uncertain
+        self.assertEqual(self.one(broadcast).state, 'uncertain')
+        self.assertEqual(self.state_of(broadcast), 'uncertain')
+        with self.assertLogs('dawah.outbox', 'WARNING') as logs:
+            self.assertEqual(stale.complete(prepared, SendResult.accepted('re_late')), 'late_accepted')
+        self.assertTrue(any('outbox_late_acceptance' in line for line in logs.output))
+        delivery = self.one(broadcast)
+        self.assertEqual((delivery.state, delivery.provider_email_id, delivery.error_code), ('sent', 're_late', ''))
+        self.assertIsNotNone(delivery.sent_at)
+        row = DeliveryAttempt.objects.get(delivery=delivery, attempt=1)
+        self.assertEqual((row.outcome, row.error_code, row.late_outcome, row.provider_email_id),
+                         ('uncertain', 'INTERRUPTED', 'accepted', 're_late'))
+        self.assertEqual(self.state_of(broadcast), 'completed')
+
+    def test_late_result_never_touches_a_newer_generation(self):
+        broadcast, _ = self.queue()
+        stale = self.worker(FakeTransport(), max_attempts=1)
+        (claim,) = stale.claim_batch()
+        prepared = stale.prepare(claim)
+        Delivery.objects.update(lease_expires_at=timezone.now() - timedelta(seconds=1))
+        self.worker(FakeTransport(), max_attempts=1).run_once()
+        Delivery.objects.update(retry_generation=1)  # e.g. an operator-approved later generation
+        self.assertEqual(stale.complete(prepared, SendResult.accepted('re_late')), 'stale')
+        self.assertEqual((self.one(broadcast).state, self.one(broadcast).provider_email_id), ('uncertain', ''))
+
+    def test_send_timeout_must_fit_inside_lease(self):
+        with self.assertRaises(ValueError):
+            self.worker(FakeTransport(), send_timeout=300)
+        with self.assertRaises(ValueError):
+            self.worker(FakeTransport(), send_timeout=110)
+        self.worker(FakeTransport(), send_timeout=109)
+
+    def test_max_sends_counts_only_provider_handoffs(self):
+        broadcast, students = self.queue(recipients=3)
+        User.objects.filter(pk__in=[students[0].pk, students[1].pk]).update(is_active=False)
+        transport = FakeTransport()
+        summary = self.worker(transport).run_once(max_sends=1)
+        self.assertEqual((summary.handoffs, summary.outcomes, len(transport.calls)),
+                         (1, {'accepted': 1, 'skipped': 2}, 1))
+        self.assertEqual(summary.as_dict()['handoffs'], 1)
+
+    def test_pacing_renews_held_claims(self):
+        self.queue(recipients=2)
+        clock = ManualClock()
+        renewed = []
+        worker = self.worker(FakeTransport())
+        worker.limiter = mock.Mock(reserve=mock.Mock(return_value=0.0), pending=mock.Mock(return_value=0.0))
+        real_renew = worker.renew
+        worker.renew = lambda claims: renewed.append(len(claims)) or real_renew(claims)
+        worker.clock = clock
+        worker.run_once()
+        self.assertEqual(renewed, [2, 1, 1, 0])  # before each handoff and after it
 
     def test_stop_request_finishes_current_send_and_releases_claims(self):
         broadcast, _ = self.queue(recipients=3)
@@ -635,6 +762,48 @@ class DeliveryHistoryAPITests(OutboxMixin, DawahAPITestCase, TestCase):
         self.assertEqual((detail['state'], detail['eligible_actions']), ('completed_with_errors', ['retry']))
         self.client.force_authenticate(student)
         self.assertEqual(self.client.get(f'/dawah/broadcasts/{broadcast.pk}/deliveries/').status_code, 403)
+
+
+@MAIL_SETTINGS
+class NoLockDuringSendTests(OutboxMixin, TransactionTestCase):
+    def test_send_runs_outside_any_transaction_and_holds_no_row_locks(self):
+        self.queue(recipients=2)
+        seen = []
+
+        def check(message):
+            seen.append(connection.in_atomic_block)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() "
+                               "AND locktype IN ('tuple', 'transactionid')")
+                seen.append(cursor.fetchone()[0])
+
+        self.worker(FakeTransport(on_send=check)).run_once()
+        self.assertEqual(seen, [False, 0, False, 0])
+
+
+class OutboxSettingsTests(SimpleTestCase):
+    def run_process(self, code, **overrides):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, 'DJANGO_SETTINGS_MODULE': 'pythagoras.settings', 'PYTHON_DOTENV_DISABLED': '1',
+                   'DEBUG': 'true', 'SECRET_KEY': 'test-only-cold-start-key-with-sufficient-length-1234567890',
+                   'DATABASE_URL': f'sqlite:///{directory}/db.sqlite3', **overrides}
+            return subprocess.run([sys.executable, '-c', code], cwd=settings.BASE_DIR, env=env, text=True,
+                                  capture_output=True, timeout=60)
+
+    def test_startup_rejects_unsafe_timeout_and_pacing(self):
+        for overrides, text in [
+            ({'RESEND_TIMEOUT_SECONDS': '110'}, 'RESEND_TIMEOUT_SECONDS must be below 110'),
+            ({'OUTBOX_REQUESTS_PER_SECOND': '0.01'}, 'OUTBOX_REQUESTS_PER_SECOND must be'),
+            ({'OUTBOX_REQUESTS_PER_SECOND': 'nan'}, 'OUTBOX_REQUESTS_PER_SECOND must be'),
+            ({'OUTBOX_REQUESTS_PER_SECOND': '101'}, 'OUTBOX_REQUESTS_PER_SECOND must be'),
+        ]:
+            with self.subTest(overrides=overrides):
+                result = self.run_process('import pythagoras.settings', **overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(text, result.stderr)
+        ok = self.run_process('import pythagoras.settings as s; print(s.OUTBOX_REQUESTS_PER_SECOND)',
+                              RESEND_TIMEOUT_SECONDS='109', OUTBOX_REQUESTS_PER_SECOND='0.5')
+        self.assertEqual((ok.returncode, ok.stdout.strip()), (0, '0.5'), ok.stderr)
 
 
 @MAIL_SETTINGS
