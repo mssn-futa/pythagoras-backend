@@ -6,6 +6,14 @@ def is_active_user(user):
     return bool(user and user.is_authenticated and user.is_active)
 
 
+class IsActiveUser(BasePermission):
+    """Any authenticated, active account (student or admin)."""
+    message = 'Authentication with an active account is required.'
+
+    def has_permission(self, request, view):
+        return is_active_user(request.user)
+
+
 class IsAdmin(BasePermission):
     message = 'You must be an admin to perform this action.'
 

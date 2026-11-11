@@ -45,6 +45,15 @@ def env_positive_int(name, default):
     raise ImproperlyConfigured(f'{name} must be a positive integer.')
 
 
+def env_rate(name, default):
+    """A DRF throttle rate such as '10/min' (periods: sec, min, hour, day)."""
+    value = os.getenv(name, default).strip()
+    match = re.fullmatch(r'([1-9]\d*)/(s|sec|second|m|min|minute|h|hour|d|day)', value)
+    if not match:
+        raise ImproperlyConfigured(f'{name} must be a rate such as 10/min.')
+    return value
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
@@ -82,6 +91,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
     'drf_spectacular',
     'corsheaders',
 
@@ -184,10 +194,14 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AUTH_USER_MODEL = 'accounts.CustomUser'
 
+# Forces the in-memory email transport and a blank provider key under tests.
+TEST_RUNNER = 'pythagoras.test_runner.IsolatedTestRunner'
+
 
 REST_FRAMEWORK = {
+    # SimpleJWT bearer authentication that rejects inactive accounts with 403.
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'accounts.authentication.ActiveUserJWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
@@ -198,6 +212,21 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'pythagoras.pagination.StandardPagination',
     'PAGE_SIZE': 20,
     'DATETIME_FORMAT': 'iso-8601',
+    # D5 engineering starting limits, tunable per deployment. Register and
+    # login are per client IP; refresh is per session (refresh token) with a
+    # looser per-IP ceiling, because every page load refreshes and many
+    # students can share one campus NAT address.
+    # Counters use the default cache; a shared cache is required for
+    # deployment-wide enforcement.
+    'DEFAULT_THROTTLE_RATES': {
+        'auth_register': env_rate('AUTH_REGISTER_RATE', '5/min'),
+        'auth_login': env_rate('AUTH_LOGIN_RATE', '10/min'),
+        'auth_refresh': env_rate('AUTH_REFRESH_RATE', '10/min'),
+        'auth_refresh_ip': env_rate('AUTH_REFRESH_IP_RATE', '300/min'),
+    },
+    # Client IP is REMOTE_ADDR unless the verified Cloudflare router is trusted,
+    # in which case the address it appends to X-Forwarded-For is used.
+    'NUM_PROXIES': 1 if TRUST_CLOUDFLARE_PROXY else 0,
 }
 
 
@@ -222,14 +251,27 @@ SPECTACULAR_SETTINGS = {
 }
 
 
-# Legacy welcome delivery remains non-networked until PLAT-03 adopts Resend.
+# All application mail uses pythagoras.mail (D0 A05). Django's own mail
+# backend stays in-memory so nothing can fall back to SMTP.
 EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+EMAIL_TRANSPORT = os.getenv('EMAIL_TRANSPORT', 'resend').strip().lower()
+if EMAIL_TRANSPORT not in {'resend', 'memory'}:
+    raise ImproperlyConfigured('EMAIL_TRANSPORT must be resend or memory.')
 RESEND_API_KEY = os.getenv('RESEND_API_KEY', '')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '')
 EMAIL_REPLY_TO = os.getenv('EMAIL_REPLY_TO', '')
+# Total wall-clock bound (DNS+connect+send+read) for one Resend request.
 RESEND_TIMEOUT_SECONDS = env_positive_int('RESEND_TIMEOUT_SECONDS', 30)
-RESEND_REQUESTS_PER_SECOND = env_positive_int('RESEND_REQUESTS_PER_SECOND', 2)
-RESEND_DAILY_REQUEST_BUDGET = env_positive_int('RESEND_DAILY_REQUEST_BUDGET', 100)
+# Shorter bound for the welcome send that runs inside the registration request.
+WELCOME_EMAIL_TIMEOUT_SECONDS = env_positive_int(
+    'WELCOME_EMAIL_TIMEOUT_SECONDS', min(10, RESEND_TIMEOUT_SECONDS))
+if WELCOME_EMAIL_TIMEOUT_SECONDS > RESEND_TIMEOUT_SECONDS:
+    raise ImproperlyConfigured('WELCOME_EMAIL_TIMEOUT_SECONDS must not exceed RESEND_TIMEOUT_SECONDS.')
+# Prefix of every provider idempotency key; staging and production MUST differ.
+EMAIL_IDEMPOTENCY_NAMESPACE = os.getenv('EMAIL_IDEMPOTENCY_NAMESPACE', 'local').strip()
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', EMAIL_IDEMPOTENCY_NAMESPACE):
+    raise ImproperlyConfigured(
+        'EMAIL_IDEMPOTENCY_NAMESPACE must be 1-64 letters, digits, ".", "_" or "-".')
 
 # Configuration interfaces only; DAWAH-02 owns the S3/R2 implementation.
 R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')

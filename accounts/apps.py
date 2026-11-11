@@ -4,3 +4,7 @@ from django.apps import AppConfig
 class AccountsConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
     name = 'accounts'
+
+    def ready(self):
+        from pythagoras.mail import checks  # noqa: F401  (registers deploy checks)
+        from . import schema  # noqa: F401  (registers the OpenAPI auth extension)

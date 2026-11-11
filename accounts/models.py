@@ -1,8 +1,11 @@
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.db import models
+from django.db.models import Q
+from django.db.models.functions import Lower, Upper
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from .identity import normalize_department, normalize_email, normalize_matric
 from .managers import CustomUserManager
 
 
@@ -63,9 +66,36 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     class Meta:
         verbose_name = _("user")
         verbose_name_plural = _("users")
+        constraints = [
+            models.UniqueConstraint(
+                Lower("email"), name="accounts_user_email_ci_unique",
+                violation_error_message=_("An account with this email already exists."),
+            ),
+            models.UniqueConstraint(
+                Upper("matric_number"), name="accounts_user_matric_ci_unique",
+                violation_error_message=_("An account with this matric number already exists."),
+            ),
+            models.CheckConstraint(
+                condition=~Q(matric_number=""), name="accounts_user_matric_not_blank",
+            ),
+        ]
 
     def __str__(self):
         return self.email
+
+    def normalize_identity(self):
+        self.email = normalize_email(self.email)
+        self.matric_number = normalize_matric(self.matric_number)
+        self.department = normalize_department(self.department)
+
+    def clean(self):
+        super().clean()
+        self.normalize_identity()
+
+    def save(self, *args, **kwargs):
+        # Every write path (API, admin, shell, commands) stores normalized identity.
+        self.normalize_identity()
+        super().save(*args, **kwargs)
 
     def get_full_name(self):
         """
