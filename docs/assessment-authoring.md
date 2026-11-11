@@ -57,7 +57,7 @@ Quiz (create/PATCH):
 - `title` required on create, 1-250 chars after trimming; `description` 0-250, default `""`.
 - `time_limit` 1-180 or null; `deadline` ISO-8601 or null. Both may be null while
   drafting. The future-deadline rule is checked at publish (D3), not at save.
-- `related_event`, `related_course`: integer pk or null; `type`: legacy metadata (default `arabic`).
+- `related_event`, `related_course`: integer pk or null; `type`: legacy metadata (default `arabic`). A newly set `related_course` must be a draft or published Arabic class (ASSESS-07, 400 otherwise); an unchanged legacy link is kept. It never restricts quiz eligibility.
 - `status`/`is_active`: echoing the current value is tolerated; a different value is 400.
 
 Question (create/PATCH), the D3 body without option IDs:

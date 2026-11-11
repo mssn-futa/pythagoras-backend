@@ -348,6 +348,22 @@ class AdminQuizWriteSerializer(RejectUnknownFieldsMixin, serializers.ModelSerial
             data = {key: value for key, value in data.items() if key not in self.ECHO_FIELDS}
         return super().to_internal_value(data)
 
+    def validate_related_course(self, value):
+        """A newly linked course must be a draft/published Arabic class (ASSESS-07).
+
+        An unchanged link (e.g. a legacy course on an existing quiz) is accepted
+        as stored so unrelated edits never fail. The link never restricts who
+        may take the quiz.
+        """
+        current = getattr(self.instance, 'related_course_id', None)
+        if value is None or value.pk == current:
+            return value
+        if value.kind != Course.Kind.ARABIC:
+            raise serializers.ValidationError('Select an Arabic class.')
+        if value.status == Course.Status.CLOSED:
+            raise serializers.ValidationError('This class is closed; select an open class.')
+        return value
+
     def create(self, validated_data):
         validated_data.setdefault('description', '')
         return super().create(validated_data)
