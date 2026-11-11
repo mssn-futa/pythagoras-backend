@@ -11,7 +11,9 @@ endpoints never read or change them.
 
 Lifecycle: class draft -> published -> closed (terminal); module draft <->
 published. A closed class is read-only (``ClassClosed``): no class edits,
-module writes or roster changes. Enrollment needs a published class.
+module writes or admin roster changes, and no new or renewed enrollment; a
+student may still withdraw their own enrollment. Enrollment needs a published
+class.
 
 Locks (lock order: class row, then enrollment/module rows, then resources):
 
@@ -36,7 +38,7 @@ from .errors import (
     AuthoringInvalid, ClassClosed, ClassNotPublished, ClassReferenced, InvalidTransition,
     UnpublishRequired,
 )
-from .lifecycle import server_now
+from .lifecycle import available_quizzes, server_now
 from .models import Course, Enrollment, LearningModule, ModuleResource, Quiz
 from .resources import visible_resource_ids
 
@@ -75,12 +77,14 @@ def has_active_enrollment(course, student):
 def class_quizzes(course_id, *, admin):
     """Quizzes linked to the class (``Quiz.related_course``), as ``{id,title,status}``.
 
-    Students see published/closed ones only (never drafts); the quiz's own
-    availability and eligibility rules still apply when they follow the link.
+    Admins see every linked quiz. Students see only the ones they can open now
+    (``lifecycle.available_quizzes``: published, deadline in the future, the
+    same rule as the student quiz list/detail); their own results stay
+    reachable through submission history.
     """
     queryset = Quiz.objects.filter(related_course_id=course_id)
     if not admin:
-        queryset = queryset.exclude(status=Quiz.Status.DRAFT)
+        queryset = available_quizzes(queryset)
     return [{'id': pk, 'title': title, 'status': status}
             for pk, title, status in queryset.order_by('pk').values_list('pk', 'title', 'status')]
 
@@ -222,11 +226,13 @@ def enroll(class_id, student):
         return enrollment, False, True
 
 
-def withdraw(class_id, student_id):
+def withdraw(class_id, student_id, *, allow_closed=False):
     """Withdraw; ``(enrollment, changed)``. Idempotent; the record is kept.
 
-    Raises ``Enrollment.DoesNotExist`` when the student was never enrolled and
-    ``ClassClosed`` for an active enrollment in a closed (read-only) class.
+    Raises ``Enrollment.DoesNotExist`` when the student was never enrolled.
+    ``allow_closed`` (a student's own withdrawal) withdraws normally from a
+    closed class; otherwise (admin roster) a closed class is read-only and an
+    active enrollment there raises ``ClassClosed``.
     """
     with transaction.atomic():
         course = share_lock_class(class_id)
@@ -235,7 +241,8 @@ def withdraw(class_id, student_id):
             raise Enrollment.DoesNotExist()
         if enrollment.status == Enrollment.Status.WITHDRAWN:
             return enrollment, False
-        _assert_open(course)
+        if not allow_closed:
+            _assert_open(course)
         enrollment.status = Enrollment.Status.WITHDRAWN
         enrollment.withdrawn_at = server_now()
         enrollment.save(update_fields=['status', 'withdrawn_at', 'updated_at'])

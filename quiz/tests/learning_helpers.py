@@ -83,12 +83,15 @@ class LearningAPITestMixin(QuizAPITestMixin):
         return page['results']
 
 
-def linked_quiz(title, course, status='published'):
-    """A quiz whose ``related_course`` is ``course`` (linked while a draft, as authoring does)."""
-    quiz, _ = make_quiz(title, active=False)
+def linked_quiz(title, course, status='published', *, deadline=None, published_now=None):
+    """A quiz whose ``related_course`` is ``course`` (linked while a draft, as authoring does).
+
+    ``deadline``/``published_now`` publish with a deadline that has already passed.
+    """
+    quiz, _ = make_quiz(title, active=False, deadline=deadline)
     Quiz.objects.filter(pk=quiz.pk).update(related_course=course)
     if status != 'draft':
-        lifecycle.publish_quiz(quiz.pk)
+        lifecycle.publish_quiz(quiz.pk, now=published_now)
     if status == 'closed':
         lifecycle.close_quiz(quiz.pk)
     quiz.refresh_from_db()

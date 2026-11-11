@@ -109,13 +109,27 @@ PAGE_PARAMS = [OpenApiParameter('page', int, description='1-based page number.')
 
 
 def paginated(request, view, queryset, serialize, message):
+    for name in ('page', 'page_size'):
+        query_param(request, name)
     paginator = StandardPagination()
     page = paginator.paginate_queryset(queryset, request, view=view)
     return success_response(paginator.get_paginated_response(serialize(page)).data, message)
 
 
+NUL_MESSAGE = 'Null characters are not allowed.'
+
+
+def query_param(request, name):
+    """A query parameter, or 400 on that field when it contains a NUL character
+    (PostgreSQL text cannot hold one; it would otherwise surface as a 500)."""
+    value = request.query_params.get(name)
+    if value is not None and '\x00' in value:
+        raise serializers.ValidationError({name: [NUL_MESSAGE]})
+    return value
+
+
 def status_param(request, values):
-    wanted = request.query_params.get('status')
+    wanted = query_param(request, 'status')
     if wanted is not None and wanted not in values:
         raise serializers.ValidationError({'status': [f'Select one of: {", ".join(values)}.']})
     return wanted
@@ -363,14 +377,13 @@ class OwnEnrollmentView(APIView):
             {**EXAMPLE_ENROLLMENT, 'status': 'withdrawn',
              'withdrawn_at': '2026-10-09T08:00:00Z'}, 'Withdrawn.'))],
         description='Withdraw (idempotent, 200 with the record; the record is kept for '
-                    're-enrollment). 404 if never enrolled. Withdrawing from a closed class is '
-                    '409 CLASS_CLOSED (a withdrawn record is still returned 200). Attempts '
-                    'already started keep their own expiry.')
+                    're-enrollment), also from a closed class. 404 if never enrolled. '
+                    'Attempts already started keep their own expiry.')
     def delete(self, request, class_id):
         self.student_class(class_id)
         with domain_errors():
             try:
-                enrollment, _ = learning.withdraw(class_id, request.user.pk)
+                enrollment, _ = learning.withdraw(class_id, request.user.pk, allow_closed=True)
             except Enrollment.DoesNotExist:
                 raise Http404() from None
         return success_response(StudentEnrollmentSerializer(enrollment).data, 'Withdrawn.')
@@ -398,7 +411,7 @@ class RosterView(APIView):
         wanted = status_param(request, Enrollment.Status.values)
         if wanted:
             queryset = queryset.filter(status=wanted)
-        search = (request.query_params.get('search') or '').strip()
+        search = (query_param(request, 'search') or '').strip()
         if search:
             queryset = queryset.filter(learning_search(search))
         return paginated(request, self, queryset.order_by('pk'),

@@ -11,7 +11,7 @@ Governing design: D3 "Arabic classes enrollment and modules"; frozen frontend co
 - `Course.kind`: `arabic` (release classes) or `general` (legacy/general academic). Every
   course that existed before `quiz.0008` is `general`, `draft`, with null timestamps; the class
   API never serves `general` rows (404), so legacy courses are not presented as Arabic classes.
-- Class lifecycle `draft -> published -> closed` (terminal). Closed is read-only.
+- Class lifecycle `draft -> published -> closed` (terminal). Closed is read-only, except that a student may still withdraw their own enrollment.
 - `Enrollment`: one row per (course, student); `status` `active|withdrawn`, `enrolled_at`
   (latest activation), `withdrawn_at` (set exactly while withdrawn). Re-enrollment reactivates
   the same row. Legacy rows: `active`, null timestamps. Course/student FKs are PROTECT.
@@ -35,7 +35,7 @@ All responses use the D0 envelope; lists are D0-paginated (`page`, `page_size` <
 | `/quiz/classes/{id}/publish/`, `/close/` | POST | admin | no body; repeat is 200 no-op; publish closed / close draft 409 `INVALID_TRANSITION` |
 | `/quiz/classes/{id}/enrollment/` | GET | student | own record or 404 |
 | `/quiz/classes/{id}/enrollment/` | POST | student | `{}`; 201 new, 200 same/reactivated record; closed 409 `CLASS_CLOSED`; draft 404 |
-| `/quiz/classes/{id}/enrollment/` | DELETE | student | 200 withdrawn record (idempotent); never enrolled 404; closed (active) 409 |
+| `/quiz/classes/{id}/enrollment/` | DELETE | student | 200 withdrawn record (idempotent, also in a closed class); never enrolled 404 |
 | `/quiz/classes/{id}/enrollments/` | GET | admin | roster; `search` (first/last/full name, email), `status` |
 | `/quiz/classes/{id}/enrollments/` | POST | admin | `{student_id, status?: active|withdrawn}`; 201 created else 200; draft 409 `CLASS_NOT_PUBLISHED`; closed 409 |
 | `/quiz/classes/{id}/modules/` | GET | active user | Admin: all (`status` filter). Student: published, gated (below) |
@@ -56,7 +56,10 @@ published resource and event, ready asset or valid YouTube ID), otherwise 400
 accepted even if hidden. `resources[]` (admin and student) holds only currently visible
 attachments, each exactly the anonymous `GET /dawah/resources/{id}/` payload; admins also get
 `resource_ids` (all, in order) and `hidden_resource_ids`. `quizzes[]` is `{id,title,status}`
-(students: published/closed only). No answer keys anywhere.
+(admins: every linked quiz; students: only quizzes they can open now, i.e. published with a
+future deadline, the same rule as the student quiz list). No answer keys anywhere.
+A query parameter containing a NUL character (`status`, `search`, `page`, `page_size`) is a
+400 on that field ("Null characters are not allowed.").
 
 Error codes: `CLASS_CLOSED`, `CLASS_NOT_PUBLISHED`, `ENROLLMENT_REQUIRED` (403),
 `UNPUBLISH_REQUIRED`, `INVALID_TRANSITION`, `RESOURCE_REFERENCED`, `VALIDATION_ERROR` (flat

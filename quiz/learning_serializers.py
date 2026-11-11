@@ -143,8 +143,9 @@ QUIZ_REF_SCHEMA = {
         'id': {'type': 'integer'}, 'title': {'type': 'string'},
         'status': {'type': 'string', 'enum': ['draft', 'published', 'closed']}},
         'required': ['id', 'title', 'status']},
-    'description': 'Quizzes linked to this class (`related_course`). Students see '
-                   'published/closed quizzes only. Metadata only: no questions or keys.',
+    'description': 'Quizzes linked to this class (`related_course`). Students see only '
+                   'quizzes they can open now (published, deadline in the future); admins see '
+                   'all. Metadata only: no questions or keys.',
 }
 
 

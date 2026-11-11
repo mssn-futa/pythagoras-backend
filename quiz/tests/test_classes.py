@@ -1,4 +1,6 @@
 """ASSESS-07 Arabic class, enrollment, roster and module API (PostgreSQL)."""
+from datetime import timedelta
+
 from django.db import transaction
 from django.db.models import ProtectedError
 from django.test import TestCase
@@ -308,13 +310,22 @@ class OwnEnrollmentTests(LearningAPITestMixin, TestCase):
         self.assertEnvelopeError(self.call(self.student, 'post', self.path, {}), 409,
                                  'CLASS_CLOSED')
         active = enroll(self.course, self.other_student)
-        # Idempotent replays still answer; changes are refused.
+        # An active record is returned unchanged by an enroll replay.
         self.assertEqual(self.data(self.call(self.other_student, 'post', self.path))['id'],
                          active.pk)
-        self.assertEnvelopeError(self.call(self.other_student, 'delete', self.path), 409,
+        # Withdrawing from a closed class works normally (lead decision) and is idempotent.
+        withdrawn_data = self.data(self.call(self.other_student, 'delete', self.path))
+        self.assertEqual((withdrawn_data['id'], withdrawn_data['status']),
+                         (active.pk, 'withdrawn'))
+        self.assertIsNotNone(withdrawn_data['withdrawn_at'])
+        self.assertEqual(self.data(self.call(self.other_student, 'delete', self.path)),
+                         withdrawn_data)
+        self.assertEqual(self.data(self.call(self.other_student, 'get', self.path)),
+                         withdrawn_data)
+        # Only (re-)enrolling into a closed class is refused.
+        self.assertEnvelopeError(self.call(self.other_student, 'post', self.path), 409,
                                  'CLASS_CLOSED')
-        self.assertEqual(self.data(self.call(self.other_student, 'get', self.path))['status'],
-                         'active')
+        self.assertEqual(Enrollment.objects.get(pk=active.pk).status, WITHDRAWN)
         withdrawn = enroll(self.course, self.add_student('w@example.test'), WITHDRAWN)
         self.assertEqual(self.data(self.call(withdrawn.student, 'delete', self.path))['status'],
                          'withdrawn')
@@ -370,6 +381,26 @@ class RosterTests(LearningAPITestMixin, TestCase):
                 body_json = self.assertEnvelopeError(self.post(body), 400, 'VALIDATION_ERROR')
                 self.assertIn(field, body_json['data']['fields'])
         self.assertFalse(Enrollment.objects.exists())
+
+    def test_null_characters_in_query_parameters_are_field_errors(self):
+        enroll(self.course, self.student)
+        module_path = f'/quiz/classes/{self.course.pk}/modules/'
+        for user, path, field in [
+            (self.admin, f'{self.path}?search=%00', 'search'),
+            (self.admin, f'{self.path}?search=ami%00na', 'search'),
+            (self.admin, f'{self.path}?status=active%00', 'status'),
+            (self.admin, f'{self.path}?page=%00', 'page'),
+            (self.admin, f'{self.path}?page_size=1%00', 'page_size'),
+            (self.admin, '/quiz/classes/?status=%00', 'status'),
+            (self.student, '/quiz/classes/?page=%00', 'page'),
+            (self.admin, f'{module_path}?status=draft%00', 'status'),
+            (self.student, f'{module_path}?page_size=%00', 'page_size'),
+        ]:
+            with self.subTest(path=path):
+                body = self.assertEnvelopeError(self.call(user, 'get', path), 400,
+                                                'VALIDATION_ERROR')
+                self.assertEqual(body['data']['fields'],
+                                 {field: ['Null characters are not allowed.']})
 
     def test_inactive_student_can_still_be_withdrawn(self):
         record = enroll(self.course, self.inactive_student)
@@ -633,9 +664,14 @@ class QuizLinkTests(LearningAPITestMixin, TestCase):
         published = linked_quiz('Week 1', course)
         draft = linked_quiz('Week 2', course, 'draft')
         closed = linked_quiz('Week 0', course, 'closed')
+        now = timezone.now()
+        past_deadline = linked_quiz('Week -1', course, deadline=now - timedelta(hours=1),
+                                    published_now=now - timedelta(days=1))
         make_quiz('Unrelated')
+        # Students: only quizzes they can open now (published, deadline ahead).
         for user, expected in [
-            (self.student, [published, closed]), (self.admin, [published, draft, closed])]:
+            (self.student, [published]),
+            (self.admin, [published, draft, closed, past_deadline])]:
             for path in (f'/quiz/classes/{course.pk}/modules/',
                          f'/quiz/classes/{course.pk}/modules/{module.pk}/'):
                 with self.subTest(user=user.email, path=path):
@@ -647,6 +683,12 @@ class QuizLinkTests(LearningAPITestMixin, TestCase):
                          for q in expected], key=lambda row: row['id']))
                     self.assertNoAnswerKeys(response)
                     self.assertNotIn('questions', str(item['quizzes']))
+        # Every quiz a student is shown opens for that student.
+        for quiz in (published,):
+            self.data(self.call(self.student, 'get', f'/quiz/quizzes/{quiz.pk}/'))
+        for quiz in (draft, closed, past_deadline):
+            self.assertEnvelopeError(self.call(self.student, 'get', f'/quiz/quizzes/{quiz.pk}/'),
+                                     404, 'NOT_FOUND')
 
     def test_quiz_related_course_validation(self):
         course = make_class()
