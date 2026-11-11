@@ -42,7 +42,7 @@ from django.utils import timezone
 from pythagoras.mail import InvalidMessage, OutboundEmail, SendResult, SendStatus, get_transport, idempotency_key
 
 from . import broadcasts
-from .models import OUTSTANDING_DELIVERY_STATES, Broadcast, Delivery, DeliveryAttempt, DeliveryState
+from .models import OUTSTANDING_DELIVERY_STATES, Broadcast, Delivery, DeliveryAttempt, DeliveryState, Event
 
 logger = logging.getLogger('dawah.outbox')
 # The command attaches a stderr handler; library use relies on the project's logging config.
@@ -176,11 +176,13 @@ def account_limiter():
 # ---------------------------------------------------------------- scheduler hook
 
 def scheduler_tick(now):
-    """Materialize due automation occurrences into queued broadcasts.
+    """Materialize due automation occurrences into queued broadcasts (COMM-06,
+    ``dawah.automations.tick``): unique rule/occurrence runs under row locks,
+    so repeated or concurrent passes create nothing twice. Returns the number
+    of broadcasts created."""
+    from . import automations  # automations imports this module lazily as well
 
-    COMM-06 implements this (rules/runs, unique occurrence keys, DB locks).
-    Until then it is a no-op returning the number materialized (0)."""
-    return 0
+    return automations.tick(now)
 
 
 # ---------------------------------------------------------------- request identity
@@ -455,7 +457,14 @@ class OutboxWorker:
         broadcast_id = Delivery.objects.filter(pk=claim.delivery_id).values_list('broadcast_id', flat=True).first()
         if broadcast_id is None:
             return 'lost'
+        from . import automations
+
+        reminder = automations.reminder_run_for_broadcast(broadcast_id)
         with transaction.atomic():
+            # Automated reminders: lock order event -> broadcast -> delivery, so a
+            # reschedule/unpublish either commits first (and is seen below) or waits.
+            event = (Event.objects.select_for_update().filter(pk=reminder.event_id).first()
+                     if reminder is not None else None)
             broadcast, delivery = _lock_pair(broadcast_id, claim.delivery_id)
             if delivery.state != DeliveryState.CLAIMED or delivery.lease_token != claim.token:
                 return 'lost'
@@ -467,6 +476,17 @@ class OutboxWorker:
                 self._log(logging.WARNING, 'outbox_claim_expired', delivery)
                 return 'expired'
             next_attempt = delivery.attempt_count + 1
+            stale = automations.stale_reminder_code(reminder, event, now) if reminder is not None else None
+            if stale:
+                # Never hand off an obsolete reminder, not even a same-key replay;
+                # keep possible earlier acceptance visible as uncertain.
+                code = automations.DELIVERY_CODES[stale]
+                state = DeliveryState.UNCERTAIN if _ambiguous_history(delivery) else DeliveryState.CANCELLED
+                self._attempt_row(delivery, next_attempt, now, DeliveryAttempt.Outcome.SKIPPED, code)
+                self._finish(broadcast, delivery, state, error_code=code)
+                automations.mark_run_cancelled(reminder.pk, stale)
+                self._log(logging.INFO, 'outbox_result', delivery, outcome=str(state), code=code)
+                return str(state)
             active = get_user_model().objects.filter(pk=delivery.student_id, is_active=True).exists()
             if not active:
                 # If an earlier same-key attempt may have been accepted, keep that

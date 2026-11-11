@@ -75,6 +75,9 @@ class Event(models.Model):
                               default=PublicationStatus.DRAFT)
     published_at = models.DateTimeField(blank=True, null=True,
                                         help_text='Time of the most recent publication.')
+    # COMM-06: incremented whenever start_time/end_time change (``services.update_event``);
+    # reminder occurrence keys include it, so a reschedule obsoletes pending reminders.
+    schedule_revision = models.PositiveIntegerField(default=1)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
                                    blank=True, null=True, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -555,3 +558,116 @@ class DeliveryAttempt(models.Model):
     class Meta:
         constraints = [models.UniqueConstraint(fields=['delivery', 'generation', 'attempt'],
                                                name='dawah_delivery_attempt_unique')]
+
+
+# ---------------------------------------------------------------- automation (D4, COMM-06)
+#
+# Rules start disabled. The outbox scheduler tick (``automations.tick``) turns
+# each due occurrence of an enabled rule into exactly one ``AutomationRun``
+# (unique per rule/occurrence_key) and, when there is content and an audience,
+# one ordinary queued ``Broadcast`` with its frozen recipient snapshot. Lock
+# order: rule, then event, then broadcast, then deliveries.
+
+AUTOMATION_CATEGORIES = ('dawah_night', 'usroh', 'special_lecture', 'jumuah')
+
+
+class AutomationKind(models.TextChoices):
+    WEEKLY_DIGEST = 'weekly_digest', 'Weekly summary'
+    EVENT_REMINDER = 'event_reminder', 'Event reminder'
+
+
+class AutomationRule(models.Model):
+    kind = models.CharField(max_length=16, choices=AutomationKind.choices)
+    enabled = models.BooleanField(default=False)
+    active_from = models.DateTimeField(
+        blank=True, null=True,
+        help_text='Occurrences scheduled before this (last enable or schedule change) are never materialized.')
+
+    audience_type = models.CharField(max_length=12, choices=AudienceType.choices, default=AudienceType.ALL)
+    audience_department = models.CharField(max_length=100, blank=True, default='')
+    audience_level = models.CharField(max_length=3, blank=True, default='')
+    categories = models.JSONField(default=list, blank=True,
+                                  help_text='Lower-case category tokens; empty (weekly only) means all four.')
+
+    timezone = models.CharField(max_length=64, default='Africa/Lagos')
+    weekday = models.PositiveSmallIntegerField(blank=True, null=True, help_text='Weekly: 0 = Monday.')
+    local_time = models.TimeField(blank=True, null=True, help_text='Weekly: local time of the occurrence.')
+    offset_minutes = models.PositiveIntegerField(blank=True, null=True,
+                                                 help_text='Reminder: minutes before the event start.')
+
+    subject = models.CharField(max_length=200)
+    body_format = models.CharField(max_length=8, choices=BodyFormat.choices, default=BodyFormat.PLAIN)
+    body = models.TextField(help_text='Plain template (rich: the generated text fallback).')
+    body_html = models.TextField(blank=True, null=True, help_text='Rich templates: canonical sanitized HTML.')
+
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True,
+                              related_name='+', help_text='Must be an active admin for new runs.')
+    version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['enabled', 'kind'], name='dawah_automation_enabled')]
+        constraints = [
+            models.CheckConstraint(
+                condition=(Q(kind=AutomationKind.WEEKLY_DIGEST, weekday__isnull=False, weekday__lte=6,
+                             local_time__isnull=False, offset_minutes__isnull=True)
+                           | Q(kind=AutomationKind.EVENT_REMINDER, weekday__isnull=True, local_time__isnull=True,
+                               offset_minutes__gte=1)),
+                name='dawah_automation_schedule_shape'),
+            models.CheckConstraint(
+                condition=(Q(audience_type=AudienceType.ALL, audience_department='', audience_level='')
+                           | (Q(audience_type=AudienceType.DEPARTMENT, audience_level='')
+                              & ~Q(audience_department=''))
+                           | Q(audience_type=AudienceType.LEVEL, audience_department='',
+                               audience_level__in=['100', '200', '300', '400', '500'])),
+                name='dawah_automation_audience_selector'),
+            models.CheckConstraint(
+                condition=(Q(body_format=BodyFormat.PLAIN, body_html__isnull=True)
+                           | (Q(body_format=BodyFormat.RICH, body_html__isnull=False) & ~Q(body_html=''))),
+                name='dawah_automation_body_format_html'),
+        ]
+
+    def __str__(self):
+        return f'{self.kind} rule {self.pk}'
+
+
+class AutomationRunState(models.TextChoices):
+    PENDING = 'pending', 'Pending'
+    QUEUED = 'queued', 'Queued (broadcast materialized)'
+    SKIPPED = 'skipped', 'Skipped'
+    MISSED = 'missed', 'Missed'
+    CANCELLED = 'cancelled', 'Cancelled'
+    BLOCKED = 'blocked', 'Blocked'
+    FAILED = 'failed', 'Failed'
+
+
+class AutomationRun(models.Model):
+    """One occurrence of a rule. ``state`` is stored for unmaterialized
+    outcomes; once a broadcast exists the API derives queued/processing/
+    completed/... from it (see ``automations.run_state``)."""
+    rule = models.ForeignKey(AutomationRule, on_delete=models.PROTECT, related_name='runs')
+    occurrence_key = models.CharField(max_length=200)
+    scheduled_at = models.DateTimeField()
+    state = models.CharField(max_length=12, choices=AutomationRunState.choices, default=AutomationRunState.PENDING)
+    reason_code = models.CharField(max_length=40, blank=True, default='')
+    broadcast = models.OneToOneField(Broadcast, on_delete=models.PROTECT, blank=True, null=True,
+                                     related_name='automation_run')
+    window_start = models.DateTimeField(blank=True, null=True)
+    window_end = models.DateTimeField(blank=True, null=True)
+    # Plain ids (no FK): run history must not block deleting an unpublished event.
+    event_id = models.BigIntegerField(blank=True, null=True)
+    event_revision = models.PositiveIntegerField(blank=True, null=True)
+    source = models.JSONField(default=dict, blank=True,
+                              help_text='Provenance snapshot: event ids/titles/categories/start times.')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['rule', 'occurrence_key'],
+                                               name='dawah_automation_run_unique_occurrence')]
+        indexes = [models.Index(fields=['rule', 'scheduled_at'], name='dawah_run_rule_scheduled'),
+                   models.Index(fields=['event_id', 'state'], name='dawah_run_event_state')]
+
+    def __str__(self):
+        return f'Run {self.occurrence_key} ({self.state})'

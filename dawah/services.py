@@ -11,7 +11,7 @@ from django.utils import timezone
 
 from pythagoras.utils import APIError
 
-from . import uploads
+from . import automations, uploads
 from .models import Event, EventResource, PublicationStatus, UploadIntent
 
 PUBLISHED = PublicationStatus.PUBLISHED
@@ -135,6 +135,7 @@ def unpublish_event(event_id):
             fields += uploads.IMAGE_POINTER_FIELDS
         event.status = UNPUBLISHED
         event.save(update_fields=fields)
+        automations.cancel_event_reminders(event, automations.SOURCE_UNPUBLISHED)
         uploads.cleanup_after_commit(cleanup_ids)
     return event
 
@@ -229,12 +230,22 @@ def apply_update(instance, validated_data, extra_fields=()):
 
 
 def update_event(event_id, serializer_factory):
-    """Validate against and update the locked current row."""
+    """Validate against and update the locked current row. A start/end change
+    increments ``schedule_revision`` and cancels obsolete unsent reminders
+    (COMM-06) in the same transaction, under the event lock."""
     with transaction.atomic():
         event = _lock_event(event_id)
         serializer = serializer_factory(event)
         serializer.is_valid(raise_exception=True)
-        apply_update(event, serializer.validated_data)
+        data = serializer.validated_data
+        rescheduled = any(name in data and data[name] != getattr(event, name) for name in ('start_time', 'end_time'))
+        extra = []
+        if rescheduled:
+            event.schedule_revision += 1
+            extra.append('schedule_revision')
+        apply_update(event, data, extra)
+        if rescheduled:
+            automations.cancel_event_reminders(event, automations.SOURCE_RESCHEDULED)
     return event
 
 
