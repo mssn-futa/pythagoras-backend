@@ -43,10 +43,10 @@ class AssessmentMigrationTests(TransactionTestCase):
 
     def legacy_fixture(self):
         apps = self.migrate(BEFORE)
-        # Accounts are at their latest schema (only quiz is rolled back), so
-        # users come from the current model and are linked to old rows by ID.
+        # Accounts and dawah are at their latest schema (only quiz is rolled
+        # back), so users and events come from the current models and are
+        # linked to old rows by ID.
         User = get_user_model()
-        Event = apps.get_model('dawah', 'Event')
         OldQuiz = apps.get_model('quiz', 'Quiz')
         OldQuestion = apps.get_model('quiz', 'Question')
         OldOption = apps.get_model('quiz', 'Option')
@@ -56,7 +56,7 @@ class AssessmentMigrationTests(TransactionTestCase):
         event = Event.objects.create(title='E', category='c', tags='t', speakers='s',
                                      location='l', start_time=SUBMITTED, end_time=SUBMITTED)
         active = OldQuiz.objects.create(title='Active', type='TEXT', description='d',
-                                        time_limit=30, is_active=True, related_event=event)
+                                        time_limit=30, is_active=True, related_event_id=event.pk)
         inactive = OldQuiz.objects.create(title='Inactive', type='arabic', description='d',
                                           time_limit=None, is_active=False)
         # Interleaved IDs: per-quiz numbering must follow ID order within each quiz.
