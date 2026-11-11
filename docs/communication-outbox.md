@@ -333,5 +333,11 @@ outcome/code/time). It never contains the request snapshot, subject or body.
   explicitly authorized broadcast.
 - **Schema changes to Delivery state:** stop the scheduled job (or let the
   current run finish), migrate, deploy, re-enable; leases make a killed run safe.
-- `scheduler_tick(now)` in `dawah/outbox.py` is the COMM-06 hook (automation
-  occurrence materialization); it is a no-op returning 0 until then.
+- `scheduler_tick(now)` in `dawah/outbox.py` runs first in every pass and
+  materializes due weekly digests/event reminders (COMM-06,
+  `docs/communication-automations.md`); `materialized` in the summary line is
+  the number of broadcasts it created. Before handing off a delivery of an
+  automated reminder, `prepare` locks the source event (event -> broadcast ->
+  delivery) and cancels the delivery (`SOURCE_UNPUBLISHED`,
+  `SOURCE_RESCHEDULED`, `EVENT_STARTED`) instead of sending; a delivery with
+  an earlier ambiguous same-key attempt becomes `uncertain` instead.

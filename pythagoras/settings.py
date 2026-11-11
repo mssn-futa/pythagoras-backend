@@ -279,6 +279,11 @@ OUTBOX_LEASE_SECONDS = 120
 OUTBOX_SHUTDOWN_MARGIN_SECONDS = 10
 if RESEND_TIMEOUT_SECONDS + OUTBOX_SHUTDOWN_MARGIN_SECONDS >= OUTBOX_LEASE_SECONDS:
     raise ImproperlyConfigured('RESEND_TIMEOUT_SECONDS must be below 110 (outbox lease 120 s minus 10 s margin).')
+# Automated reminders link to {FRONTEND_BASE_URL}/dawah/events/{id} (COMM-06,
+# docs/communication-automations.md); empty leaves {{event_url}} blank.
+FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', '').strip().rstrip('/')
+if FRONTEND_BASE_URL and not re.fullmatch(r'https?://[^\s/?#]+(/[^\s?#]*)?', FRONTEND_BASE_URL):
+    raise ImproperlyConfigured('FRONTEND_BASE_URL must be an absolute http(s) URL without query or fragment.')
 
 # Configuration interfaces only; DAWAH-02 owns the S3/R2 implementation.
 R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')

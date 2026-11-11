@@ -131,7 +131,8 @@ class AutomationApiTests(AutomationBase):
             'audience': {'type': 'level', 'level': '300'}, 'categories': ['JUMUAH', 'usroh'], 'offset_minutes': 120,
             'template': {'subject': 'Soon: {{event_title}}', 'body_format': 'plain', 'body': '{{event_url}}'},
             'version': 1}, format='json'))
-        self.assertEqual((data['version'], data['offset_minutes'], data['categories'], data['audience'], data['enabled']),
+        self.assertEqual((data['version'], data['offset_minutes'], data['categories'], data['audience'],
+                          data['enabled']),
                          (2, 120, ['jumuah', 'usroh'], {'type': 'level', 'level': '300'}, False))
         other = User.objects.create_user(email='other-admin@example.test', password=None, role='admin')
         data = self.data(self.client.patch(path, {'owner_id': other.pk, 'version': 2}, format='json'))
@@ -167,7 +168,8 @@ class AutomationApiTests(AutomationBase):
         event = make_event(status=PUBLISHED, start=timezone.now() - timedelta(days=1), category='Jumuah',
                            summary='Patience <script>alert(1)</script> & gratitude')
         make_resource(event, status=PUBLISHED, type='vid', youtube_video_id='dQw4w9WgXcQ', title='Recording')
-        rule_obj = rule(enabled=False, owner=self.admin, weekday=timezone.now().weekday())
+        tomorrow = (timezone.now().astimezone(automations.ZoneInfo('Africa/Lagos')) + timedelta(days=1)).weekday()
+        rule_obj = rule(enabled=False, owner=self.admin, weekday=tomorrow)  # window covers the last ~5 days
         self.as_admin()
         self.error(self.client.post(f'{A}{rule_obj.pk}/preview/', {'version': 2}, format='json'), 409,
                    'AUTOMATION_VERSION_CONFLICT')
@@ -215,7 +217,8 @@ class AutomationApiTests(AutomationBase):
         schema = draft4(SchemaGenerator().get_schema(public=True))
         rule_response = self.client.get(f'{A}{rule_obj.pk}/')
         preview = self.client.post(f'{A}{rule_obj.pk}/preview/', {'version': 1}, format='json')
-        for path, method, resp in ((f'{A}{{rule_id}}/runs/', 'get', response), (f'{A}{{rule_id}}/', 'get', rule_response),
+        for path, method, resp in ((f'{A}{{rule_id}}/runs/', 'get', response),
+                                   (f'{A}{{rule_id}}/', 'get', rule_response),
                                    (f'{A}{{rule_id}}/preview/', 'post', preview), (A, 'get', self.client.get(A))):
             with self.subTest(path=path):
                 content = schema['paths'][path][method]['responses']['200']['content']['application/json']
@@ -257,7 +260,8 @@ class WeeklyScheduleTests(AutomationBase):
         # Repeated ticks (restart, next Cron pass) return the existing run.
         self.assertEqual(automations.tick(MONDAY_8_LAGOS + timedelta(minutes=5)), 0)
         self.assertEqual(automations.tick(MONDAY_8_LAGOS + timedelta(hours=23)), 0)
-        self.assertEqual((AutomationRun.objects.count(), Broadcast.objects.count(), Delivery.objects.count()), (1, 1, 2))
+        self.assertEqual((AutomationRun.objects.count(), Broadcast.objects.count(), Delivery.objects.count()),
+                         (1, 1, 2))
 
     def test_lagos_local_day_differs_from_utc_day(self):
         # Monday 00:30 Lagos is Sunday 23:30Z.
@@ -457,7 +461,8 @@ class OutboxIntegrationTests(AutomationBase):
 
     def test_failed_and_uncertain_runs_are_visible(self):
         rule_obj, event = self.reminder_due_now()
-        self.worker(FakeTransport(SendResult.failed('VALIDATION_ERROR'), SendResult.failed('VALIDATION_ERROR'))).run_once()
+        failing = FakeTransport(SendResult.failed('VALIDATION_ERROR'), SendResult.failed('VALIDATION_ERROR'))
+        self.worker(failing).run_once()
         self.assertEqual(automations.run_state(runs(rule_obj)[0]), ('failed', 'provider_failure'))
 
     def test_tick_logs_ids_only(self):

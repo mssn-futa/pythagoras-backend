@@ -523,7 +523,8 @@ def cancel_event_reminders(event, reason):
     """Cancel obsolete reminder work for ``event``. The caller holds the event
     row lock (``services``). ``source_rescheduled`` cancels runs of older
     revisions; ``source_unpublished`` cancels all of the event's runs."""
-    runs = AutomationRun.objects.select_for_update().filter(
+    # of=self: never lock the joined rule rows (lock order is rule -> event).
+    runs = AutomationRun.objects.select_for_update(of=('self',)).filter(
         event_id=event.pk, rule__kind=AutomationKind.EVENT_REMINDER,
         state__in=[AutomationRunState.PENDING, AutomationRunState.QUEUED])
     if reason == SOURCE_RESCHEDULED:
