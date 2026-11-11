@@ -47,7 +47,7 @@ from quiz import authoring, lifecycle
 from quiz.errors import (
     AssessmentError, AuthoringInvalid, PublicationInvalid, QuizImmutable, is_immutable_db_error,
 )
-from quiz.models import Attempt, Course, Question, Quiz, Submission
+from quiz.models import Attempt, Course, Enrollment, LearningModule, Question, Quiz, Submission
 from quiz.permissions import (
     IsActiveAdmin, IsActiveStudent, IsActiveUser, admin_or_read_permissions, is_admin,
     visible_questions, visible_quizzes, visible_submissions,
@@ -74,10 +74,11 @@ def domain_errors():
     except AuthoringInvalid as exc:
         raise serializers.ValidationError(exc.fields or {'non_field_errors': [exc.message]})
     except AssessmentError as exc:
-        raise APIError(exc.code, exc.message, fields=exc.fields)
+        raise APIError(exc.code, exc.message, status_code=exc.status_code, fields=exc.fields)
     except InvalidAnswers as exc:
         raise serializers.ValidationError(exc.as_fields())
-    except (Quiz.DoesNotExist, Question.DoesNotExist, Attempt.DoesNotExist):
+    except (Quiz.DoesNotExist, Question.DoesNotExist, Attempt.DoesNotExist, Course.DoesNotExist,
+            LearningModule.DoesNotExist, Enrollment.DoesNotExist):
         raise Http404()
     except ProtectedError:
         raise APIError('RESOURCE_REFERENCED',

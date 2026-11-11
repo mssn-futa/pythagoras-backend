@@ -10,6 +10,7 @@ class AssessmentError(Exception):
     """Base for assessment state errors. ``code``/``message`` map to a D0 error."""
 
     code = 'CONFLICT'
+    status_code = 409
     default_message = 'This assessment operation is not allowed.'
 
     def __init__(self, message=None, *, fields=None):
@@ -81,6 +82,43 @@ class PublicationInvalid(AuthoringInvalid):
     """The quiz graph fails publication validation (400 VALIDATION_ERROR with ``fields``)."""
 
     default_message = 'This quiz cannot be published.'
+
+
+class ClassClosed(AssessmentError):
+    """A closed Arabic class is read-only: no edits, modules or roster changes."""
+
+    code = 'CLASS_CLOSED'
+    default_message = 'This class is closed and can no longer be changed.'
+
+
+class ClassNotPublished(AssessmentError):
+    """Enrollment needs a published class."""
+
+    code = 'CLASS_NOT_PUBLISHED'
+    default_message = 'This class is not open for enrollment yet.'
+
+
+class UnpublishRequired(AssessmentError):
+    """A published module must be unpublished before it is deleted."""
+
+    code = 'UNPUBLISH_REQUIRED'
+    default_message = 'Unpublish this module before deleting it.'
+
+
+class ClassReferenced(AssessmentError):
+    """A class with enrollments or quizzes cannot be deleted (history is protected)."""
+
+    code = 'RESOURCE_REFERENCED'
+    default_message = ('This class has enrollments or linked quizzes and cannot be deleted; '
+                       'close it instead.')
+
+
+class EnrollmentRequired(AssessmentError):
+    """Module access needs an active enrollment in the published class (403)."""
+
+    code = 'ENROLLMENT_REQUIRED'
+    status_code = 403
+    default_message = 'An active enrollment in this class is required to read its modules.'
 
 
 class InvalidAnswers(ValueError):
