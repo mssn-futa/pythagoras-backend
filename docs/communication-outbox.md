@@ -79,3 +79,139 @@ never raw provider errors, credentials, bodies or addresses).
 `broadcasts.derive_state`: uncertain wins, then outstanding work
 (`processing` once anything was dispatched, else `queued`), then
 `completed_with_errors` when any failed, else `completed`.
+
+## Worker (COMM-02)
+
+Code: `dawah/outbox.py` (worker, recovery, backlog), command
+`dawah/management/commands/dawah_outbox.py`, tests `dawah/tests/test_outbox.py`.
+
+```sh
+python manage.py dawah_outbox --once                      # production: one bounded pass, then exit
+python manage.py dawah_outbox --once --budget-seconds 240 --max-sends 100
+python manage.py dawah_outbox                             # continuous local/operator loop (poll 5 s)
+python manage.py dawah_outbox --status                    # backlog JSON; sends nothing
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--once` | off | Scheduler tick, lease recovery, bounded drain, release unused claims, exit 0. |
+| `--status` | off | Print backlog JSON (below) and exit. Mutually exclusive with `--once`. |
+| `--budget-seconds` | 240 | `--once` wall budget. No new handoff starts once the remaining budget is below `RESEND_TIMEOUT_SECONDS` + 10 s margin. |
+| `--max-sends` | none | Cap on handoffs in this run (request budget). |
+| `--batch-size` | 20 | Rows claimed per batch. |
+| `--poll-seconds` | 5 | Idle poll interval in continuous mode. |
+
+Each run prints one JSON summary on stdout
+(`{"mode","claimed","released","recovered","materialized","outcomes","stop_reason","elapsed_seconds"}`,
+`stop_reason` one of `drained`, `budget`, `max_sends`, `signal`). SIGTERM/SIGINT
+stop new claims, let the in-flight send finish (bounded by
+`RESEND_TIMEOUT_SECONDS`), release unused claims and exit 0. An unexpected error
+releases the batch's unused claims and exits non-zero; an in-flight `sending`
+row is then recovered by the next run as below.
+
+The Cloudflare job role is `outbox-once` (fixed argv
+`python manage.py dawah_outbox --once`, see the RELEASE-09 entrypoint); it
+needs the web role's mail settings (`RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`,
+`EMAIL_REPLY_TO`, `EMAIL_IDEMPOTENCY_NAMESPACE`, `RESEND_TIMEOUT_SECONDS`,
+`RESEND_REQUESTS_PER_SECOND`, `OUTBOX_REQUESTS_PER_SECOND`) plus
+`SECRET_KEY`/`DATABASE_URL`. Run exactly one worker per environment (the
+singleton job). Correctness does not depend on it: claims, leases and tokens
+make concurrent workers safe, but rate pacing is per process.
+
+### Per delivery
+
+1. **Claim** (one transaction): up to 20 due `queued` rows
+   (`next_attempt_at <= now`) with `FOR UPDATE SKIP LOCKED`, each gets a new
+   `lease_token` and `lease_expires_at = now + 120 s`, state `claimed`. Commit;
+   no lock is held afterwards. Unused claims of a batch have their leases
+   renewed after each send.
+2. **Prepare** (lock broadcast, then delivery): the token must match and the
+   lease must not have expired (an expired claim is requeued, never sent). The
+   recipient's `is_active` is rechecked: inactive becomes `skipped`
+   (`RECIPIENT_INACTIVE`), or `uncertain` if an earlier same-key attempt of this
+   generation may have been accepted. On the generation's first dispatch the
+   request is frozen: `request_snapshot` (`from`, one-element `to` =
+   `snapshot_email`, `subject`/`html`/`text` from the broadcast snapshot,
+   `reply_to`), `idempotency_key = idempotency_key('broadcast', id, 'generation',
+   n)`, `request_hash` (SHA-256 of key + canonical snapshot), `first_dispatch_at`
+   and `idempotency_deadline_at = first_dispatch_at + 23 h`. Later attempts
+   rebuild the message only from the stored snapshot after verifying its hash
+   (mismatch: `uncertain REQUEST_SNAPSHOT_MISMATCH`, nothing sent). A message that
+   cannot be formed (e.g. blank `DEFAULT_FROM_EMAIL`) is `failed INVALID_MESSAGE`
+   with `nonacceptance_known` (no handoff happened). Otherwise `attempt_count+1`,
+   state `sending`, lease renewed, an open `DeliveryAttempt` row; commit.
+3. **Send** through `pythagoras.mail.get_transport(timeout=RESEND_TIMEOUT_SECONDS)`
+   with no database lock held. A raising transport counts as
+   `uncertain TRANSPORT_EXCEPTION`.
+4. **Complete** (lock broadcast, then delivery): only if state is `sending` and
+   token/generation/attempt still match; otherwise the result is logged as
+   `outbox_stale_completion` (with status/code/provider ID) and nothing changes.
+   The attempt row is closed and `broadcasts.refresh_state` runs under the lock.
+
+| Transport result | Delivery outcome |
+| --- | --- |
+| `accepted` with ID | `sent`, `provider_email_id`, `sent_at` (provider acceptance, not inbox proof) |
+| `accepted` without ID | treated as `uncertain MALFORMED_SUCCESS` |
+| `failed` payload conflict (`INVALID_IDEMPOTENT_REQUEST`, memory `IDEMPOTENCY_PAYLOAD_MISMATCH`) | `failed IDEMPOTENCY_PAYLOAD_CONFLICT`, `nonacceptance_known=False`: investigate, never rotate the key |
+| `failed` other, no ambiguous prior attempt | `failed <code>`, `nonacceptance_known=True` (retry-eligible) |
+| `failed` other after an ambiguous prior attempt | `uncertain <code>` |
+| `retryable` (429, concurrent idempotent request) | `queued`, same key, `next_attempt_at = now + max(budget delay, Retry-After)`; when budget/window is spent: `failed` + `nonacceptance_known` if every attempt was a definite non-acceptance, else `uncertain` |
+| `uncertain` (timeout, connection, 5xx, 408, other 409, malformed) | `queued`, same key, after the budget delay; when budget/window is spent: `uncertain` |
+
+Budget: 3 handoffs per generation; delays 60 s after the first, 300 s after the
+second. A replay is only scheduled if it (plus one bounded send) still ends
+before `idempotency_deadline_at`. "Ambiguous prior attempt" means an attempt
+row of this generation that is not `retryable`/`skipped` (uncertain,
+interrupted, lease lost, open).
+
+### Recovery
+
+At the start of every pass (and every continuous poll):
+
+- `claimed` with an expired lease: back to `queued`, nothing was sent.
+- `sending` with an expired lease (crash/kill after `sending` was persisted):
+  the open attempt is closed `uncertain INTERRUPTED`; if budget remains and the
+  safety window still covers a bounded send, the row is requeued for an
+  immediate **same-request, same-key** replay (the provider deduplicates an
+  accepted original); otherwise it becomes `uncertain` (`INTERRUPTED`, or
+  `IDEMPOTENCY_WINDOW_EXPIRED` past the window).
+
+At prepare time a stored request whose window no longer covers a bounded send
+is never replayed: `uncertain IDEMPOTENCY_WINDOW_EXPIRED` after an ambiguous
+attempt, otherwise (only definite non-acceptances so far) `failed
+IDEMPOTENCY_WINDOW_EXPIRED` with `nonacceptance_known`.
+
+### Rate budget
+
+`RESEND_REQUESTS_PER_SECOND` (default 2) is the Resend account limit;
+`OUTBOX_REQUESTS_PER_SECOND` (default 1, must be > 0 and not above the account
+limit) is the outbox's process-wide pacing (one slot per interval, no bursts).
+The difference is headroom for welcome/transactional mail, which sends inline
+and is not paced. Anything that still hits the account limit gets 429 and
+backs off with Retry-After as above. Pacing waits count against the `--once`
+budget. Tune both with the Resend account's actual rate/quota.
+
+### Backlog and logs
+
+`--status` prints `counts` (per delivery state), `due`, `expired_leases`,
+`oldest_outstanding_age_seconds` (oldest unresolved delivery),
+`oldest_due_age_seconds` (oldest due-but-unsent row), `broadcasts_processing`,
+`broadcasts_uncertain`. Logger `dawah.outbox` (stderr when nothing else is
+configured) emits `outbox_sending`, `outbox_result`, `outbox_lease_recovered`,
+`outbox_claim_expired`, `outbox_claims_released`, `outbox_stale_completion` and
+`outbox_run` with ids, generation, attempt, state, safe code and provider email
+ID only; never addresses, subjects, bodies, request snapshots or credentials.
+
+### Operator procedures
+
+- **Failed (retry-eligible):** fix the cause (sender/domain/key/content), then
+  `POST /dawah/broadcasts/{id}/retry/` with the delivery ids; the next pass
+  sends generation n+1 with a new key.
+- **Uncertain / payload conflict:** never retried automatically or by the API.
+  Reconcile with the stored `provider_email_id`, `idempotency_key`,
+  `request_hash`, attempt rows and the Resend dashboard; resending is a separate,
+  explicitly authorized broadcast.
+- **Schema changes to Delivery state:** stop the scheduled job (or let the
+  current run finish), migrate, deploy, re-enable; leases make a killed run safe.
+- `scheduler_tick(now)` in `dawah/outbox.py` is the COMM-06 hook (automation
+  occurrence materialization); it is a no-op returning 0 until then.
