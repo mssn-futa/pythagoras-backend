@@ -193,7 +193,10 @@ other rules or the drain.
   `Event.schedule_revision` when `start_time`/`end_time` change and, under the
   event lock, cancels unsent deliveries (`queued`/`claimed`) of reminder runs
   for older revisions; `unpublish_event` does the same for all of the event's
-  reminder runs. The run becomes `cancelled` (`source_rescheduled` /
+  reminder runs. Republishing an unpublished event (`publish_event`) also
+  increments the revision, so a reminder cancelled before send can be
+  re-materialized (subject to grace and `superseded_after_handoff`). The run
+  becomes `cancelled` (`source_rescheduled` /
   `source_unpublished`) unless everything was already handed off (then its
   history stays). The next pass computes the new revision's occurrence (sent
   if still within grace, else `missed`).
@@ -232,8 +235,6 @@ held during provider I/O.
 
 - After provider handoff a cancelled reminder may still be delivered; the
   delivery stays `sent`/`uncertain` with its evidence.
-- An event unpublished and republished at the same revision does not get a
-  new reminder (its run stays `cancelled`).
 - Event time changes made outside `services.update_event` and the Django
   admin (shell, raw SQL) do not bump `schedule_revision`; the handoff recheck
   still blocks sending after the event starts or once unpublished.

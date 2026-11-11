@@ -649,3 +649,17 @@ class ReviewFixTests(AutomationBase):
                 self.assertEqual(len(frontend_base_url_check(None)), errors)
         with override_settings(DEBUG=True, FRONTEND_BASE_URL='http://localhost:5173'):
             self.assertEqual(frontend_base_url_check(None), [])
+
+    def test_republish_rematerializes_reminder_cancelled_before_send(self):
+        rule_obj, event = self.reminder_due_now()
+        automations.tick(timezone.now())
+        self.as_admin()
+        self.data(self.client.post(f'/dawah/events/{event.pk}/unpublish/'))
+        self.data(self.client.post(f'/dawah/events/{event.pk}/publish/'))
+        event.refresh_from_db()
+        self.assertEqual(event.schedule_revision, 2)
+        transport = FakeTransport()
+        self.worker(transport).run_once()
+        self.assertEqual(len(transport.calls), 2)  # sent once, from the new revision only
+        self.assertEqual([(r.occurrence_key.rsplit(':', 1)[1], r.state, r.reason_code) for r in runs(rule_obj)],
+                         [('rev-1', 'cancelled', 'source_unpublished'), ('rev-2', 'queued', '')])

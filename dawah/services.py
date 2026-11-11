@@ -101,6 +101,12 @@ def publish_event(event_id):
                 event.featured_image_public_key, event.featured_image_public_url = image[1], image[2]
                 fields += uploads.IMAGE_POINTER_FIELDS
                 attached.append(image[3])
+            if event.status == UNPUBLISHED:
+                # Republication is a new schedule source (COMM-06): reminders
+                # cancelled at unpublication can be re-materialized; ones
+                # already handed off are guarded by superseded_after_handoff.
+                event.schedule_revision += 1
+                fields.append('schedule_revision')
             event.status = PUBLISHED
             event.published_at = timezone.now()
             event.save(update_fields=fields)
