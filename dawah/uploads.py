@@ -516,41 +516,63 @@ def finalize_upload(upload_id, user):
 
     # Phase 2: provider I/O and validation, no row locks held.
     outcome = None  # ('ready', info) or ('rejected'|'failed', code, message)
+    derivative = None  # featured image: sanitized server-generated copy (key, ObjectInfo, cleanup row id)
     promotion = None  # featured image of a published event: (public key, url, cleanup row id)
     storage = get_storage()
     try:
-        outcome = _observe_and_validate(storage, snapshot, token)
-        if outcome[0] == 'ready' and snapshot.kind == Kind.IMAGE and Event.objects.filter(
-                pk=snapshot.event_id, status=PublicationStatus.PUBLISHED).exists():
-            # Promote before the pointer can change, so the visible image never
-            # points at a missing/unvalidated object.
-            try:
-                promotion = _copy_to_public(snapshot.validation_key, snapshot.validation_etag,
-                                            spec=SPECS[Kind.IMAGE], file_name=snapshot.file_name,
-                                            content_type=snapshot.content_type, event_id=snapshot.event_id)
-            except (ObjectNotFound, PreconditionFailed):
-                outcome = ('failed', 'VALIDATION_COPY_MISSING',
-                           'The validated copy is unavailable. Upload the file again.')
-    except _Retryable as exc:
-        _release_lease(snapshot.pk, token)
-        raise exc.error from None
-    except StorageError as exc:
-        _release_lease(snapshot.pk, token)
-        logger.warning('upload finalize provider failure',
-                       extra={'upload_id': snapshot.pk, 'error_code': exc.code})
-        raise media_upload_failed() from None
-    except Exception:  # noqa: BLE001 - e.g. temp disk full; never a 500 with details or a stuck lease
-        _release_lease(snapshot.pk, token)
-        logger.error('upload finalize internal failure',
-                     extra={'upload_id': snapshot.pk, 'error_code': 'FINALIZE_INTERNAL_ERROR'})
-        raise media_upload_failed() from None
+        try:
+            outcome = _observe_and_validate(storage, snapshot, token)
+            if outcome[0] == 'ready' and snapshot.kind == Kind.IMAGE:
+                # The raw upload is never attached or published: only the re-encoded,
+                # metadata-free derivative is.
+                derivative = _store_derivative(storage, snapshot, outcome[1].sanitized)
+                if Event.objects.filter(pk=snapshot.event_id, status=PublicationStatus.PUBLISHED).exists():
+                    # Promote before the pointer can change, so the visible image never
+                    # points at a missing/unvalidated object.
+                    try:
+                        promotion = _copy_to_public(derivative[0], derivative[1].etag,
+                                                    spec=SPECS[Kind.IMAGE], file_name=snapshot.file_name,
+                                                    content_type=snapshot.content_type, event_id=snapshot.event_id)
+                    except (ObjectNotFound, PreconditionFailed):
+                        outcome = ('failed', 'VALIDATION_COPY_MISSING',
+                                   'The validated copy is unavailable. Upload the file again.')
+        except _Retryable as exc:
+            _release_lease(snapshot.pk, token)
+            raise exc.error from None
+        except StorageError as exc:
+            _release_lease(snapshot.pk, token)
+            logger.warning('upload finalize provider failure',
+                           extra={'upload_id': snapshot.pk, 'error_code': exc.code})
+            raise media_upload_failed() from None
+        except Exception:  # noqa: BLE001 - e.g. temp disk full; never a 500 with details or a stuck lease
+            _release_lease(snapshot.pk, token)
+            logger.error('upload finalize internal failure',
+                         extra={'upload_id': snapshot.pk, 'error_code': 'FINALIZE_INTERNAL_ERROR'})
+            raise media_upload_failed() from None
 
-    # Phase 3: attach or reject atomically under the lock chain.
-    try:
-        return _complete(upload_id, user, token, snapshot, outcome, promotion)
+        # Phase 3: attach or reject atomically under the lock chain.
+        return _complete(upload_id, user, token, snapshot, outcome, promotion, derivative)
     finally:
+        # Server-made copies not attached above become eligible for cleanup (no-op once attached).
+        if derivative:
+            promotion_abandoned([derivative[2]], 'derivative_unused')
         if promotion:
-            promotion_abandoned([promotion[2]], 'promotion_unused')  # no-op once attached
+            promotion_abandoned([promotion[2]], 'promotion_unused')
+
+
+def _store_derivative(storage, intent, data):
+    """Write the sanitized image under a new server-only private key. Its cleanup
+    row is recorded first (with a grace period) and cancelled when attached."""
+    spec = SPECS[Kind.IMAGE]
+    key = f'media/{spec.prefix}/{_token()}{spec.extension(intent.content_type)}'
+    row = record_cleanup(PRIVATE, key, 'derivative_pending', event_id=intent.event_id, upload_id=intent.pk,
+                         not_before=timezone.now() + PROMOTION_GRACE)
+    try:
+        info = storage.put_object(key, data, content_type=intent.content_type)
+    except StorageError:
+        promotion_abandoned([row.pk], 'derivative_failed')
+        raise
+    return key, info, row.pk
 
 
 class _Retryable(Exception):
@@ -639,7 +661,7 @@ def _observe_and_validate(storage, intent, token):
     return ('ready', info)
 
 
-def _complete(upload_id, user, token, snapshot, outcome, promotion=None):
+def _complete(upload_id, user, token, snapshot, outcome, promotion=None, derivative=None):
     """Attach or reject under the lock chain, only while our lease is live."""
     cleanup_ids = []
     after_commit_error = None
@@ -682,7 +704,7 @@ def _complete(upload_id, user, token, snapshot, outcome, promotion=None):
                     _terminal(intent, Status.FAILED, *conflict)
                     kind = 'failed'
                 elif intent.kind == Kind.IMAGE:
-                    cleanup_ids += _attach_image(event, intent, promotion)
+                    cleanup_ids += _attach_image(event, intent, promotion, derivative)
                 else:
                     cleanup_ids += _attach(resource, intent, outcome[1])
             else:
@@ -756,21 +778,24 @@ def _attach(resource, intent, info):
     return cleanup_ids
 
 
-def _attach_image(event, intent, promotion):
-    """Make the validated image the event's featured image (locked rows).
+def _attach_image(event, intent, promotion, derivative):
+    """Make the sanitized derivative the event's featured image (locked rows).
 
-    For a published event ``promotion`` is the already-copied public object:
-    the pointer swaps to it and the previous public copy is retired (deleted
-    and purged after commit). Otherwise only the private asset changes."""
+    For a published event ``promotion`` is the already-copied public object
+    (of the derivative): the pointer swaps to it and the previous public copy
+    is retired (deleted and purged after commit). Otherwise only the private
+    asset changes. The raw validation copy is recorded for cleanup."""
+    key, info, derivative_row = derivative
     cleanup_ids = []
-    if event.featured_image_object_key and event.featured_image_object_key != intent.validation_key:
+    if event.featured_image_object_key and event.featured_image_object_key != key:
         cleanup_ids.append(record_cleanup(PRIVATE, event.featured_image_object_key, 'replaced',
                                           event_id=event.pk).pk)
     cleanup_ids.append(retire_event_image(event, 'replaced'))
-    event.featured_image_object_key = intent.validation_key
-    event.featured_image_etag = intent.validation_etag
+    event.featured_image_object_key = key
+    event.featured_image_etag = info.etag
     event.featured_image_content_type = intent.content_type
-    event.featured_image_size_bytes = intent.observed_size
+    event.featured_image_size_bytes = info.size
+    promotion_attached([derivative_row])
     event.featured_image_file_name = intent.file_name
     event.featured_image_uploaded_at = timezone.now()
     event.featured_image_storage_status = ImageStorageStatus.READY
@@ -780,6 +805,8 @@ def _attach_image(event, intent, promotion):
     event.save(update_fields=[*IMAGE_ASSET_FIELDS, *IMAGE_POINTER_FIELDS, 'updated_at'])
     _terminal(intent, Status.READY)
     cleanup_ids.append(record_cleanup(PRIVATE, intent.staging_key, 'staging_consumed', event_id=event.pk,
+                                      upload_id=intent.pk).pk)
+    cleanup_ids.append(record_cleanup(PRIVATE, intent.validation_key, 'image_sanitized', event_id=event.pk,
                                       upload_id=intent.pk).pk)
     return cleanup_ids
 

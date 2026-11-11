@@ -159,6 +159,14 @@ class S3ObjectStorage(ObjectStorage):
             raise StorageError('COPY_NOT_VISIBLE')
         return info
 
+    def put_object(self, key, data, *, content_type, bucket=PRIVATE):
+        self._call('put_object', Bucket=self._bucket(bucket), Key=key, Body=bytes(data), ContentType=content_type,
+                   ContentLength=len(data))
+        info = self.head(key, bucket=bucket)
+        if info is None:
+            raise StorageError('PUT_NOT_VISIBLE')
+        return info
+
     def open_stream(self, key, *, bucket=PRIVATE, byte_range=None, if_match=None):
         params = {'Bucket': self._bucket(bucket), 'Key': key}
         if if_match:

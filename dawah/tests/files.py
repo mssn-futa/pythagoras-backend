@@ -12,11 +12,13 @@ REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 OFFICE_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
 
-def pdf_bytes(pages=1, header=b'%PDF-1.4', xref_stream=False):
+def pdf_bytes(pages=1, header=b'%PDF-1.4', xref_stream=False, catalog_extra=b'', extra=()):
     """Minimal well-formed PDF with a correct cross-reference table/stream."""
     kids = ' '.join(f'{3 + i} 0 R' for i in range(pages))
-    objects = [b'<< /Type /Catalog /Pages 2 0 R >>', f'<< /Type /Pages /Kids [{kids}] /Count {pages} >>'.encode()]
+    objects = [b'<< /Type /Catalog /Pages 2 0 R' + catalog_extra + b' >>',
+               f'<< /Type /Pages /Kids [{kids}] /Count {pages} >>'.encode()]
     objects += [b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>'] * pages
+    objects += list(extra)
     out = header + b'\n%\xe2\xe3\xcf\xd3\n'
     offsets = []
     for number, body in enumerate(objects, start=1):
@@ -105,3 +107,59 @@ def jpeg_declaring(width, height):
     index = data.find(b'\xff\xc0')
     struct.pack_into('>HH', data, index + 5, height, width)
     return bytes(data)
+
+
+def object_stream(payload, filter_name=b'/FlateDecode'):
+    """A /Type /ObjStm object body holding ``payload`` (compressed like real writers do)."""
+    data = zlib.compress(payload) if filter_name == b'/FlateDecode' else payload
+    return (b'<< /Type /ObjStm /N 1 /First 4 /Filter %s /Length %d >>\nstream\n' % (filter_name, len(data))
+            + data + b'\nendstream')
+
+
+def jpeg_with_metadata(size=(60, 40), orientation=6):
+    """JPEG with GPS EXIF, an orientation tag, a comment and XMP; left half red, right half blue."""
+    from PIL import ExifTags
+    image = Image.new('RGB', size, (255, 0, 0))
+    image.paste((0, 0, 255), (size[0] // 2, 0, size[0], size[1]))
+    exif = Image.Exif()
+    exif[ExifTags.Base.Orientation] = orientation
+    exif[ExifTags.Base.Make] = 'SecretCam'
+    gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    gps[ExifTags.GPS.GPSLatitudeRef] = 'N'
+    gps[ExifTags.GPS.GPSLatitude] = (7.0, 18.0, 12.0)
+    gps[ExifTags.GPS.GPSLongitudeRef] = 'E'
+    gps[ExifTags.GPS.GPSLongitude] = (5.0, 8.0, 3.0)
+    buffer = io.BytesIO()
+    image.save(buffer, 'JPEG', exif=exif.tobytes(), comment=b'secret-comment',
+               xmp=b'<x:xmpmeta xmlns:x="adobe:ns:meta/">secret-xmp</x:xmpmeta>')
+    return buffer.getvalue()
+
+
+def png_with_metadata(icc=None):
+    from PIL import PngImagePlugin
+    info = PngImagePlugin.PngInfo()
+    info.add_text('Comment', 'secret-text')
+    info.add_itxt('Author', 'secret-itxt')
+    image = Image.new('RGB', (20, 10), (10, 200, 10))
+    exif = Image.Exif()
+    exif[0x010F] = 'SecretCam'
+    buffer = io.BytesIO()
+    options = {'icc_profile': icc} if icc else {}
+    image.save(buffer, 'PNG', pnginfo=info, exif=exif.tobytes(), **options)
+    return buffer.getvalue()
+
+
+def png_chunk_types(data):
+    types, position = [], 8
+    while position + 8 <= len(data):
+        length = struct.unpack('>I', data[position:position + 4])[0]
+        types.append(data[position + 4:position + 8])
+        position += 12 + length
+    return types
+
+
+def animated_png():
+    frames = [Image.new('RGB', (16, 16), color) for color in ((255, 0, 0), (0, 255, 0))]
+    buffer = io.BytesIO()
+    frames[0].save(buffer, 'PNG', save_all=True, append_images=frames[1:], duration=100)
+    return buffer.getvalue()

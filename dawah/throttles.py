@@ -16,3 +16,14 @@ class UploadIntentRateThrottle(SimpleRateThrottle):
         if not (request.user and request.user.is_authenticated):
             return None  # permissions reject anonymous callers first
         return self.cache_format % {'scope': self.scope, 'ident': request.user.pk}
+
+
+FINALIZE_RATE = '30/min'  # bounds concurrent validation work (decode/decompress memory) per admin
+
+
+class UploadFinalizeRateThrottle(UploadIntentRateThrottle):
+    """Per-admin limit on finalize calls (each may decode an image / walk an archive)."""
+    scope = 'dawah_finalize'
+
+    def get_rate(self):
+        return api_settings.DEFAULT_THROTTLE_RATES.get(self.scope, FINALIZE_RATE)

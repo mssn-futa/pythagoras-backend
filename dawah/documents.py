@@ -4,12 +4,14 @@ Both validators work on the seekable spooled copy of the immutable validated
 object (see :func:`dawah.media.spool_stream`), never on client-writable bytes.
 Nothing is executed, rendered or extracted to disk.
 
-PDF: byte-level structure sanity (no stream is decoded, so no Flate bomb):
+PDF: byte-level structure sanity (page content streams are never decoded):
 header ``%PDF-1.0``..``%PDF-2.0`` at offset 0, ``%%EOF`` near the end, a final
 ``startxref`` whose offset lies inside the file and points at a classic
 ``xref`` table (with a ``trailer`` naming ``/Root``) or a cross-reference
 stream object (``/Type /XRef`` with ``/Root``), and at least one indirect
-object.
+object. Active content (``/JavaScript``, ``/JS``, ``/Launch``,
+``/EmbeddedFile(s)``, ``/RichMedia``, also hex-escaped) is refused, including
+inside compressed object streams, which are inflated under a 64 MiB total cap.
 
 DOCX: a ZIP (OOXML) archive. The end-of-central-directory record is read
 first so the entry count is capped *before* the central directory is
@@ -91,10 +93,82 @@ def validate_pdf(fileobj, size):
             raise _invalid_pdf()
         if b'endobj' not in body and b'endobj' not in tail and not _has_endobj(fileobj):
             raise _invalid_pdf()
+        _scan_active_content(fileobj, size)
     except MediaRejected:
         raise
     except Exception:
         raise _invalid_pdf() from None
+
+
+# Names that make a viewer run script, launch programs, carry attachments or
+# rich media. /OpenAction and /AA only trigger such actions, so refusing the
+# actions themselves covers "open action with JavaScript".
+ACTIVE_NAMES = {b'JavaScript', b'JS', b'Launch', b'EmbeddedFile', b'EmbeddedFiles', b'RichMedia'}
+NAME_DELIMITERS = rb'\s/<>\[\]()%{}'
+PLAIN_ACTIVE = re.compile(rb'/(JavaScript|JS|Launch|EmbeddedFiles?|RichMedia)(?=[' + NAME_DELIMITERS + rb']|$)')
+ESCAPED_NAME = re.compile(rb'/[^' + NAME_DELIMITERS + rb']*#[0-9A-Fa-f]{2}[^' + NAME_DELIMITERS + rb']*')
+STREAM_START = re.compile(rb'(?<!end)stream\r?\n')
+OBJSTM_MAX_INFLATED = 64 * 1024 * 1024  # total, across all compressed object streams
+INFLATE_CHUNK = 64 * 1024
+
+
+def _active_content():
+    return MediaRejected('PDF_ACTIVE_CONTENT', 'PDFs with JavaScript, launch actions, embedded files or rich '
+                                               'media are not accepted. Export a plain PDF.')
+
+
+def _decode_name(raw):
+    return re.sub(rb'#([0-9A-Fa-f]{2})', lambda m: bytes([int(m.group(1), 16)]), raw[1:])
+
+
+def _check_names(data):
+    if PLAIN_ACTIVE.search(data):
+        raise _active_content()
+    for match in ESCAPED_NAME.finditer(data):
+        if _decode_name(match.group(0)) in ACTIVE_NAMES:
+            raise _active_content()
+
+
+def _scan_active_content(fileobj, size):
+    """Bounded scan for active-content names in the file and in its compressed
+    object streams (/Type /ObjStm, FlateDecode), inflated with a total cap.
+    Page content streams are not inflated: they cannot hold action dictionaries."""
+    fileobj.seek(0)
+    data = fileobj.read(size)  # at most DOCUMENT_MAX_BYTES (checked before validation)
+    _check_names(data)
+    budget = OBJSTM_MAX_INFLATED
+    for match in STREAM_START.finditer(data):
+        head = data[max(0, match.start() - 4096):match.start()]
+        dictionary = head[head.rfind(b'obj') + 3:] if b'obj' in head else head
+        if not re.search(rb'/Type\s*/ObjStm\b', dictionary):
+            continue
+        filters = re.search(rb'/Filter\s*(\[[^\]]*\]|/[A-Za-z0-9]+)', dictionary)
+        if not filters or filters.group(1).replace(b'[', b'').replace(b']', b'').split() != [b'/FlateDecode']:
+            raise _invalid_pdf()  # an object stream this scan cannot inspect
+        budget = _inflate_and_check(data, match.end(), budget)
+
+
+def _inflate_and_check(data, start, budget):
+    decompressor = zlib.decompressobj()
+    carry = b''
+    position = start
+    while position < len(data) and not decompressor.eof:
+        pending = data[position:position + INFLATE_CHUNK]
+        position += len(pending)
+        while pending and not decompressor.eof:
+            try:
+                out = decompressor.decompress(pending, budget + 1)
+            except zlib.error:
+                raise _invalid_pdf() from None
+            budget -= len(out)
+            if budget < 0:
+                raise _invalid_pdf()  # inflates beyond the scan cap: refuse rather than skip
+            _check_names(carry + out)
+            carry = out[-64:]
+            pending = decompressor.unconsumed_tail
+    if not decompressor.eof:
+        raise _invalid_pdf()
+    return budget
 
 
 def _has_endobj(fileobj):
@@ -114,9 +188,11 @@ def _has_endobj(fileobj):
 
 DOCX_MAX_ENTRIES = 1000
 DOCX_MAX_ENTRY_BYTES = 50 * 1024 * 1024       # uncompressed, per entry
-DOCX_MAX_TOTAL_BYTES = 100 * 1024 * 1024      # uncompressed, whole archive
+DOCX_MAX_TOTAL_BYTES = 60 * 1024 * 1024       # uncompressed, whole archive
 DOCX_MAX_RATIO = 100                           # uncompressed / compressed, per entry
 DOCX_RATIO_MIN_BYTES = 1024 * 1024             # tiny entries may compress arbitrarily well
+DOCX_MAX_TOTAL_RATIO = 50                      # uncompressed / compressed, whole archive
+DOCX_TOTAL_RATIO_MIN_BYTES = 4 * 1024 * 1024   # small documents may compress arbitrarily well
 DOCX_MAX_XML_BYTES = 4 * 1024 * 1024           # parsed XML parts ([Content_Types].xml, *.rels)
 DOCX_MAX_NAME_LENGTH = 512
 READ_CHUNK = 256 * 1024
@@ -235,6 +311,9 @@ def validate_docx(fileobj, size):
             if MACRO_NAMES.search(name):
                 raise MediaRejected('DOCX_MACROS_NOT_ALLOWED', 'Documents with macros or ActiveX content are not '
                                                                'accepted. Save it as a plain .docx file.')
+        compressed = sum(info.compress_size for info in infos)
+        if total > DOCX_TOTAL_RATIO_MIN_BYTES and total > DOCX_MAX_TOTAL_RATIO * max(compressed, 1):
+            raise _limits()
         if '[Content_Types].xml' not in names or 'word/document.xml' not in names:
             raise _invalid_docx()
 

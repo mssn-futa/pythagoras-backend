@@ -13,6 +13,7 @@ Never point it at production buckets.
 cases moto does not implement are skipped with a reason *only* then. Against
 R2 every assertion runs. An emulator run is not provider proof.
 """
+import io
 import os
 import secrets
 import unittest
@@ -20,6 +21,7 @@ import urllib.error
 import urllib.request
 
 from django.test import SimpleTestCase, TestCase
+from PIL import Image
 
 from dawah import storage as storage_module
 from dawah.models import EventResource, UploadIntent
@@ -166,7 +168,9 @@ class LiveDocumentAndImageFlowTests(DawahAPITestCase, TestCase):
         event = make_event(status=PUBLISHED)
         urls = []
         for size in ((40, 30), (80, 60)):
-            data = files.image_bytes('PNG', size=size)
+            data = files.png_with_metadata() if size == (40, 30) else files.image_bytes('PNG', size=size)
+            if size == (40, 30):
+                size = (20, 10)
             intent = self.data(self.client.post(f'/dawah/events/{event.pk}/featured-image/',
                                                 {'file_name': 'poster.png', 'content_type': 'image/png',
                                                  'size_bytes': len(data)}, format='json'), 201)
@@ -178,8 +182,11 @@ class LiveDocumentAndImageFlowTests(DawahAPITestCase, TestCase):
                             bucket=PRIVATE)
             url = finalized['event']['featured_image_url']
             status, body, headers = http('GET', url)
-            self.assertEqual((status, body, headers.get('Content-Type'), headers.get('Content-Disposition')),
-                             (200, data, 'image/png', 'inline; filename="poster.png"'))
+            self.assertEqual((status, headers.get('Content-Type'), headers.get('Content-Disposition')),
+                             (200, 'image/png', 'inline; filename="poster.png"'))
+            # The sanitized derivative (not the raw upload) was written server-side and published.
+            self.assertEqual(Image.open(io.BytesIO(body)).size, size)
+            self.assertNotIn(b'tEXt', body)
             urls.append(url)
         self.assertNotEqual(urls[0], urls[1])
         self.assertNotEqual(http('GET', urls[0])[0], 200)  # replaced copy deleted after the pointer swap

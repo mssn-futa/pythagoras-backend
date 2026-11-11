@@ -77,6 +77,11 @@ class InMemoryObjectStorage(ObjectStorage):
                     cache_control=cache_control)
         return self.head(dst_key, bucket=dst_bucket)
 
+    def put_object(self, key, data, *, content_type, bucket=PRIVATE):
+        self._record('put_object', key=key, bucket=bucket)
+        self._store(bucket, key, data, content_type)
+        return self.head(key, bucket=bucket)
+
     def open_stream(self, key, *, bucket=PRIVATE, byte_range=None, if_match=None):
         self._record('open_stream', key=key, bucket=bucket)
         info = self.objects[bucket].get(key)

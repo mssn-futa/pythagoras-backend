@@ -1,8 +1,10 @@
 """Real-lock races for featured images and documents (PostgreSQL, threads)."""
+import io
 import threading
 
 from django.db import connection
 from django.test import TransactionTestCase
+from PIL import Image
 
 from dawah import views  # noqa: F401, I001  (pre-existing shared-package import order)
 from dawah import services, uploads
@@ -62,8 +64,11 @@ class ImageRaceTests(FakeStorageMixin, TransactionTestCase):
         self.assertEqual(len(public_copies), 1)
         self.event.refresh_from_db()
         intent.refresh_from_db()
-        self.assertEqual(self.event.featured_image_object_key, intent.validation_key)
+        self.assertEqual(intent.status, 'ready')
+        self.assertTrue(self.event.featured_image_object_key.startswith('media/images/'))
         self.assertEqual(self.storage.keys(PUBLIC), {self.event.featured_image_public_key})
+        derivatives = [c for c in self.storage.calls if c[0] == 'put_object']
+        self.assertEqual(len(derivatives), 1)
 
     def test_racing_replacements_attach_only_the_newest(self):
         old_bytes, new_bytes = files.image_bytes('PNG', size=(10, 10)), files.image_bytes('PNG', size=(30, 20))
@@ -80,8 +85,8 @@ class ImageRaceTests(FakeStorageMixin, TransactionTestCase):
         self.assertEqual(outcome, {'status': 'failed', 'error_code': 'SUPERSEDED'})
         self.event.refresh_from_db()
         new.refresh_from_db()
-        self.assertEqual(self.event.featured_image_object_key, new.validation_key)
-        self.assertEqual(self.storage.public_get(self.event.featured_image_url)[1], new_bytes)
+        published = self.storage.public_get(self.event.featured_image_url)[1]
+        self.assertEqual(Image.open(io.BytesIO(published)).size, (30, 20))  # the newest image's derivative
         self.assertEqual(UploadIntent.objects.filter(event=self.event, status='ready').count(), 1)
         uploads.process_cleanup()
         self.assertEqual(self.storage.keys(PUBLIC), {self.event.featured_image_public_key})

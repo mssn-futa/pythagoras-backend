@@ -138,11 +138,19 @@ class ImageFinalizeTests(ImageTestCase):
         self.assertEqual((call['content_type'], call['disposition']), ('image/jpeg', 'inline'))
         self.event.refresh_from_db()
         stored = UploadIntent.objects.get(pk=intent['upload_id'])
-        self.assertEqual((self.event.featured_image_object_key, self.event.featured_image_public_key,
-                          self.event.featured_image_size_bytes, self.event.featured_image_content_type),
-                         (stored.validation_key, '', len(JPEG), 'image/jpeg'))
+        key = self.event.featured_image_object_key
+        derivative = self.storage.objects[PRIVATE][key]
+        # The attached object is the server-made derivative, not the raw upload.
+        self.assertTrue(key.startswith('media/images/') and key.endswith('.jpg'))
+        self.assertNotEqual(key, stored.validation_key)
+        self.assertEqual((self.event.featured_image_public_key, self.event.featured_image_size_bytes,
+                          self.event.featured_image_content_type, self.event.featured_image_etag),
+                         ('', len(derivative['data']), 'image/jpeg', derivative['etag']))
         self.assertEqual(self.storage.keys(PUBLIC), set())  # draft images stay private
         self.assertNotIn(stored.staging_key, self.storage.keys(PRIVATE))
+        self.assertNotIn(stored.validation_key, self.storage.keys(PRIVATE))  # raw copy cleaned up
+        self.assertEqual(StorageCleanup.objects.get(key=stored.validation_key).reason, 'image_sanitized')
+        self.assertEqual(StorageCleanup.objects.get(key=key).status, 'cancelled')
         # Replay returns the saved outcome.
         self.assertEqual(self.finalized(intent['upload_id'])['upload'], result['upload'])
 
@@ -173,12 +181,13 @@ class ImageFinalizeTests(ImageTestCase):
         self.ready()
         self.publish()
         url = self.event.featured_image_url
+        before = self.storage.public_get(url)[1]
         cache.clear()
         intent = self.upload(files.png_declaring(30000, 30000), name='bomb.png', content_type='image/png')
         self.assertEqual(self.finalized(intent['upload_id'])['upload']['error_code'], 'IMAGE_TOO_LARGE')
         self.event.refresh_from_db()
         self.assertEqual((self.event.featured_image_url, self.event.featured_image_storage_status), (url, 'ready'))
-        self.assertEqual(self.storage.public_get(url)[1], JPEG)
+        self.assertEqual(self.storage.public_get(url)[1], before)
 
     def test_expired_intent(self):
         intent = self.upload()
@@ -404,3 +413,60 @@ class FeaturedImageAltTests(ImageTestCase):
                              ('featured_image_storage_status', 'none'), ('featured_image_uploaded_at', None),
                              ('featured_image_alt', '')):
             self.assertEqual(data[field], value)
+
+
+class ImagePrivacyTests(ImageTestCase):
+    def test_published_bytes_have_no_exif_gps_and_orientation_is_applied(self):
+        import io
+
+        from PIL import ExifTags, Image
+        source = files.jpeg_with_metadata()
+        self.assertTrue(Image.open(io.BytesIO(source)).getexif().get_ifd(ExifTags.IFD.GPSInfo))
+        result = self.ready(source, name='phone.jpg')
+        # Even the admin preview object is the derivative.
+        self.assertNotIn(b'GPS', self.storage.objects['private'][self.event.featured_image_object_key]['data'])
+        self.publish()
+        status, body, headers = self.storage.public_get(self.event.featured_image_url)
+        self.assertEqual((status, headers['Content-Type']), (200, 'image/jpeg'))
+        for marker in (b'Exif\x00\x00', b'GPS', b'SecretCam', b'secret-comment', b'secret-xmp'):
+            self.assertNotIn(marker, body)
+        published = Image.open(io.BytesIO(body))
+        self.assertEqual(dict(published.getexif()), {})
+        self.assertEqual(published.size, (40, 60))  # orientation 6 applied
+        self.assertEqual(self.event.featured_image_size_bytes, len(body))
+        self.assertEqual(result['upload']['status'], 'ready')
+        # The raw upload (with GPS) is not kept anywhere once cleanup ran.
+        for bucket in ('private', 'public'):
+            for data in (o['data'] for o in self.storage.objects[bucket].values()):
+                self.assertNotIn(b'GPS', data)
+
+    def test_replacement_on_published_event_publishes_only_the_derivative(self):
+        self.publish()
+        self.ready(files.jpeg_with_metadata(), name='phone.jpg')
+        body = self.storage.public_get(self.event.featured_image_url)[1]
+        self.assertNotIn(b'GPS', body)
+        self.assertEqual(body, self.storage.objects['private'][self.event.featured_image_object_key]['data'])
+
+    def test_derivative_write_failure_is_retryable_and_recorded(self):
+        intent = self.upload()
+        self.storage.fail['put_object'] = StorageUnavailable('PROVIDER_UNAVAILABLE')
+        self.error(self.finalize(intent['upload_id']), 503, 'PROVIDER_UNAVAILABLE')
+        row = StorageCleanup.objects.get(reason='derivative_failed')
+        self.assertEqual((row.status, row.event_id), ('pending', self.event.pk))
+        del self.storage.fail['put_object']
+        self.assertEqual(self.finalized(intent['upload_id'])['upload']['status'], 'ready')
+
+
+class FinalizeThrottleTests(ImageTestCase):
+    def test_finalize_is_limited_per_admin(self):
+        intent = self.upload()
+        for _ in range(30):
+            self.assertEqual(self.finalize(intent['upload_id']).status_code, 200)
+        response = self.finalize(intent['upload_id'])
+        self.error(response, 429, 'THROTTLED')
+        self.assertIn('Retry-After', response)
+        from .helpers import User
+        other = User.objects.create_user(email='o2@example.test', password='Other-Pass-9876', first_name='O',
+                                         last_name='A', role='admin')
+        self.as_user(other)
+        self.error(self.finalize(intent['upload_id']), 404, 'NOT_FOUND')  # separate budget

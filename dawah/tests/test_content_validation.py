@@ -1,5 +1,6 @@
 """Bounded PDF / DOCX / image validators (no storage, no database)."""
 import io
+import random
 import zipfile
 from unittest import mock
 
@@ -96,7 +97,7 @@ class DocxValidationTests(SimpleTestCase):
         self.assertEqual(self.code(ratio), 'DOCX_LIMITS_EXCEEDED')
 
     def test_total_uncompressed_limit(self):
-        noise = bytes(range(256)) * 4096  # ~1 MiB, ratio well below the limit (stored)
+        noise = random.Random(7).randbytes(1024 * 1024)  # incompressible, ratio ~1
         entries = {f'word/media/n{i}.bin': noise for i in range(3)}
         data = files.docx_bytes(extra=entries)
         self.check(data)
@@ -213,7 +214,8 @@ class ImageValidationTests(SimpleTestCase):
             self.assertEqual(self.code(files.jpeg_declaring(10000, 10000), 'image/jpeg'), 'IMAGE_TOO_LARGE')
         self.assertLess(len(files.png_declaring(30000, 30000)), 200)
         # Just under the cap, with no pixel data: header passes, decoding fails safely.
-        self.assertEqual(self.code(files.png_declaring(5000, 5000)), 'INVALID_IMAGE')
+        self.assertEqual(self.code(files.png_declaring(4000, 3999)), 'INVALID_IMAGE')
+        self.assertEqual(self.code(files.png_declaring(4000, 4001)), 'IMAGE_TOO_LARGE')  # 16 MP cap
 
 
 class KindSpecTests(SimpleTestCase):
@@ -224,3 +226,122 @@ class KindSpecTests(SimpleTestCase):
         document = uploads.SPECS['document']
         self.assertEqual(document.file_name('../Agenda (v2).docx', DOCX_TYPE), 'Agenda-v2.docx')
         self.assertEqual(document.file_name('عربى.pdf', 'application/pdf'), 'document.pdf')
+
+
+class ImageSanitizationTests(SimpleTestCase):
+    """Featured images are published as a re-encoded, metadata-free derivative."""
+
+    def derivative(self, data, content_type):
+        from PIL import Image
+        info = images.validate_image(io.BytesIO(data), len(data), content_type)
+        return info, Image.open(io.BytesIO(info.sanitized))
+
+    def test_jpeg_gps_exif_comment_xmp_removed_and_orientation_applied(self):
+        from PIL import ExifTags, Image
+        source = files.jpeg_with_metadata()
+        original = Image.open(io.BytesIO(source))
+        self.assertTrue(original.getexif().get_ifd(ExifTags.IFD.GPSInfo))  # the fixture really has GPS
+        self.assertIn(b'secret-comment', source)
+        info, clean = self.derivative(source, 'image/jpeg')
+        for marker in (b'Exif\x00\x00', b'GPS', b'SecretCam', b'secret-comment', b'secret-xmp', b'xmpmeta'):
+            self.assertNotIn(marker, info.sanitized)
+        self.assertEqual(dict(clean.getexif()), {})
+        self.assertNotIn('comment', clean.info)
+        # Orientation 6 (rotate 90 CW): 60x40 becomes 40x60, red (left) ends up on top.
+        self.assertEqual((clean.size, (info.width, info.height)), ((40, 60), (40, 60)))
+        top, bottom = clean.convert('RGB').getpixel((20, 5)), clean.convert('RGB').getpixel((20, 55))
+        self.assertGreater(top[0], 200)
+        self.assertGreater(bottom[2], 200)
+        self.assertEqual(clean.format, 'JPEG')
+
+    def test_png_text_and_exif_chunks_removed_icc_kept(self):
+        from PIL import ImageCms
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
+        source = files.png_with_metadata(icc=icc)
+        self.assertTrue({b'tEXt', b'iTXt', b'eXIf'} <= set(files.png_chunk_types(source)))
+        info, clean = self.derivative(source, 'image/png')
+        chunks = set(files.png_chunk_types(info.sanitized))
+        self.assertFalse(chunks & {b'tEXt', b'iTXt', b'zTXt', b'eXIf', b'tIME'})
+        self.assertIn(b'iCCP', chunks)
+        self.assertEqual(clean.info.get('icc_profile'), icc)
+        self.assertNotIn(b'secret', info.sanitized)
+
+    def test_single_frame_and_palette_transparency(self):
+        info, clean = self.derivative(files.animated_png(), 'image/png')
+        self.assertEqual(getattr(clean, 'n_frames', 1), 1)
+        self.assertNotIn(b'acTL', info.sanitized)
+        from PIL import Image
+        buffer = io.BytesIO()
+        Image.new('P', (8, 8), 0).save(buffer, 'PNG', transparency=0)
+        info, clean = self.derivative(buffer.getvalue(), 'image/png')
+        self.assertEqual(clean.mode, 'RGBA')
+        self.assertEqual(clean.getpixel((0, 0))[3], 0)
+
+    def test_large_images_are_downscaled_jpeg_via_draft(self):
+        from PIL import JpegImagePlugin
+        source = files.image_bytes('JPEG', size=(4800, 3000))
+        with mock.patch.object(JpegImagePlugin.JpegImageFile, 'draft',
+                               autospec=True, side_effect=JpegImagePlugin.JpegImageFile.draft) as draft:
+            info, clean = self.derivative(source, 'image/jpeg')
+        self.assertTrue(draft.called)
+        self.assertEqual(clean.size, (4096, 2560))
+        info, clean = self.derivative(files.image_bytes('PNG', size=(5000, 1000)), 'image/png')
+        self.assertEqual(clean.size, (4096, 819))
+
+    def test_cmyk_jpeg_becomes_rgb(self):
+        from PIL import Image
+        buffer = io.BytesIO()
+        Image.new('CMYK', (10, 10), (0, 255, 255, 0)).save(buffer, 'JPEG')
+        info, clean = self.derivative(buffer.getvalue(), 'image/jpeg')
+        self.assertEqual(clean.mode, 'RGB')
+
+
+class PdfActiveContentTests(SimpleTestCase):
+    def code(self, data):
+        return rejected(self, documents.validate_pdf, io.BytesIO(data), len(data))
+
+    def test_active_content_is_refused(self):
+        js_action = b'<< /Type /Action /S /JavaScript /JS (app.alert(1)) >>'
+        cases = {
+            'open action js': files.pdf_bytes(catalog_extra=b' /OpenAction 4 0 R', extra=[js_action]),
+            'JS key only': files.pdf_bytes(extra=[b'<< /S /Foo /JS 5 0 R >>']),
+            'hex-escaped name': files.pdf_bytes(extra=[b'<< /S /J#61vaScript >>']),
+            'launch': files.pdf_bytes(extra=[b'<< /S /Launch /F (calc.exe) >>']),
+            'embedded files': files.pdf_bytes(catalog_extra=b' /Names << /EmbeddedFiles 4 0 R >>',
+                                             extra=[b'<< /Names [] >>']),
+            'embedded file stream': files.pdf_bytes(
+                extra=[b'<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream']),
+            'rich media': files.pdf_bytes(extra=[b'<< /Subtype /RichMedia >>']),
+            'inside object stream': files.pdf_bytes(extra=[files.object_stream(b'5 0 ' + js_action)]),
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.code(data), 'PDF_ACTIVE_CONTENT')
+
+    def test_clean_object_streams_and_lookalike_names_pass(self):
+        ok = files.pdf_bytes(extra=[files.object_stream(b'5 0 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'),
+                                    b'<< /JSON (not a key) /Launcher 1 /JavaScripts 2 >>'])
+        documents.validate_pdf(io.BytesIO(ok), len(ok))
+        goto = files.pdf_bytes(catalog_extra=b' /OpenAction [3 0 R /Fit]')
+        documents.validate_pdf(io.BytesIO(goto), len(goto))
+
+    def test_uninspectable_or_oversized_object_streams_are_invalid(self):
+        hex_stream = files.pdf_bytes(extra=[files.object_stream(b'5 0 << >>', filter_name=b'/ASCIIHexDecode')])
+        self.assertEqual(self.code(hex_stream), 'INVALID_PDF')
+        broken = files.pdf_bytes(
+            extra=[b'<< /Type /ObjStm /Filter /FlateDecode /Length 5 >>\nstream\nnope!\nendstream'])
+        self.assertEqual(self.code(broken), 'INVALID_PDF')
+        bomb = files.pdf_bytes(extra=[files.object_stream(b'5 0 ' + b' ' * (2 * 1024 * 1024))])
+        with mock.patch.object(documents, 'OBJSTM_MAX_INFLATED', 1024 * 1024):
+            self.assertEqual(self.code(bomb), 'INVALID_PDF')
+        documents.validate_pdf(io.BytesIO(bomb), len(bomb))
+
+
+class DocxAggregateLimitTests(SimpleTestCase):
+    def test_aggregate_ratio_limit(self):
+        # Each entry stays under the per-entry ratio threshold (1 MiB), the archive does not.
+        entries = {f'word/media/z{i}.bin': b'\x00' * (900 * 1024) for i in range(6)}
+        data = files.docx_bytes(extra=entries)
+        self.assertEqual(rejected(self, documents.validate_docx, io.BytesIO(data), len(data)),
+                         'DOCX_LIMITS_EXCEEDED')
+        self.assertEqual(documents.DOCX_MAX_TOTAL_BYTES, 60 * 1024 * 1024)

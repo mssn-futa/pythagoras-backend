@@ -19,7 +19,7 @@ from .serializers import (
     EventResourceWriteSerializer, EventSerializer, EventWriteSerializer, FinalizeResponseSerializer,
     ImageUploadIntentSerializer, UploadIntentResponseSerializer, upload_event_id, upload_state,
 )
-from .throttles import UploadIntentRateThrottle
+from .throttles import UploadFinalizeRateThrottle, UploadIntentRateThrottle
 
 
 def reader_is_admin(request):
@@ -440,6 +440,7 @@ FINALIZE_MESSAGES = {
 
 class UploadFinalizeView(AdminOnlyView):
     serializer_class = FinalizeResponseSerializer
+    throttle_classes = [UploadFinalizeRateThrottle]
 
     @extend_schema(
         operation_id='dawah_uploads_finalize',
@@ -453,7 +454,8 @@ class UploadFinalizeView(AdminOnlyView):
                     'null); featured-image uploads return `event` (and `resource` null). Retryable: 409 '
                     'UPLOAD_IN_PROGRESS (another validation holds the lease), UPLOAD_INCOMPLETE (no object yet), '
                     'UPLOAD_CHANGED (overwritten during copy), MEDIA_CHANGED (event published during image '
-                    'validation); 503 PROVIDER_UNAVAILABLE.',
+                    'validation); 429 THROTTLED (30/min per admin); 503 PROVIDER_UNAVAILABLE. Featured images are '
+                    'published as a sanitized re-encoded derivative (orientation applied, metadata removed).',
         examples=[OpenApiExample('Ready', response_only=True, value=examples.FINALIZE_READY),
                   OpenApiExample('Featured image ready', response_only=True, value=examples.FINALIZE_IMAGE_READY)],
     )
