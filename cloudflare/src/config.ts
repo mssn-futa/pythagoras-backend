@@ -7,7 +7,7 @@
  */
 
 /** Allow-list of container roles. Mirrors /app/docker-entrypoint.sh. `migrate` is deliberately absent. */
-export const ROLES = ['web', 'job-probe'] as const;
+export const ROLES = ['web', 'job-probe', 'outbox-once'] as const;
 export type Role = (typeof ROLES)[number];
 
 export function isAllowedRole(value: unknown): value is Role {
@@ -57,6 +57,29 @@ export const WEB_PLAIN_NAMES = [
 /** The job probe only needs the database. */
 export const JOB_PROBE_FORWARDED_NAMES = ['SECRET_KEY', 'DATABASE_URL'] as const;
 
+/**
+ * Bounded broadcast outbox pass (COMM-02): `manage.py dawah_outbox --once`.
+ * RELEASE-03 switches the Cron job from `job-probe` to this role.
+ */
+export const OUTBOX_ROLE = 'outbox-once' as const;
+
+/** The outbox pass needs the database, the Resend key and the mail/automation settings only. */
+export const OUTBOX_FORWARDED_NAMES = [
+  'SECRET_KEY',
+  'DATABASE_URL',
+  'RESEND_API_KEY',
+  'DEBUG',
+  'DEFAULT_FROM_EMAIL',
+  'EMAIL_REPLY_TO',
+  'EMAIL_IDEMPOTENCY_NAMESPACE',
+  'RESEND_TIMEOUT_SECONDS',
+  'RESEND_REQUESTS_PER_SECOND',
+  'OUTBOX_REQUESTS_PER_SECOND',
+  'AUTOMATION_TIMEZONE',
+  'AUTOMATION_CATCH_UP_DAYS',
+  'AUTOMATION_REMINDER_GRACE_SECONDS',
+] as const;
+
 export const WEB_PORT = 8000;
 /** Single named web instance for the proof; RELEASE-03 may widen this with getRandom(). */
 export const WEB_INSTANCE_NAME = 'web-primary';
@@ -89,13 +112,18 @@ export function containerEnvFor(role: Role, env: EnvLike): Record<string, string
   const names: readonly string[] =
     role === 'web'
       ? [...REQUIRED_SECRET_NAMES, ...OPTIONAL_WEB_SECRET_NAMES, ...WEB_PLAIN_NAMES]
-      : JOB_PROBE_FORWARDED_NAMES;
+      : role === OUTBOX_ROLE
+        ? OUTBOX_FORWARDED_NAMES
+        : JOB_PROBE_FORWARDED_NAMES;
   for (const name of names) {
     const value = str(env, name);
     if (value !== undefined) out[name] = value;
   }
   if (role === 'job-probe') {
     out.JOB_PROBE_BUDGET_SECONDS = String(JOB_BUDGET_SECONDS);
+  }
+  if (role === OUTBOX_ROLE) {
+    out.OUTBOX_BUDGET_SECONDS = String(JOB_BUDGET_SECONDS);
   }
   return out;
 }

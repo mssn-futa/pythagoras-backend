@@ -4,6 +4,8 @@
 # Roles (an allow-list; nothing else is ever executed):
 #   web        gunicorn serving pythagoras.wsgi on $PORT (default 8000)
 #   job-probe  bounded, harmless database probe (python -m pythagoras.job_probe)
+#   outbox-once  one bounded broadcast outbox pass (COMM-02):
+#              `manage.py dawah_outbox --once --budget-seconds $OUTBOX_BUDGET_SECONDS`
 #   migrate    OPERATOR ONLY: runs `manage.py migrate --noinput`; refuses unless
 #              PYTHAGORAS_ALLOW_MIGRATE=yes. No other role ever migrates.
 #
@@ -63,6 +65,16 @@ case "$role" in
     # The Python watchdog exits 124 at the budget; `timeout` is the outer backstop.
     exec timeout --kill-after=5 "$((budget + 10))" python -m pythagoras.job_probe
     ;;
+  outbox-once)
+    budget="${OUTBOX_BUDGET_SECONDS:-240}"
+    case "$budget" in ''|*[!0-9]*|0) fail "OUTBOX_BUDGET_SECONDS must be a positive integer" ;; esac
+    export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
+    echo "entrypoint: role=outbox-once budget_seconds=$budget"
+    # The command stops dispatching before the budget and exits; `timeout` is the
+    # outer backstop (SIGTERM first, which the command handles gracefully).
+    exec timeout --kill-after=10 "$((budget + 30))" \
+      python manage.py dawah_outbox --once --budget-seconds "$budget"
+    ;;
   migrate)
     if [ "${PYTHAGORAS_ALLOW_MIGRATE:-}" != "yes" ]; then
       fail "migrate role is operator-only; refusing without PYTHAGORAS_ALLOW_MIGRATE=yes" 78
@@ -71,6 +83,6 @@ case "$role" in
     exec python manage.py migrate --noinput
     ;;
   *)
-    fail "unknown role (allowed: web, job-probe, migrate)" 64
+    fail "unknown role (allowed: web, job-probe, outbox-once, migrate)" 64
     ;;
 esac
