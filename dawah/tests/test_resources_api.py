@@ -1,7 +1,12 @@
+from unittest import mock
+
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db.models import ProtectedError
 from django.test import TestCase
 
-from dawah.models import EventResource
+from dawah import services
+from dawah.models import Event, EventResource, StorageCleanup
+from quiz.models import Quiz
 
 from .helpers import DRAFT, PUBLISHED, UNPUBLISHED, DawahAPITestCase, make_event, make_resource
 
@@ -189,14 +194,16 @@ class ResourcePermissionTests(DawahAPITestCase, TestCase):
         resource = make_resource(event, status=PUBLISHED, ready=True, duration=2100)
         data = self.data(self.client.get(f'/dawah/resources/{resource.pk}/'))
         self.assertEqual(set(data), {'id', 'event_id', 'title', 'type', 'status', 'storage_status', 'duration',
-                                     'media_url', 'playback', 'content_type', 'size_bytes', 'uploaded_at',
-                                     'preview_url', 'published_at', 'created_at', 'updated_at',
+                                     'media_url', 'playback', 'content_type', 'size_bytes', 'file_name',
+                                     'uploaded_at', 'preview_url', 'published_at', 'created_at', 'updated_at',
                                      'created_by', 'legacy_file_present', 'event'})
+        self.assertEqual(data['file_name'], 'khutbah.mp3')
         self.assertIsNone(data['preview_url'])
         self.assertEqual(data['media_url'], resource.public_media_url)
         self.assertEqual(data['event'], {'id': event.pk, 'title': event.title, 'speakers': event.speakers,
                                          'category': event.category, 'start_time': '2026-10-09T12:00:00Z',
-                                         'summary': event.summary})
+                                         'summary': event.summary, 'featured_image_url': None,
+                                         'featured_image_alt': ''})
         self.assertNotIn('file', data)
 
 
@@ -253,3 +260,62 @@ class ResourcePublicationTests(DawahAPITestCase, TestCase):
         self.error(self.unpublish(resource), 409, 'INVALID_STATE_TRANSITION')
         other = make_event(status=PUBLISHED)
         self.error(self.client.post(f'{resource_url(other.pk, resource.pk)}publish/'), 404, 'NOT_FOUND')
+
+
+class ResourceReferenceTests(DawahAPITestCase, TestCase):
+    """Resources referenced by other domains (ASSESS-07 quiz.ModuleResource, PROTECT) are not deleted."""
+
+    def setUp(self):
+        super().setUp()
+        self.event = make_event()
+        self.resource = make_resource(self.event, ready=True)
+        self.referrer = Quiz.objects.create(title='Module quiz', type='event', description='d', time_limit=10)
+        self.as_admin()
+
+    def protected(self):
+        return ProtectedError('protected', {self.referrer})
+
+    def test_protected_resource_delete_is_resource_referenced(self):
+        url = f'/dawah/events/{self.event.pk}/resources/{self.resource.pk}/'
+        with mock.patch.object(EventResource, 'delete', side_effect=self.protected()):
+            data = self.error(self.client.delete(url), 409, 'RESOURCE_REFERENCED')
+        self.assertEqual(data['fields'], {'references': {'quiz.quiz': [self.referrer.pk]}})
+        self.assertTrue(EventResource.objects.filter(pk=self.resource.pk).exists())
+        self.assertFalse(StorageCleanup.objects.exists())  # nothing recorded for a refused delete
+        self.assertIn(self.resource.private_object_key, self.storage.keys('private'))
+        self.assertEqual(self.client.delete(url).status_code, 204)
+
+    def test_generic_precheck_reports_reverse_relations(self):
+        url = f'/dawah/events/{self.event.pk}/resources/{self.resource.pk}/'
+        with mock.patch('dawah.services.resource_references', return_value={'quiz.moduleresource': [4, 7]}):
+            data = self.error(self.client.delete(url), 409, 'RESOURCE_REFERENCED')
+            self.assertEqual(data['fields'], {'references': {'quiz.moduleresource': [4, 7]}})
+            # Event deletion cascades into resources, so it reports their references too.
+            data = self.error(self.client.delete(f'/dawah/events/{self.event.pk}/'), 409, 'RESOURCE_REFERENCED')
+            self.assertEqual(data['fields'], {'references': {'quiz.moduleresource': [4, 7]}})
+        self.assertEqual(services.resource_references(self.resource), {})  # intents are not references
+
+    def test_event_delete_reports_protecting_rows_of_its_resources(self):
+
+        with mock.patch.object(Event, 'delete', side_effect=self.protected()):
+            data = self.error(self.client.delete(f'/dawah/events/{self.event.pk}/'), 409, 'RESOURCE_REFERENCED')
+        self.assertEqual(data['fields'], {'references': {'quiz.quiz': [self.referrer.pk]}})
+        self.assertTrue(EventResource.objects.filter(pk=self.resource.pk).exists())
+
+
+class EventResourceReferenceScanTests(DawahAPITestCase, TestCase):
+    """event_references includes incoming references to the event's resources (generic scan)."""
+
+    def test_event_references_merge_resource_references(self):
+        event = make_event()
+        first, second = make_resource(event), make_resource(event)
+        quiz = Quiz.objects.create(title='Q', type='event', description='d', related_event=event, time_limit=10)
+        fake = {first.pk: {'quiz.moduleresource': [9, 3]}, second.pk: {'quiz.moduleresource': [3, 5]}}
+        with mock.patch('dawah.services.resource_references', side_effect=lambda r: fake.get(r.pk, {})):
+            self.assertEqual(services.event_references(event),
+                             {'quiz.quiz': [quiz.pk], 'quiz.moduleresource': [3, 5, 9]})
+            self.as_admin()
+            data = self.error(self.client.delete(f'/dawah/events/{event.pk}/'), 409, 'RESOURCE_REFERENCED')
+        self.assertEqual(data['fields']['references']['quiz.moduleresource'], [3, 5, 9])
+        self.assertNotIn('quiz', self.client.delete(f'/dawah/events/{event.pk}/').json()['message'].lower())
+        self.assertEqual(EventResource.objects.filter(event=event).count(), 2)

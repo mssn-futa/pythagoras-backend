@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from django.db import connection
+from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 
@@ -104,3 +104,53 @@ class DurableAudioMigrationTests(TransactionTestCase):
 
         back = self.migrate(AFTER)
         self.assertEqual(back.get_model('dawah', 'EventResource').objects.count(), 3)
+
+
+class DocumentsAndImagesMigrationTests(TransactionTestCase):
+    """0006 adds featured-image/document metadata without publishing legacy assets."""
+
+    migrate = PublicationStateMigrationTests.migrate
+    BEFORE = [('dawah', '0005_youtube_video_reference')]
+    AFTER = [('dawah', '0006_event_documents_and_featured_images')]
+
+    def tearDown(self):
+        self.migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_legacy_images_and_audio_intents_survive_without_becoming_visible(self):
+        old = self.migrate(self.BEFORE)
+        Event = old.get_model('dawah', 'Event')
+        EventResource = old.get_model('dawah', 'EventResource')
+        UploadIntent = old.get_model('dawah', 'UploadIntent')
+        start = datetime(2026, 1, 9, 12, tzinfo=UTC)
+        event = Event.objects.create(title='Legacy', category='c', speakers='s', location='l', start_time=start,
+                                     end_time=start, status='published', featured_image='events/old.png')
+        doc = EventResource.objects.create(event=event, title='Doc', type='doc', file='event_resources/a.pdf')
+        audio = EventResource.objects.create(event=event, title='Audio', type='aud')
+        intent = UploadIntent.objects.create(resource=audio, kind='audio', staging_key='staging/audio/k',
+                                             validation_key='media/audio/k.mp3', file_name='k.mp3',
+                                             content_type='audio/mpeg', size_bytes=10, expires_at=start)
+
+        new = self.migrate(self.AFTER)
+        migrated = new.get_model('dawah', 'Event').objects.get(pk=event.pk)
+        self.assertEqual((migrated.featured_image.name, migrated.featured_image_storage_status,
+                          migrated.featured_image_object_key, migrated.featured_image_public_url,
+                          migrated.featured_image_alt), ('events/old.png', 'none', '', '', ''))
+        migrated_doc = new.get_model('dawah', 'EventResource').objects.get(pk=doc.pk)
+        self.assertEqual((migrated_doc.file.name, migrated_doc.storage_status, migrated_doc.status,
+                          migrated_doc.public_media_url), ('event_resources/a.pdf', 'none', 'draft', ''))
+        kept = new.get_model('dawah', 'UploadIntent').objects.get(pk=intent.pk)
+        self.assertEqual((kept.kind, kept.resource_id, kept.event_id), ('audio', audio.pk, None))
+
+        Intent = new.get_model('dawah', 'UploadIntent')
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Intent.objects.create(kind='image', resource_id=audio.pk, staging_key='s2', validation_key='v2',
+                                  file_name='a.png', content_type='image/png', size_bytes=1, expires_at=start)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Intent.objects.create(kind='document', staging_key='s3', validation_key='v3', file_name='a.pdf',
+                                  content_type='application/pdf', size_bytes=1, expires_at=start)
+
+        back = self.migrate(self.BEFORE)
+        self.assertEqual(back.get_model('dawah', 'Event').objects.get(pk=event.pk).featured_image.name,
+                         'events/old.png')
+        self.assertEqual(back.get_model('dawah', 'UploadIntent').objects.count(), 1)

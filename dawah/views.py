@@ -13,14 +13,13 @@ from accounts.permissions import IsActiveAdmin
 from pythagoras.utils import success_response
 
 from . import examples, filters, services, uploads
-from .media import MP3_CONTENT_TYPE, MP3_MAX_BYTES
-from .models import Event, EventResource, PublicationStatus
+from .models import Event, EventResource, PublicationStatus, UploadIntent
 from .serializers import (
-    AudioUploadIntentSerializer, EventDetailSerializer, EventResourceSerializer, EventResourceWriteSerializer,
-    EventSerializer, EventWriteSerializer, FinalizeResponseSerializer, UploadIntentResponseSerializer,
-    upload_state,
+    AudioUploadIntentSerializer, DocumentUploadIntentSerializer, EventDetailSerializer, EventResourceSerializer,
+    EventResourceWriteSerializer, EventSerializer, EventWriteSerializer, FinalizeResponseSerializer,
+    ImageUploadIntentSerializer, UploadIntentResponseSerializer, upload_event_id, upload_state,
 )
-from .throttles import UploadIntentRateThrottle
+from .throttles import UploadFinalizeRateThrottle, UploadIntentRateThrottle
 
 
 def reader_is_admin(request):
@@ -294,7 +293,9 @@ class ResourceDetailView(DawahView):
     @extend_schema(operation_id='dawah_resources_retrieve', responses={200: EventResourceSerializer},
                    description='Stable public detail link: visible resource with parent event metadata.',
                    examples=[OpenApiExample('Ready published audio', response_only=True,
-                                            value=examples.RESOURCE_PUBLISHED)])
+                                            value=examples.RESOURCE_PUBLISHED),
+                             OpenApiExample('Ready published document', response_only=True,
+                                            value=examples.RESOURCE_DOCUMENT)])
     def get(self, request, resource_id):
         queryset = EventResource.objects.select_related('event')
         if not reader_is_admin(request):
@@ -334,6 +335,21 @@ class AdminOnlyView(DawahView):
         return [IsActiveAdmin()]
 
 
+def intent_response(intent, upload_url):
+    data = {
+        'upload_id': intent.pk, 'resource_id': intent.resource_id, 'event_id': upload_event_id(intent),
+        'method': 'PUT', 'upload_url': upload_url, 'headers': {'Content-Type': intent.content_type},
+        'expires_at': upload_state(intent)['expires_at'], 'max_size_bytes': uploads.SPECS[intent.kind].max_bytes,
+    }
+    return success_response(data, 'Upload ready. Send the file to upload_url, then finalize.', status=201)
+
+
+INTENT_PROTOCOL = ('Returns a short-lived signed PUT URL on the R2 S3 API host: PUT the bytes with exactly the '
+                   'returned `headers` and **no** Authorization header or cookies, then call finalize. A new '
+                   'intent replaces earlier unfinished intents of the same target. ')
+INTENT_LIMIT = '429 THROTTLED (5/min per admin, shared by all upload kinds); 503 PROVIDER_UNAVAILABLE.'
+
+
 class AudioUploadIntentView(AdminOnlyView):
     serializer_class = AudioUploadIntentSerializer
     throttle_classes = [UploadIntentRateThrottle]
@@ -343,11 +359,8 @@ class AudioUploadIntentView(AdminOnlyView):
         request=AudioUploadIntentSerializer,
         responses={201: UploadIntentResponseSerializer},
         description='Admin: request a direct-to-storage upload for an audio resource (metadata only, no bytes). '
-                    'Only `audio/mpeg`, `.mp3`, 1 byte to 100 MiB. Returns a short-lived signed PUT URL on the '
-                    'R2 S3 API host: PUT the bytes with exactly the returned `headers` and **no** Authorization '
-                    'header or cookies, then call finalize. A new intent replaces earlier unfinished intents of '
-                    'the resource. 409 RESOURCE_TYPE_MISMATCH, UNPUBLISH_REQUIRED (published resource); '
-                    '429 THROTTLED (5/min per admin); 503 PROVIDER_UNAVAILABLE.',
+                    'Only `audio/mpeg`, `.mp3`, 1 byte to 100 MiB. ' + INTENT_PROTOCOL
+                    + '409 RESOURCE_TYPE_MISMATCH, UNPUBLISH_REQUIRED (published resource); ' + INTENT_LIMIT,
         examples=[OpenApiExample('Intent', request_only=True, value=examples.UPLOAD_INTENT_REQUEST),
                   OpenApiExample('Issued', response_only=True, status_codes=['201'],
                                  value=examples.UPLOAD_INTENT_RESPONSE)],
@@ -358,16 +371,67 @@ class AudioUploadIntentView(AdminOnlyView):
         serializer.is_valid(raise_exception=True)
         intent, upload_url = uploads.create_audio_intent(event_id, resource_id, serializer.validated_data,
                                                          request.user)
-        data = {
-            'upload_id': intent.pk, 'resource_id': intent.resource_id, 'method': 'PUT',
-            'upload_url': upload_url, 'headers': {'Content-Type': MP3_CONTENT_TYPE},
-            'expires_at': upload_state(intent)['expires_at'], 'max_size_bytes': MP3_MAX_BYTES,
-        }
-        return success_response(data, 'Upload ready. Send the file to upload_url, then finalize.', status=201)
+        return intent_response(intent, upload_url)
 
 
+class DocumentUploadIntentView(AdminOnlyView):
+    serializer_class = DocumentUploadIntentSerializer
+    throttle_classes = [UploadIntentRateThrottle]
+
+    @extend_schema(
+        operation_id='dawah_event_resources_document_intent',
+        request=DocumentUploadIntentSerializer,
+        responses={201: UploadIntentResponseSerializer},
+        description='Admin: request a direct-to-storage upload for a document (`doc`) resource. Only PDF '
+                    '(`application/pdf`, `.pdf`) or DOCX (`application/vnd.openxmlformats-officedocument.'
+                    'wordprocessingml.document`, `.docx`), 1 byte to 20 MiB. ' + INTENT_PROTOCOL
+                    + 'Finalize validates the PDF structure / DOCX archive (entry, size and compression-ratio '
+                      'limits; macros, ActiveX and external content refused). 409 RESOURCE_TYPE_MISMATCH, '
+                      'UNPUBLISH_REQUIRED (a published document cannot be replaced); ' + INTENT_LIMIT,
+        examples=[OpenApiExample('Intent', request_only=True, value=examples.DOCUMENT_INTENT_REQUEST),
+                  OpenApiExample('Issued', response_only=True, status_codes=['201'],
+                                 value=examples.DOCUMENT_INTENT_RESPONSE)],
+    )
+    def post(self, request, event_id, resource_id):
+        get_object_or_404(EventResource, pk=resource_id, event_id=event_id)  # 404 before field validation
+        serializer = DocumentUploadIntentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        intent, upload_url = uploads.create_document_intent(event_id, resource_id, serializer.validated_data,
+                                                            request.user)
+        return intent_response(intent, upload_url)
+
+
+class FeaturedImageIntentView(AdminOnlyView):
+    serializer_class = ImageUploadIntentSerializer
+    throttle_classes = [UploadIntentRateThrottle]
+
+    @extend_schema(
+        operation_id='dawah_events_featured_image_intent',
+        request=ImageUploadIntentSerializer,
+        responses={201: UploadIntentResponseSerializer},
+        description='Admin: request a direct-to-storage upload for the event\'s featured image. Only JPEG '
+                    '(`image/jpeg`, `.jpg`/`.jpeg`) or PNG (`image/png`, `.png`), 1 byte to 10 MiB; finalize '
+                    'decodes it with a pixel cap. Allowed in any event state: on a published event the new '
+                    'image is promoted to the public bucket before it replaces the visible one. '
+                    + INTENT_PROTOCOL + INTENT_LIMIT,
+        examples=[OpenApiExample('Intent', request_only=True, value=examples.IMAGE_INTENT_REQUEST),
+                  OpenApiExample('Issued', response_only=True, status_codes=['201'],
+                                 value=examples.IMAGE_INTENT_RESPONSE)],
+    )
+    def post(self, request, event_id):
+        get_object_or_404(Event, pk=event_id)  # 404 before field validation
+        serializer = ImageUploadIntentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        intent, upload_url = uploads.create_image_intent(event_id, serializer.validated_data, request.user)
+        return intent_response(intent, upload_url)
+
+
+READY_MESSAGES = {
+    UploadIntent.Kind.AUDIO: 'Upload validated. The audio is ready to publish.',
+    UploadIntent.Kind.DOCUMENT: 'Upload validated. The document is ready to publish.',
+    UploadIntent.Kind.IMAGE: 'Upload validated. The featured image is attached.',
+}
 FINALIZE_MESSAGES = {
-    'ready': 'Upload validated. The audio is ready to publish.',
     'rejected': 'The uploaded file was rejected.',
     'failed': 'The upload could not be attached.',
     'expired': 'The upload expired before it was finalized.',
@@ -376,6 +440,7 @@ FINALIZE_MESSAGES = {
 
 class UploadFinalizeView(AdminOnlyView):
     serializer_class = FinalizeResponseSerializer
+    throttle_classes = [UploadFinalizeRateThrottle]
 
     @extend_schema(
         operation_id='dawah_uploads_finalize',
@@ -383,16 +448,31 @@ class UploadFinalizeView(AdminOnlyView):
         responses={200: FinalizeResponseSerializer},
         description='Admin (the intent owner only; others get 404): validate what storage actually holds. '
                     'The server observes the staged object size/type/ETag, copies it at that ETag to a '
-                    'server-only key and validates the copy as MP3. 200 returns the outcome in `upload.status` '
-                    '(`ready`, `rejected`, `failed`, `expired`); a replay returns the saved outcome. '
-                    'Retryable: 409 UPLOAD_IN_PROGRESS (another validation holds the lease), UPLOAD_INCOMPLETE '
-                    '(no object yet), UPLOAD_CHANGED (overwritten during copy); 503 PROVIDER_UNAVAILABLE.',
-        examples=[OpenApiExample('Ready', response_only=True, value=examples.FINALIZE_READY)],
+                    'server-only key and validates the copy (MP3 / PDF / DOCX / JPEG / PNG by upload kind). '
+                    '200 returns the outcome in `upload.status` (`ready`, `rejected`, `failed`, `expired`); a '
+                    'replay returns the saved outcome. Audio/document uploads return `resource` (and `event` '
+                    'null); featured-image uploads return `event` (and `resource` null). Retryable: 409 '
+                    'UPLOAD_IN_PROGRESS (another validation holds the lease), UPLOAD_INCOMPLETE (no object yet), '
+                    'UPLOAD_CHANGED (overwritten during copy), MEDIA_CHANGED (event published during image '
+                    'validation); 429 THROTTLED (30/min per admin); 503 PROVIDER_UNAVAILABLE. Featured images are '
+                    'published as a sanitized re-encoded derivative (orientation applied, metadata removed).',
+        examples=[OpenApiExample('Ready', response_only=True, value=examples.FINALIZE_READY),
+                  OpenApiExample('Featured image ready', response_only=True, value=examples.FINALIZE_IMAGE_READY)],
     )
     def post(self, request, upload_id):
         result = uploads.finalize_upload(upload_id, request.user)
-        resource = EventResource.objects.select_related('event').get(pk=result.resource.pk)
-        resource_data = EventResourceSerializer(resource, context=self.get_serializer_context()).data
-        data = {'upload': upload_state(result.intent), 'resource': resource_data,
-                'preview_url': resource_data['preview_url']}
-        return success_response(data, FINALIZE_MESSAGES.get(result.intent.status, 'Upload state retrieved.'))
+        context = self.get_serializer_context()
+        resource_data = event_data = None
+        if result.intent.kind == UploadIntent.Kind.IMAGE:
+            event = Event.objects.get(pk=result.event.pk)
+            event_data = EventSerializer(event, context=context).data
+            preview = event_data['featured_image_preview_url']
+        else:
+            resource = EventResource.objects.select_related('event').get(pk=result.resource.pk)
+            resource_data = EventResourceSerializer(resource, context=context).data
+            preview = resource_data['preview_url']
+        data = {'upload': upload_state(result.intent), 'resource': resource_data, 'event': event_data,
+                'preview_url': preview}
+        message = (READY_MESSAGES[result.intent.kind] if result.intent.status == 'ready'
+                   else FINALIZE_MESSAGES.get(result.intent.status, 'Upload state retrieved.'))
+        return success_response(data, message)

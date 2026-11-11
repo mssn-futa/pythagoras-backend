@@ -51,8 +51,8 @@ class InMemoryObjectStorage(ObjectStorage):
         return (f'https://{FAKE_HOST}/private/{quote(key)}?X-Amz-Expires={expires_in}'
                 f'&X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost&X-Amz-Signature={token}')
 
-    def presign_get(self, key, *, expires_in, content_type, filename):
-        self._record('presign_get', key=key)
+    def presign_get(self, key, *, expires_in, content_type, filename, disposition='inline'):
+        self._record('presign_get', key=key, content_type=content_type, disposition=disposition)
         return (f'https://{FAKE_HOST}/private/{quote(key)}?X-Amz-Expires={expires_in}'
                 f'&X-Amz-Signature={secrets.token_hex(16)}')
 
@@ -76,6 +76,11 @@ class InMemoryObjectStorage(ObjectStorage):
         self._store(dst_bucket, dst_key, data, content_type, content_disposition=content_disposition,
                     cache_control=cache_control)
         return self.head(dst_key, bucket=dst_bucket)
+
+    def put_object(self, key, data, *, content_type, bucket=PRIVATE):
+        self._record('put_object', key=key, bucket=bucket)
+        self._store(bucket, key, data, content_type)
+        return self.head(key, bucket=bucket)
 
     def open_stream(self, key, *, bucket=PRIVATE, byte_range=None, if_match=None):
         self._record('open_stream', key=key, bucket=bucket)

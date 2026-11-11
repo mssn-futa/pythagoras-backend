@@ -9,7 +9,8 @@ packages extend it additively:
   ``storage_status=ready`` and the publish promotion that records the public
   ``media_url`` for audio (see ``dawah/uploads.py``).
 * DAWAH-05 adds ``youtube_video_id`` and tightens the video visibility rule.
-* DAWAH-07 adds document/featured-image object metadata.
+* DAWAH-07 adds document uploads (same resource fields) and validated R2
+  featured-image object metadata on the event (``featured_image_*``).
 """
 from django.conf import settings
 from django.db import models
@@ -22,6 +23,13 @@ class PublicationStatus(models.TextChoices):
     DRAFT = 'draft', 'Draft'
     PUBLISHED = 'published', 'Published'
     UNPUBLISHED = 'unpublished', 'Unpublished'
+
+
+class ImageStorageStatus(models.TextChoices):
+    NONE = 'none', 'No image'
+    PENDING = 'pending', 'Upload pending'
+    READY = 'ready', 'Ready'
+    FAILED = 'failed', 'Upload failed'
 
 
 class EventQuerySet(models.QuerySet):
@@ -44,8 +52,24 @@ class Event(models.Model):
     end_time = models.DateTimeField()
 
     # Legacy local upload; never exposed or published as a durable asset.
-    # DAWAH-07 adds validated R2 featured-image metadata alongside it.
     featured_image = models.ImageField(upload_to='events/', blank=True, null=True)
+
+    # Validated R2 featured image (DAWAH-07). Keys/ETags are server-only and
+    # never serialized; the public copy/URL exists only while the event is
+    # published (promotion before the pointer changes, as for resources).
+    featured_image_storage_status = models.CharField(max_length=16, choices=ImageStorageStatus.choices,
+                                                     default=ImageStorageStatus.NONE)
+    featured_image_object_key = models.CharField(max_length=512, blank=True, default='',
+                                                 help_text='Server-only validated private copy.')
+    featured_image_etag = models.CharField(max_length=128, blank=True, default='')
+    featured_image_content_type = models.CharField(max_length=100, blank=True, default='')
+    featured_image_size_bytes = models.BigIntegerField(blank=True, null=True)
+    featured_image_file_name = models.CharField(max_length=120, blank=True, default='')
+    featured_image_uploaded_at = models.DateTimeField(blank=True, null=True)
+    featured_image_public_key = models.CharField(max_length=512, blank=True, default='')
+    featured_image_public_url = models.CharField(max_length=1024, blank=True, default='')
+    featured_image_alt = models.CharField(max_length=250, blank=True, default='',
+                                          help_text='Optional authored plain-text alternative text.')
 
     status = models.CharField(max_length=12, choices=PublicationStatus.choices,
                               default=PublicationStatus.DRAFT)
@@ -65,8 +89,15 @@ class Event(models.Model):
         return self.title
 
     @property
+    def has_featured_image(self):
+        return (bool(self.featured_image_object_key)
+                and self.featured_image_storage_status == ImageStorageStatus.READY)
+
+    @property
     def featured_image_url(self):
-        """Public URL of a ready featured image. DAWAH-07 supplies durable images."""
+        """Public URL of the promoted featured image, only while published."""
+        if self.status == PublicationStatus.PUBLISHED and self.has_featured_image and self.featured_image_public_url:
+            return self.featured_image_public_url
         return None
 
     def publication_errors(self):
@@ -204,10 +235,14 @@ class UploadIntent(models.Model):
     The browser may only PUT to ``staging_key`` (signed, private, temporary).
     Finalize copies the staged object at its observed ETag to the server-only
     ``validation_key``, validates that immutable copy and attaches it.
+    Audio/document intents target a ``resource``; image intents target the
+    ``event`` (its featured image). Exactly one of the two is set.
     """
 
     class Kind(models.TextChoices):
         AUDIO = 'audio', 'Audio'
+        DOCUMENT = 'document', 'Document'
+        IMAGE = 'image', 'Featured image'
 
     class Status(models.TextChoices):
         ISSUED = 'issued', 'Issued'
@@ -220,7 +255,10 @@ class UploadIntent(models.Model):
     TERMINAL = (Status.READY, Status.REJECTED, Status.FAILED, Status.EXPIRED)
     OPEN = (Status.ISSUED, Status.VALIDATING)
 
-    resource = models.ForeignKey(EventResource, on_delete=models.CASCADE, related_name='upload_intents')
+    resource = models.ForeignKey(EventResource, on_delete=models.CASCADE, related_name='upload_intents',
+                                 blank=True, null=True)
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='image_upload_intents',
+                              blank=True, null=True, help_text='Featured-image intents only.')
     # SET_NULL: deleting an admin must not cascade-delete intents (their keys
     # would be orphaned unrecorded). Unowned intents can no longer be finalized
     # (404) and are expired/cleaned by the cleanup command.
@@ -254,6 +292,10 @@ class UploadIntent(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=['status', 'expires_at'], name='dawah_intent_status_exp')]
+        constraints = [models.CheckConstraint(
+            condition=(Q(kind='image', event__isnull=False, resource__isnull=True)
+                       | (~Q(kind='image') & Q(event__isnull=True, resource__isnull=False))),
+            name='dawah_intent_single_target')]
 
     def __str__(self):
         return f'Upload {self.pk} ({self.status})'
@@ -280,6 +322,7 @@ class StorageCleanup(models.Model):
     key = models.CharField(max_length=512)
     reason = models.CharField(max_length=40)
     resource_id = models.BigIntegerField(blank=True, null=True)
+    event_id = models.BigIntegerField(blank=True, null=True, help_text='Featured-image objects.')
     upload_id = models.BigIntegerField(blank=True, null=True)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
     public_url = models.CharField(max_length=1024, blank=True, default='',

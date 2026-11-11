@@ -12,7 +12,7 @@ from django.utils import timezone
 from pythagoras.utils import APIError
 
 from . import uploads
-from .models import Event, EventResource, PublicationStatus
+from .models import Event, EventResource, PublicationStatus, UploadIntent
 
 PUBLISHED = PublicationStatus.PUBLISHED
 UNPUBLISHED = PublicationStatus.UNPUBLISHED
@@ -48,17 +48,31 @@ def _needs_promotion(resource):
             and resource.has_asset and not resource.public_object_key)
 
 
+def _image_needs_promotion(event):
+    return event.has_featured_image and not event.featured_image_public_key
+
+
+def _image_asset(event):
+    return (event.featured_image_object_key, event.featured_image_etag)
+
+
 def publish_event(event_id):
-    """Publish the event. Its published uploaded resources lost their public
-    copies at event unpublication, so they are re-promoted to *new* public keys
-    (no locks held during the copies) and attached atomically with the event's
-    status. All or nothing: a failed promotion leaves the event unpublished."""
+    """Publish the event. Its published uploaded resources (and its featured
+    image) lost their public copies at event unpublication, so they are
+    re-promoted to *new* public keys (no locks held during the copies) and
+    attached atomically with the event's status. All or nothing: a failed
+    promotion leaves the event unpublished."""
     with transaction.atomic():
         event = _lock_event(event_id)
         _check_event_publishable(event)
         pending = [r for r in event.resources.select_for_update().order_by('id') if _needs_promotion(r)]
+        image_pending = _image_needs_promotion(event)
+        image_asset = _image_asset(event)
     promoted = {}  # resource id -> (asset, key, url, cleanup row id)
+    image = None  # (asset, key, url, cleanup row id)
     try:
+        if image_pending:
+            image = (image_asset, *uploads.promote_event_image(event))
         for resource in pending:
             key, url, row_id = uploads.promote_to_public(resource)
             promoted[resource.pk] = ((resource.private_object_key, resource.etag), key, url, row_id)
@@ -79,13 +93,22 @@ def publish_event(event_id):
                 resource.public_object_key, resource.public_media_url = key, url
                 resource.save(update_fields=['public_object_key', 'public_media_url', 'updated_at'])
                 attached.append(row_id)
+            fields = ['status', 'published_at', 'updated_at']
+            if _image_needs_promotion(event):
+                if image is None or image[0] != _image_asset(event):
+                    raise APIError('MEDIA_CHANGED', 'The featured image changed while publishing. Try again.',
+                                   status_code=409)
+                event.featured_image_public_key, event.featured_image_public_url = image[1], image[2]
+                fields += uploads.IMAGE_POINTER_FIELDS
+                attached.append(image[3])
             event.status = PUBLISHED
             event.published_at = timezone.now()
-            event.save(update_fields=['status', 'published_at', 'updated_at'])
+            event.save(update_fields=fields)
             uploads.promotion_attached(attached)
     finally:
         # Every copy not cancelled as attached above becomes eligible for cleanup.
-        uploads.promotion_abandoned([entry[3] for entry in promoted.values()], 'publish_aborted')
+        rows = [entry[3] for entry in promoted.values()] + ([image[3]] if image else [])
+        uploads.promotion_abandoned(rows, 'publish_aborted')
     return event
 
 
@@ -93,8 +116,8 @@ def unpublish_event(event_id):
     """Hide the event and, through visibility rules, all of its resources.
 
     Resource publication states are not rewritten (D2), but their public
-    copies are recorded for deletion/purge and their media_url cleared;
-    re-publishing the event re-promotes them."""
+    copies (and the featured image's) are recorded for deletion/purge and the
+    public URLs cleared; re-publishing the event re-promotes them."""
     with transaction.atomic():
         event = _lock_event(event_id)
         if event.status != PUBLISHED:
@@ -105,8 +128,13 @@ def unpublish_event(event_id):
             if row_id:
                 resource.save(update_fields=['public_object_key', 'public_media_url', 'updated_at'])
                 cleanup_ids.append(row_id)
+        fields = ['status', 'updated_at']
+        image_row = uploads.retire_event_image(event, 'event_unpublished')
+        if image_row:
+            cleanup_ids.append(image_row)
+            fields += uploads.IMAGE_POINTER_FIELDS
         event.status = UNPUBLISHED
-        event.save(update_fields=['status', 'updated_at'])
+        event.save(update_fields=fields)
         uploads.cleanup_after_commit(cleanup_ids)
     return event
 
@@ -156,7 +184,7 @@ def publish_resource(event_id, resource_id):
             event, resource = _lock_resource(event_id, resource_id)
             _check_resource_publishable(event, resource)
             if uploaded and (resource.private_object_key, resource.etag) != asset:
-                raise APIError('MEDIA_CHANGED', 'The audio changed while publishing. Try again.', status_code=409)
+                raise APIError('MEDIA_CHANGED', 'The file changed while publishing. Try again.', status_code=409)
             fields = ['status', 'published_at', 'updated_at']
             if uploaded:
                 stale = uploads.retire_public_copy(resource, 'replaced')
@@ -242,28 +270,67 @@ def create_resource(event_id, serializer, created_by):
             storage_status=EventResource.initial_storage_status(data['type']), **data)
 
 
-def event_references(event):
-    """Rows in other domains (e.g. quizzes) that point at this event.
-
-    Parent-owned resources are not references. Checked generically so the
-    guard does not import or edit quiz models; ASSESS-02 adds DB protection.
-    """
+def _incoming_references(model_class, instance, skip):
     references = {}
-    for relation in Event._meta.related_objects:
-        if relation.related_model is EventResource:
+    for relation in model_class._meta.related_objects:
+        if relation.related_model in skip:
             continue
         model = relation.related_model
-        ids = list(model._base_manager.filter(**{relation.field.name: event})
+        ids = list(model._base_manager.filter(**{relation.field.name: instance})
                    .order_by('pk').values_list('pk', flat=True)[:REFERENCE_ID_LIMIT])
         if ids:
             references[model._meta.label_lower] = ids
     return references
 
 
+def _merge(target, references):
+    for label, ids in references.items():
+        merged = sorted(set(target.get(label, [])) | set(ids))
+        target[label] = merged[:REFERENCE_ID_LIMIT]
+    return target
+
+
+def event_references(event):
+    """Rows in other domains that point at this event or at one of its resources
+    (e.g. quizzes, quiz.ModuleResource), as ``{app.model: [ids]}``.
+
+    Parent-owned resources and upload intents are not references themselves;
+    incoming references to the resources are included because deleting the
+    event deletes them. Checked generically so the guard does not import quiz
+    models; DB protection (PROTECT) is reported the same way.
+    """
+    references = _incoming_references(Event, event, (EventResource, UploadIntent))
+    for resource in event.resources.order_by('id'):
+        _merge(references, resource_references(resource))
+    return references
+
+
+def resource_references(resource):
+    """Rows in other domains (e.g. quiz.ModuleResource, ASSESS-07) that point at this resource.
+
+    Upload intents belong to the resource and are not references."""
+    return _incoming_references(EventResource, resource, (UploadIntent,))
+
+
+def protected_references(exc):
+    """``{app.model: [ids]}`` of the rows a ProtectedError/RestrictedError names."""
+    objects = getattr(exc, 'protected_objects', None) or getattr(exc, 'restricted_objects', None) or ()
+    references = {}
+    for obj in objects:
+        references.setdefault(obj._meta.label_lower, []).append(obj.pk)
+    return {label: sorted(ids)[:REFERENCE_ID_LIMIT] for label, ids in references.items()}
+
+
 def referenced_error(references):
     return APIError('RESOURCE_REFERENCED',
-                    'This event is referenced by other records (for example quizzes). '
+                    'This event or one of its resources is referenced by other records. '
                     'Remove those references before deleting it.',
+                    status_code=409, fields={'references': references})
+
+
+def resource_referenced_error(references):
+    return APIError('RESOURCE_REFERENCED',
+                    'This resource is referenced by other records. Remove those references before deleting it.',
                     status_code=409, fields={'references': references})
 
 
@@ -279,14 +346,15 @@ def delete_event(event_id):
         references = event_references(event)
         if references:
             raise referenced_error(references)
-        cleanup_ids = []
+        cleanup_ids = uploads.record_event_image_cleanup(event, 'event_deleted')
         for resource in event.resources.select_for_update().order_by('id'):
             cleanup_ids += uploads.record_resource_cleanup(resource, 'resource_deleted')
         try:
             # Legacy local files are left on disk; Django does not delete them.
             event.delete()
-        except (ProtectedError, RestrictedError):
-            raise referenced_error(event_references(event)) from None
+        except (ProtectedError, RestrictedError) as exc:
+            # A race past the check, or a PROTECT reference to one of its resources.
+            raise referenced_error(protected_references(exc) or event_references(event)) from None
         uploads.cleanup_after_commit(cleanup_ids)
 
 
@@ -295,6 +363,12 @@ def delete_resource(event_id, resource_id):
         _, resource = _lock_resource(event_id, resource_id)
         if resource.status == PUBLISHED:
             raise unpublish_required('resource')
+        references = resource_references(resource)
+        if references:
+            raise resource_referenced_error(references)
         cleanup_ids = uploads.record_resource_cleanup(resource, 'resource_deleted')
-        resource.delete()
+        try:
+            resource.delete()  # PROTECT/RESTRICT raise before any row is deleted; the atomic block rolls back
+        except (ProtectedError, RestrictedError) as exc:
+            raise resource_referenced_error(protected_references(exc) or resource_references(resource)) from None
         uploads.cleanup_after_commit(cleanup_ids)
