@@ -495,3 +495,23 @@ class EventResourceVisibilityTests(TestCase):
         make_resource(event, status=PublicationStatus.DRAFT, type='vid', youtube_video_id='dQw4w9WgXcQ')
         self.assertEqual(automations._resource_links([event]), {})
         self.assertEqual(EventResource.objects.count(), 1)
+
+
+class DjangoAdminRescheduleTests(AutomationBase):
+    def test_admin_time_change_bumps_revision_and_cancels(self):
+        from django.contrib import admin as django_admin
+
+        from dawah.admin import EventAdminForm
+
+        start = datetime(2026, 11, 13, 12, tzinfo=UTC)
+        rule_obj = rule(kind='event_reminder', owner=self.admin)
+        event = make_event(status=PUBLISHED, start=start)
+        automations.tick(start - timedelta(days=1))
+        data = {'title': event.title, 'category': event.category, 'tags': '', 'speakers': 's', 'location': 'l',
+                'summary': 'x', 'start_time': '2026-11-14 12:00:00', 'end_time': '2026-11-14 13:00:00'}
+        form = EventAdminForm(data, instance=event)
+        self.assertTrue(form.is_valid(), form.errors)
+        django_admin.site._registry[Event].save_model(None, form.save(commit=False), form, True)
+        event.refresh_from_db()
+        self.assertEqual(event.schedule_revision, 2)
+        self.assertEqual([(r.state, r.reason_code) for r in runs(rule_obj)], [('cancelled', 'source_rescheduled')])

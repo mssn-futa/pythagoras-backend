@@ -373,4 +373,3 @@ def preview_payload(rule, rendered, count, skip, source):
     return {'subject': rendered.subject, 'body': rule.body, 'body_format': rule.body_format,
             'body_html': rule.body_html, 'rendered_text': rendered.text, 'rendered_html': rendered.html,
             'audience_count': count, 'skip_reason_code': skip, 'source': source}
-

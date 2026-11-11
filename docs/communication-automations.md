@@ -201,9 +201,9 @@ held during provider I/O.
 
 - After provider handoff a cancelled reminder may still be delivered; the
   delivery stays `sent`/`uncertain` with its evidence.
-- Event time changes made outside `services.update_event` (Django admin,
-  shell) do not bump `schedule_revision`; the handoff recheck still blocks
-  sending after the event starts or once unpublished.
+- Event time changes made outside `services.update_event` and the Django
+  admin (shell, raw SQL) do not bump `schedule_revision`; the handoff recheck
+  still blocks sending after the event starts or once unpublished.
 - Weekly digests are not cancelled when an included event is later
   unpublished (the frozen snapshot is sent as materialized).
 - Only `Africa/Lagos` is accepted (frontend contract); the code is generic

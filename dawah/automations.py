@@ -730,4 +730,3 @@ def broadcast_counts(broadcast_ids):
 
 def is_owner_candidate(user):
     return user is not None and user.is_active and getattr(user, 'role', None) == 'admin'
-
