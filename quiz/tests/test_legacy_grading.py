@@ -3,14 +3,23 @@ from django.test import TestCase
 from accounts.models import CustomUser
 from dawah.models import Event
 from quiz.models import Quiz, Question, Option, Submission, Course
-from quiz.services import QuizService
+from quiz.services import InvalidAnswers, QuizService
 
 
-# Create your tests here.
 class TestQuizService(TestCase):
+    """Legacy text/multiple-answer grader (not a release question type).
+
+    Kept as legacy coverage; fixtures use only persisted enum values
+    (``Question.Type``) and database-assigned primary keys so they run the same
+    on PostgreSQL as on SQLite.
+    """
+
     def setUp(self):
-        student = CustomUser.objects.create(
-            email="django@email.com", password="DjangoBoy!!"
+        # Legacy-shaped records are graded unsaved: new legacy rows cannot be
+        # stored (quiz.0007), and each belongs to its own student.
+        student, student2, student3 = (
+            CustomUser.objects.create_user(email=email, password=None)
+            for email in ("django@email.com", "django2@email.com", "django3@email.com")
         )
 
         event = Event.objects.create(
@@ -29,7 +38,7 @@ class TestQuizService(TestCase):
             level="100",
             semester="First",
         )
-        quiz = Quiz.objects.create(
+        quiz = self.quiz = Quiz.objects.create(
             title="Quiz 101",
             type="TEXT",
             related_course=course,
@@ -38,19 +47,19 @@ class TestQuizService(TestCase):
         )
         # Question 1
         q1 = Question.objects.create(
-            pk=1, quiz=quiz, text="Django is a python web framework", type=Question.Type.text
+            quiz=quiz, text="Django is a python web framework", type=Question.Type.text
         )
         Option.objects.create(question=q1, text="True", is_correct=True)
         Option.objects.create(question=q1, text="False", is_correct=False)
         # Question 2
         q2 = Question.objects.create(
-            pk=2, quiz=quiz, text="NodeJS is a javascript ___", type=Question.Type.text
+            quiz=quiz, text="NodeJS is a javascript ___", type=Question.Type.text
         )
         Option.objects.create(question=q2, text="web framework", is_correct=False)
         Option.objects.create(question=q2, text="runtime environment", is_correct=True)
         # Question 3
         q3 = Question.objects.create(
-            pk=3, quiz=quiz, text="Choose all correct options: ", type=Question.Type.multi
+            quiz=quiz, text="Choose all correct options: ", type=Question.Type.multi
         )
         Option.objects.create(
             question=q3, text="The python interpreter is written in C", is_correct=True
@@ -64,14 +73,13 @@ class TestQuizService(TestCase):
             is_correct=True,
         )
         # Submission 1
-        Submission.objects.create(
-            pk=1,
+        self.submission1 = Submission(
             quiz=quiz,
             student=student,
             answers={
-                "1": "true",
-                "2": "runtime environment",
-                "3": [
+                str(q1.id): "true",
+                str(q2.id): "runtime environment",
+                str(q3.id): [
                     "The python interpreter is written in C",
                     "Pythagoras' grading engine would not be reliable without some tests",
                 ],
@@ -79,14 +87,13 @@ class TestQuizService(TestCase):
             score=0,
         )
         # Submission 2
-        Submission.objects.create(
-            pk=2,
+        self.submission2 = Submission(
             quiz=quiz,
-            student=student,
+            student=student2,
             answers={
-                "1": "true",
-                "2": "runtime environment",
-                "3": [
+                str(q1.id): "true",
+                str(q2.id): "runtime environment",
+                str(q3.id): [
                     "Pythagoras' grading engine would not be reliable without some tests",
                     "The python interpreter is written in C",
                     "GitHub is a version control system",
@@ -95,14 +102,13 @@ class TestQuizService(TestCase):
             score=0,
         )
         # Submission 3
-        Submission.objects.create(
-            pk=3,
+        self.submission3 = Submission(
             quiz=quiz,
-            student=student,
+            student=student3,
             answers={
-                "1": "true",
-                "2": "web framework",
-                "3": [
+                str(q1.id): "true",
+                str(q2.id): "web framework",
+                str(q3.id): [
                     "The python interpreter is written in C",
                     "Pythagoras' grading engine would not be reliable without some tests",
                 ],
@@ -111,10 +117,32 @@ class TestQuizService(TestCase):
         )
 
     def test_all_answers_correct(self):
-        self.assertEqual(QuizService.grade_submission(Submission.objects.get(pk=1)), 3)
+        self.assertEqual(QuizService.grade_submission(self.submission1), 3)
 
     def test_multiple_answers_not_correct(self):
-        self.assertEqual(QuizService.grade_submission(Submission.objects.get(pk=2)), 2)
+        self.assertEqual(QuizService.grade_submission(self.submission2), 2)
 
     def test_txt_answer_not_correct(self):
-        self.assertEqual(QuizService.grade_submission(Submission.objects.get(pk=3)), 2)
+        self.assertEqual(QuizService.grade_submission(self.submission3), 2)
+
+
+    def test_persisted_question_types_are_valid_enum_values(self):
+        stored = set(Question.objects.values_list("type", flat=True))
+        self.assertTrue(stored <= set(Question.Type.values), stored)
+
+    def test_malformed_legacy_answers_raise_invalid_answers_not_assertion(self):
+        q1, q3 = self.quiz.question_set.order_by("pk")[0], self.quiz.question_set.order_by("pk")[2]
+        cases = [
+            ([], "non_field_errors"),
+            ("true", "non_field_errors"),
+            ({str(q1.id): ["true"]}, str(q1.id)),   # list for a single-answer question
+            ({str(q1.id): 1}, str(q1.id)),
+            ({str(q3.id): "The python interpreter is written in C"}, str(q3.id)),  # str for multi
+            ({str(q3.id): ["ok", 3]}, str(q3.id)),  # non-string list element
+        ]
+        for answers, field in cases:
+            with self.subTest(answers=answers):
+                submission = Submission(quiz=self.quiz, answers=answers, score=0)
+                with self.assertRaises(InvalidAnswers) as caught:
+                    QuizService.grade_submission(submission)
+                self.assertIn(field, caught.exception.errors)
