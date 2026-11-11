@@ -258,6 +258,17 @@ EMAIL_IDEMPOTENCY_NAMESPACE = os.getenv('EMAIL_IDEMPOTENCY_NAMESPACE', 'local').
 if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', EMAIL_IDEMPOTENCY_NAMESPACE):
     raise ImproperlyConfigured(
         'EMAIL_IDEMPOTENCY_NAMESPACE must be 1-64 letters, digits, ".", "_" or "-".')
+# Resend account request budget (D5). The outbox worker paces itself to
+# OUTBOX_REQUESTS_PER_SECOND; the rest of the account rate is headroom for
+# welcome/transactional sends (docs/communication-outbox.md "Rate budget").
+RESEND_REQUESTS_PER_SECOND = env_positive_int('RESEND_REQUESTS_PER_SECOND', 2)
+try:
+    OUTBOX_REQUESTS_PER_SECOND = float(os.getenv('OUTBOX_REQUESTS_PER_SECOND', '1'))
+except ValueError:
+    OUTBOX_REQUESTS_PER_SECOND = 0.0
+if not 0 < OUTBOX_REQUESTS_PER_SECOND <= RESEND_REQUESTS_PER_SECOND:
+    raise ImproperlyConfigured(
+        'OUTBOX_REQUESTS_PER_SECOND must be a positive number not above RESEND_REQUESTS_PER_SECOND.')
 
 # Configuration interfaces only; DAWAH-02 owns the S3/R2 implementation.
 R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')
