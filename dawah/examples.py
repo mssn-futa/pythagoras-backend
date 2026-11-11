@@ -1,5 +1,6 @@
 """OpenAPI example payloads (``data`` only; the schema adds the envelope and,
 for list routes, wraps a single item in the paginated page)."""
+from . import broadcast_content
 
 EVENT_CREATE = {
     'title': 'Friday khutbah', 'category': 'jumuah', 'tags': 'patience', 'speakers': 'Guest speaker',
@@ -106,4 +107,151 @@ RESOURCE_DOCUMENT = {
     **RESOURCE_NESTED, 'id': 9, 'title': 'Agenda', 'type': 'doc', 'duration': None,
     'media_url': 'https://media.example.test/documents/b1cZr6wKe9LmNoPq2Jq3-x8Yt0aPq4sV/agenda.pdf',
     'content_type': 'application/pdf', 'size_bytes': 245760, 'file_name': 'agenda.pdf', 'event': EVENT_SUMMARY,
+}
+
+
+# ---------------------------------------------------------------- broadcasts (COMM-01)
+
+BROADCAST_CREATE = {'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link',
+                    'audience': {'type': 'department', 'department': 'Computer Science'}}
+
+BROADCAST_PATCH = {'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link',
+                   'audience': {'type': 'level', 'level': '300'}, 'version': 2}
+
+ZERO_COUNTS = {'queued': 0, 'sent': 0, 'failed': 0, 'uncertain': 0, 'skipped': 0, 'cancelled': 0}
+
+BROADCAST_DRAFT = {
+    'id': 7, 'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link', 'body_format': 'plain',
+    'body_html': None, 'audience': {'type': 'department', 'department': 'Computer Science'}, 'state': 'draft',
+    'version': 3, 'creator_id': 1, 'created_at': '2026-11-10T09:00:00Z', 'updated_at': '2026-11-10T09:20:00Z',
+    'queued_at': None, 'recipient_count': None, 'counts': ZERO_COUNTS,
+    'eligible_actions': ['edit', 'delete', 'preview', 'queue'],
+}
+
+BROADCAST_QUEUED = {
+    **BROADCAST_DRAFT, 'state': 'queued', 'updated_at': '2026-11-10T09:30:00Z',
+    'queued_at': '2026-11-10T09:30:00Z', 'recipient_count': 42, 'counts': {**ZERO_COUNTS, 'queued': 42},
+    'eligible_actions': [],
+}
+
+_PREVIEW_PLAIN = broadcast_content.render_content('Weekly Da’wah summary', 'plain',
+                                                 'Summary and recording link\n\nSee you <Friday>')
+BROADCAST_PREVIEW = {
+    'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link\n\nSee you <Friday>',
+    'body_format': 'plain', 'body_html': None,
+    'rendered_text': _PREVIEW_PLAIN.text, 'rendered_html': _PREVIEW_PLAIN.html, 'audience_count': 42,
+}
+
+# COMM-04 rich drafts: request HTML (as an editor or paste sends it) and the stored canonical form.
+RICH_REQUEST_HTML = ('<h2>Key lessons</h2><p>Read the <a href="https://example.test/dawah/content/8" target="_blank" '
+                     'onclick="steal()">recording</a> <b>before</b> Friday.<script>alert(1)</script></p>'
+                     '<ul><li><p><strong>Patience</strong></p></li><li><p><em>Gratitude</em></p></li></ul>'
+                     '<p>See https://example.test/</p>')
+_RICH = broadcast_content.sanitize_rich_html(RICH_REQUEST_HTML)
+BROADCAST_RICH_CREATE = {'subject': 'Weekly Da’wah summary', 'body_format': 'rich', 'body_html': RICH_REQUEST_HTML,
+                         'audience': {'type': 'all'}}
+BROADCAST_RICH_PATCH = {'body_format': 'rich', 'body_html': '<p>Updated <strong>summary</strong></p>', 'version': 1}
+BROADCAST_RICH_DRAFT = {**BROADCAST_DRAFT, 'version': 1, 'audience': {'type': 'all'}, 'body_format': 'rich',
+                        'body_html': _RICH.html, 'body': _RICH.text}
+_PREVIEW_RICH = broadcast_content.render_content('Weekly Da’wah summary', 'rich', body_html=_RICH.html)
+BROADCAST_RICH_PREVIEW = {
+    'subject': 'Weekly Da’wah summary', 'body': _RICH.text, 'body_format': 'rich', 'body_html': _RICH.html,
+    'rendered_text': _PREVIEW_RICH.text, 'rendered_html': _PREVIEW_RICH.html, 'audience_count': 42,
+}
+
+DELIVERY_QUEUED = {
+    'id': 12, 'student_id': 31, 'snapshot_email': 'student@example.test', 'state': 'queued', 'attempt_count': 0,
+    'retry_generation': 0, 'provider_email_id': None, 'error_code': None, 'sent_at': None,
+    'created_at': '2026-11-10T09:30:00Z', 'updated_at': '2026-11-10T09:30:00Z', 'eligible_actions': [],
+}
+
+DELIVERY_DETAIL = {
+    'id': 12, 'student_id': 31, 'snapshot_email': 'student@example.test', 'state': 'sent', 'attempt_count': 2,
+    'retry_generation': 1, 'provider_email_id': '4ef9a417-02e9-4d39-ad75-9611e0fcc33c', 'error_code': None,
+    'sent_at': '2026-11-10T10:02:05Z', 'created_at': '2026-11-10T09:30:00Z', 'updated_at': '2026-11-10T10:02:05Z',
+    'eligible_actions': [], 'broadcast_id': 7, 'nonacceptance_known': False, 'next_attempt_at': None,
+    'idempotency_key': 'production/broadcast/12/generation/1',
+    'request_hash': '9f2c4a0e5b7d1c3e8a6f4b2d0c9e7a5b3d1f8e6c4a2b0d9f7e5c3a1b8d6f4e2c',
+    'first_dispatch_at': '2026-11-10T10:01:00Z', 'idempotency_deadline_at': '2026-11-11T09:01:00Z',
+    'retry_requested_at': '2026-11-10T10:00:30Z', 'retry_requested_by_id': 2,
+    'generations': [{
+        'generation': 0, 'state': 'failed', 'attempt_count': 1, 'error_code': 'VALIDATION_ERROR',
+        'nonacceptance_known': True, 'provider_email_id': '', 'idempotency_key': 'production/broadcast/12/generation/0',
+        'request_hash': '1b3d5f7a9c2e4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c',
+        'first_dispatch_at': '2026-11-10T09:31:00Z', 'idempotency_deadline_at': '2026-11-11T08:31:00Z',
+        'requested_at': None, 'requested_by_id': None, 'closed_at': '2026-11-10T10:00:30Z', 'closed_by_id': 2,
+    }],
+    'attempts': [
+        {'generation': 0, 'attempt': 1, 'started_at': '2026-11-10T09:31:00Z', 'finished_at': '2026-11-10T09:31:01Z',
+         'outcome': 'failed', 'error_code': 'VALIDATION_ERROR', 'provider_email_id': '', 'late_outcome': '',
+         'late_error_code': '', 'late_recorded_at': None},
+        {'generation': 1, 'attempt': 1, 'started_at': '2026-11-10T10:01:00Z', 'finished_at': '2026-11-10T10:01:30Z',
+         'outcome': 'uncertain', 'error_code': 'TIMEOUT', 'provider_email_id': '', 'late_outcome': '',
+         'late_error_code': '', 'late_recorded_at': None},
+        {'generation': 1, 'attempt': 2, 'started_at': '2026-11-10T10:02:04Z', 'finished_at': '2026-11-10T10:02:05Z',
+         'outcome': 'accepted', 'error_code': '', 'provider_email_id': '4ef9a417-02e9-4d39-ad75-9611e0fcc33c',
+         'late_outcome': '', 'late_error_code': '', 'late_recorded_at': None},
+    ],
+}
+
+VERSION_REQUEST = {'version': 3}
+RETRY_REQUEST = {'delivery_ids': [12, 13]}
+
+# ---------------------------------------------------------------- automations (COMM-06)
+
+AUTOMATION_WEEKLY_CREATE = {
+    'kind': 'weekly_digest', 'audience': {'type': 'all'}, 'timezone': 'Africa/Lagos', 'weekday': 0,
+    'local_time': '08:00', 'enabled': False,
+    'template': {'subject': 'Weekly Da’wah summary', 'body_format': 'plain',
+                 'body': 'This week ({{week_start}} to {{week_end}}):\n\n{{summaries}}'},
+}
+
+AUTOMATION_REMINDER_CREATE = {
+    'kind': 'event_reminder', 'audience': {'type': 'all'}, 'offset_minutes': 1440, 'categories': ['jumuah'],
+    'enabled': False,
+    'template': {'subject': 'Reminder: {{event_title}}', 'body_format': 'rich',
+                 'body_html': '<p><strong>{{event_title}}</strong> starts {{event_start}}.</p>'},
+}
+
+AUTOMATION_WEEKLY = {
+    'id': 3, 'kind': 'weekly_digest', 'enabled': False, 'audience': {'type': 'all'}, 'categories': [],
+    'timezone': 'Africa/Lagos', 'weekday': 0, 'local_time': '08:00', 'offset_minutes': None,
+    'template': {'subject': 'Weekly Da’wah summary', 'body_format': 'plain',
+                 'body': 'This week ({{week_start}} to {{week_end}}):\n\n{{summaries}}', 'body_html': None},
+    'owner_id': 1, 'owner_active': True, 'blocked_reason': None, 'version': 1,
+    'created_at': '2026-11-10T09:00:00Z', 'updated_at': '2026-11-10T09:00:00Z',
+}
+
+AUTOMATION_REMINDER = {
+    **AUTOMATION_WEEKLY, 'id': 4, 'kind': 'event_reminder', 'categories': ['jumuah'], 'weekday': None,
+    'local_time': None, 'offset_minutes': 1440,
+    'template': {'subject': 'Reminder: {{event_title}}', 'body_format': 'rich',
+                 'body': '{{event_title}} starts {{event_start}}.',
+                 'body_html': '<p><strong>{{event_title}}</strong> starts {{event_start}}.</p>'},
+}
+
+AUTOMATION_PATCH = {
+    'audience': {'type': 'level', 'level': '300'}, 'categories': ['jumuah', 'usroh'], 'offset_minutes': 120,
+    'template': {'subject': 'Reminder: {{event_title}}', 'body_format': 'plain', 'body': 'Starts {{event_start}}.'},
+    'version': 2,
+}
+
+AUTOMATION_PREVIEW = {
+    'subject': 'Weekly Da’wah summary', 'body': AUTOMATION_WEEKLY['template']['body'], 'body_format': 'plain',
+    'body_html': None, 'rendered_text': 'This week (Monday 2 November 2026, 08:00 (Africa/Lagos) to ...',
+    'rendered_html': '<!DOCTYPE html><html lang="en">...</html>', 'audience_count': 42, 'skip_reason_code': None,
+    'source': {'window_start': '2026-11-02T07:00:00Z', 'window_end': '2026-11-09T07:00:00Z',
+               'scheduled_at': '2026-11-09T07:00:00Z',
+               'events': [{'id': 5, 'title': 'Friday khutbah', 'category': 'jumuah',
+                           'start_time': '2026-11-06T12:00:00Z'}]},
+}
+
+AUTOMATION_RUN = {
+    'id': 1, 'occurrence_key': 'rule-3:2026-11-09T07:00:00Z', 'scheduled_at': '2026-11-09T07:00:00Z',
+    'state': 'queued', 'reason_code': None, 'broadcast_id': 7, 'recipient_count': 4,
+    'counts': {'queued': 4, 'sent': 0, 'failed': 0, 'uncertain': 0, 'skipped': 0, 'cancelled': 0},
+    'source': {'window_start': '2026-11-02T07:00:00Z', 'window_end': '2026-11-09T07:00:00Z',
+               'events': [{'id': 5, 'title': 'Friday khutbah', 'category': 'jumuah',
+                           'start_time': '2026-11-06T12:00:00Z'}]},
+    'created_at': '2026-11-09T07:00:05Z', 'updated_at': '2026-11-09T07:00:05Z',
 }

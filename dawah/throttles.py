@@ -27,3 +27,14 @@ class UploadFinalizeRateThrottle(UploadIntentRateThrottle):
 
     def get_rate(self):
         return api_settings.DEFAULT_THROTTLE_RATES.get(self.scope, FINALIZE_RATE)
+
+
+BROADCAST_SEND_RATE = '60/hour'  # D5 engineering starting limit: queue/retry 60/hour per admin
+
+
+class BroadcastSendRateThrottle(UploadIntentRateThrottle):
+    """Per-admin limit shared by broadcast queue and retry requests."""
+    scope = 'dawah_broadcast_send'
+
+    def get_rate(self):
+        return api_settings.DEFAULT_THROTTLE_RATES.get(self.scope, BROADCAST_SEND_RATE)
