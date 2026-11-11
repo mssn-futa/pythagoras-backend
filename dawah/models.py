@@ -339,3 +339,207 @@ class StorageCleanup(models.Model):
 
     def __str__(self):
         return f'Cleanup {self.pk} ({self.bucket}, {self.status})'
+
+
+# ---------------------------------------------------------------- communication (D4)
+#
+# COMM-01 owns drafts, audiences, the queue transaction and the frozen recipient
+# snapshot. The outbox worker/provider fields on ``Delivery`` and the
+# ``DeliveryAttempt`` audit rows exist so COMM-02 (worker/Resend/retries) and
+# COMM-04 (rich content) extend this schema additively. Lock order for every
+# broadcast write: broadcast row, then its deliveries (ascending id).
+
+class BroadcastState(models.TextChoices):
+    DRAFT = 'draft', 'Draft'
+    QUEUED = 'queued', 'Queued'
+    PROCESSING = 'processing', 'Processing'
+    COMPLETED = 'completed', 'Completed'
+    COMPLETED_WITH_ERRORS = 'completed_with_errors', 'Completed with errors'
+    UNCERTAIN = 'uncertain', 'Uncertain'
+
+
+class BodyFormat(models.TextChoices):
+    PLAIN = 'plain', 'Plain text'
+    RICH = 'rich', 'Rich text'
+
+
+class AudienceType(models.TextChoices):
+    ALL = 'all', 'All active students'
+    DEPARTMENT = 'department', 'One department'
+    LEVEL = 'level', 'One level'
+
+
+class DeliveryState(models.TextChoices):
+    QUEUED = 'queued', 'Queued'
+    CLAIMED = 'claimed', 'Claimed'
+    SENDING = 'sending', 'Sending'
+    SENT = 'sent', 'Sent (provider accepted)'
+    FAILED = 'failed', 'Failed'
+    UNCERTAIN = 'uncertain', 'Uncertain'
+    SKIPPED = 'skipped', 'Skipped'
+    CANCELLED = 'cancelled', 'Cancelled'
+
+
+# Deliveries not yet resolved; reported under ``counts.queued``.
+OUTSTANDING_DELIVERY_STATES = (DeliveryState.QUEUED, DeliveryState.CLAIMED, DeliveryState.SENDING)
+
+
+class Broadcast(models.Model):
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True,
+                                   related_name='+')
+    subject = models.CharField(max_length=200)
+    body = models.TextField(help_text='Plain text (rich drafts: the server-generated text fallback).')
+    body_format = models.CharField(max_length=8, choices=BodyFormat.choices, default=BodyFormat.PLAIN)
+    body_html = models.TextField(blank=True, null=True,
+                                 help_text='Canonical sanitized HTML of rich drafts (COMM-04); null for plain.')
+
+    audience_type = models.CharField(max_length=12, choices=AudienceType.choices)
+    audience_department = models.CharField(max_length=100, blank=True, default='',
+                                           help_text='Trimmed display value; matched case-insensitively.')
+    audience_level = models.CharField(max_length=3, blank=True, default='')
+
+    state = models.CharField(max_length=24, choices=BroadcastState.choices, default=BroadcastState.DRAFT)
+    version = models.PositiveIntegerField(default=1)
+
+    # Frozen at queue time and never changed afterwards.
+    queued_at = models.DateTimeField(blank=True, null=True)
+    queued_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True,
+                                  related_name='+')
+    recipient_count = models.PositiveIntegerField(blank=True, null=True)
+    snapshot_subject = models.CharField(max_length=200, blank=True, default='')
+    snapshot_text = models.TextField(blank=True, default='')
+    snapshot_html = models.TextField(blank=True, default='')
+    snapshot_template_version = models.CharField(max_length=32, blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['state', 'updated_at'], name='dawah_broadcast_state_updated')]
+        constraints = [
+            models.CheckConstraint(
+                condition=(Q(audience_type=AudienceType.ALL, audience_department='', audience_level='')
+                           | (Q(audience_type=AudienceType.DEPARTMENT, audience_level='')
+                              & ~Q(audience_department=''))
+                           | Q(audience_type=AudienceType.LEVEL, audience_department='',
+                               audience_level__in=['100', '200', '300', '400', '500'])),
+                name='dawah_broadcast_audience_selector'),
+            models.CheckConstraint(
+                condition=Q(state=BroadcastState.DRAFT) | (Q(queued_at__isnull=False)
+                                                           & Q(recipient_count__isnull=False)),
+                name='dawah_broadcast_queued_snapshot'),
+        ]
+
+    def __str__(self):
+        return self.subject
+
+    @property
+    def is_draft(self):
+        return self.state == BroadcastState.DRAFT
+
+
+class Delivery(models.Model):
+    """One logical recipient of a queued broadcast, across retries."""
+    broadcast = models.ForeignKey(Broadcast, on_delete=models.PROTECT, related_name='deliveries')
+    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='+')
+    snapshot_email = models.EmailField(max_length=254, help_text='Address frozen at queue time.')
+    state = models.CharField(max_length=12, choices=DeliveryState.choices, default=DeliveryState.QUEUED)
+
+    # Outbox bookkeeping (COMM-02 worker).
+    attempt_count = models.PositiveSmallIntegerField(default=0, help_text='Attempts in the current generation.')
+    retry_generation = models.PositiveSmallIntegerField(default=0, help_text='0 = original send; +1 per manual retry.')
+    next_attempt_at = models.DateTimeField(blank=True, null=True)
+    lease_token = models.UUIDField(blank=True, null=True)
+    lease_expires_at = models.DateTimeField(blank=True, null=True)
+    error_code = models.CharField(max_length=64, blank=True, default='', help_text='Safe code, never raw errors.')
+    sent_at = models.DateTimeField(blank=True, null=True)
+    nonacceptance_known = models.BooleanField(
+        default=False,
+        help_text='Set only by the worker on positive evidence the provider did not accept this generation '
+                  '(definitive rejection, or failure before any provider handoff). Required for manual retry.')
+
+    # Provider request identity for the current generation (stable across replays).
+    provider_email_id = models.CharField(max_length=128, blank=True, default='')
+    idempotency_key = models.CharField(max_length=256, blank=True, default='')
+    request_snapshot = models.JSONField(blank=True, null=True)
+    request_hash = models.CharField(max_length=64, blank=True, default='')
+    first_dispatch_at = models.DateTimeField(blank=True, null=True)
+    idempotency_deadline_at = models.DateTimeField(blank=True, null=True)
+
+    retry_requested_at = models.DateTimeField(blank=True, null=True)
+    retry_requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True,
+                                           null=True, related_name='+')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = 'deliveries'
+        constraints = [models.UniqueConstraint(fields=['broadcast', 'student'], name='dawah_delivery_unique_recipient')]
+        indexes = [
+            models.Index(fields=['broadcast', 'state'], name='dawah_delivery_broadcast_state'),
+            models.Index(fields=['state', 'next_attempt_at'], name='dawah_delivery_due'),
+        ]
+
+    def __str__(self):
+        return f'Delivery {self.pk} of broadcast {self.broadcast_id}'
+
+    @property
+    def is_retry_eligible(self):
+        """Positive evidence of nonacceptance only (docs/communication-outbox.md):
+        a failure without ``nonacceptance_known`` (payload conflict, expired
+        safety deadline, ambiguity) is never retryable."""
+        return (self.state == DeliveryState.FAILED and self.nonacceptance_known
+                and not self.provider_email_id and self.sent_at is None)
+
+
+class DeliveryGeneration(models.Model):
+    """Append-only evidence of a closed retry generation: the provider request
+    identity and outcome, copied before manual retry resets the live fields."""
+    delivery = models.ForeignKey(Delivery, on_delete=models.PROTECT, related_name='generations')
+    generation = models.PositiveSmallIntegerField()
+    state = models.CharField(max_length=12, choices=DeliveryState.choices)
+    attempt_count = models.PositiveSmallIntegerField()
+    error_code = models.CharField(max_length=64, blank=True, default='')
+    nonacceptance_known = models.BooleanField()
+    provider_email_id = models.CharField(max_length=128, blank=True, default='')
+    idempotency_key = models.CharField(max_length=256, blank=True, default='')
+    request_snapshot = models.JSONField(blank=True, null=True)
+    request_hash = models.CharField(max_length=64, blank=True, default='')
+    first_dispatch_at = models.DateTimeField(blank=True, null=True)
+    idempotency_deadline_at = models.DateTimeField(blank=True, null=True)
+    requested_at = models.DateTimeField(blank=True, null=True,
+                                                help_text='When this generation was requested (null: original).')
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True,
+                                             null=True, related_name='+')
+    closed_at = models.DateTimeField(help_text='When a manual retry closed this generation.')
+    closed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True,
+                                  related_name='+', help_text='Admin whose retry closed this generation.')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['delivery', 'generation'],
+                                               name='dawah_delivery_generation_unique')]
+
+
+class DeliveryAttempt(models.Model):
+    """Append-only audit of one provider handoff attempt (written by COMM-02)."""
+
+    class Outcome(models.TextChoices):
+        ACCEPTED = 'accepted', 'Accepted'
+        RETRYABLE = 'retryable', 'Retryable failure'
+        FAILED = 'failed', 'Definitive failure'
+        UNCERTAIN = 'uncertain', 'Uncertain'
+        SKIPPED = 'skipped', 'Skipped'
+        LEASE_LOST = 'lease_lost', 'Lease lost'
+
+    delivery = models.ForeignKey(Delivery, on_delete=models.PROTECT, related_name='attempts')
+    generation = models.PositiveSmallIntegerField()
+    attempt = models.PositiveSmallIntegerField()
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField(blank=True, null=True)
+    outcome = models.CharField(max_length=12, choices=Outcome.choices, blank=True, default='')
+    error_code = models.CharField(max_length=64, blank=True, default='')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['delivery', 'generation', 'attempt'],
+                                               name='dawah_delivery_attempt_unique')]

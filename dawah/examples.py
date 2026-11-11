@@ -107,3 +107,44 @@ RESOURCE_DOCUMENT = {
     'media_url': 'https://media.example.test/documents/b1cZr6wKe9LmNoPq2Jq3-x8Yt0aPq4sV/agenda.pdf',
     'content_type': 'application/pdf', 'size_bytes': 245760, 'file_name': 'agenda.pdf', 'event': EVENT_SUMMARY,
 }
+
+
+# ---------------------------------------------------------------- broadcasts (COMM-01)
+
+BROADCAST_CREATE = {'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link',
+                    'audience': {'type': 'department', 'department': 'Computer Science'}}
+
+BROADCAST_PATCH = {'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link',
+                   'audience': {'type': 'level', 'level': '300'}, 'version': 2}
+
+ZERO_COUNTS = {'queued': 0, 'sent': 0, 'failed': 0, 'uncertain': 0, 'skipped': 0, 'cancelled': 0}
+
+BROADCAST_DRAFT = {
+    'id': 7, 'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link', 'body_format': 'plain',
+    'body_html': None, 'audience': {'type': 'department', 'department': 'Computer Science'}, 'state': 'draft',
+    'version': 3, 'creator_id': 1, 'created_at': '2026-11-10T09:00:00Z', 'updated_at': '2026-11-10T09:20:00Z',
+    'queued_at': None, 'recipient_count': None, 'counts': ZERO_COUNTS,
+    'eligible_actions': ['edit', 'delete', 'preview', 'queue'],
+}
+
+BROADCAST_QUEUED = {
+    **BROADCAST_DRAFT, 'state': 'queued', 'updated_at': '2026-11-10T09:30:00Z',
+    'queued_at': '2026-11-10T09:30:00Z', 'recipient_count': 42, 'counts': {**ZERO_COUNTS, 'queued': 42},
+    'eligible_actions': [],
+}
+
+BROADCAST_PREVIEW = {
+    'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link\n\nSee you <Friday>',
+    'body_format': 'plain', 'body_html': None,
+    'rendered_text': 'Summary and recording link\n\nSee you <Friday>',
+    'rendered_html': '<p>Summary and recording link</p><p>See you &lt;Friday&gt;</p>', 'audience_count': 42,
+}
+
+DELIVERY_QUEUED = {
+    'id': 12, 'student_id': 31, 'snapshot_email': 'student@example.test', 'state': 'queued', 'attempt_count': 0,
+    'retry_generation': 0, 'provider_email_id': None, 'error_code': None, 'sent_at': None,
+    'created_at': '2026-11-10T09:30:00Z', 'updated_at': '2026-11-10T09:30:00Z', 'eligible_actions': [],
+}
+
+VERSION_REQUEST = {'version': 3}
+RETRY_REQUEST = {'delivery_ids': [12, 13]}
