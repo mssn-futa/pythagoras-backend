@@ -1,5 +1,6 @@
 """OpenAPI example payloads (``data`` only; the schema adds the envelope and,
 for list routes, wraps a single item in the paginated page)."""
+from . import broadcast_content
 
 EVENT_CREATE = {
     'title': 'Friday khutbah', 'category': 'jumuah', 'tags': 'patience', 'speakers': 'Guest speaker',
@@ -133,11 +134,29 @@ BROADCAST_QUEUED = {
     'eligible_actions': [],
 }
 
+_PREVIEW_PLAIN = broadcast_content.render_content('Weekly Da’wah summary', 'plain',
+                                                 'Summary and recording link\n\nSee you <Friday>')
 BROADCAST_PREVIEW = {
     'subject': 'Weekly Da’wah summary', 'body': 'Summary and recording link\n\nSee you <Friday>',
     'body_format': 'plain', 'body_html': None,
-    'rendered_text': 'Summary and recording link\n\nSee you <Friday>',
-    'rendered_html': '<p>Summary and recording link</p><p>See you &lt;Friday&gt;</p>', 'audience_count': 42,
+    'rendered_text': _PREVIEW_PLAIN.text, 'rendered_html': _PREVIEW_PLAIN.html, 'audience_count': 42,
+}
+
+# COMM-04 rich drafts: request HTML (as an editor or paste sends it) and the stored canonical form.
+RICH_REQUEST_HTML = ('<h2>Key lessons</h2><p>Read the <a href="https://example.test/dawah/content/8" target="_blank" '
+                     'onclick="steal()">recording</a> <b>before</b> Friday.<script>alert(1)</script></p>'
+                     '<ul><li><p><strong>Patience</strong></p></li><li><p><em>Gratitude</em></p></li></ul>'
+                     '<p>See https://example.test/</p>')
+_RICH = broadcast_content.sanitize_rich_html(RICH_REQUEST_HTML)
+BROADCAST_RICH_CREATE = {'subject': 'Weekly Da’wah summary', 'body_format': 'rich', 'body_html': RICH_REQUEST_HTML,
+                         'audience': {'type': 'all'}}
+BROADCAST_RICH_PATCH = {'body_format': 'rich', 'body_html': '<p>Updated <strong>summary</strong></p>', 'version': 1}
+BROADCAST_RICH_DRAFT = {**BROADCAST_DRAFT, 'version': 1, 'audience': {'type': 'all'}, 'body_format': 'rich',
+                        'body_html': _RICH.html, 'body': _RICH.text}
+_PREVIEW_RICH = broadcast_content.render_content('Weekly Da’wah summary', 'rich', body_html=_RICH.html)
+BROADCAST_RICH_PREVIEW = {
+    'subject': 'Weekly Da’wah summary', 'body': _RICH.text, 'body_format': 'rich', 'body_html': _RICH.html,
+    'rendered_text': _PREVIEW_RICH.text, 'rendered_html': _PREVIEW_RICH.html, 'audience_count': 42,
 }
 
 DELIVERY_QUEUED = {

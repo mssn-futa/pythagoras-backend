@@ -30,3 +30,5 @@ python-dateutil==2.9.0.post0
 s3transfer==0.19.3
 six==1.17.0
 urllib3==2.8.0
+# COMM-04: rich broadcast HTML sanitizer (Rust ammonia bindings; no transitive dependencies).
+nh3==0.3.7

@@ -428,6 +428,11 @@ class Broadcast(models.Model):
                 condition=Q(state=BroadcastState.DRAFT) | (Q(queued_at__isnull=False)
                                                            & Q(recipient_count__isnull=False)),
                 name='dawah_broadcast_queued_snapshot'),
+            # COMM-04: plain rows never carry HTML; rich rows always carry canonical HTML.
+            models.CheckConstraint(
+                condition=(Q(body_format=BodyFormat.PLAIN, body_html__isnull=True)
+                           | (Q(body_format=BodyFormat.RICH, body_html__isnull=False) & ~Q(body_html=''))),
+                name='dawah_broadcast_body_format_html'),
         ]
 
     def __str__(self):

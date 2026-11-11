@@ -6,6 +6,7 @@ show them next to the form controls.
 """
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+from rest_framework.exceptions import ErrorDetail
 
 from pythagoras.serializers import UTCDateTimeField
 
@@ -113,21 +114,54 @@ class AudienceField(serializers.Field):
 
 # ---------------------------------------------------------------- requests
 
+RICH_BODY_SENT = 'Rich drafts do not accept body; the server generates the text fallback from body_html.'
+HTML_FOR_PLAIN = 'body_html applies only to rich drafts; send body_format "rich" with it.'
+
+
 class BroadcastWriteSerializer(StrictWriteMixin, serializers.ModelSerializer):
-    """Create (subject, body, audience required) or PATCH (any subset plus
-    ``version``). Plain text only until COMM-04 adds rich content."""
+    """Create or PATCH (any subset plus ``version``) a draft (D4, frozen for COMM-03/COMM-05).
+
+    * Plain: ``{subject, body, audience}``; ``body_format: "plain"`` optional
+      (sent when converting a rich draft back to plain; ``body`` may then be
+      omitted to keep the current text fallback). ``body_html`` becomes null.
+    * Rich: ``{subject, body_format: "rich", body_html, audience}`` and never
+      ``body``. ``body_html`` is sanitized to the D4 allowlist and stored in
+      canonical form; ``body`` is the generated text fallback. A PATCH of a
+      rich draft may omit ``body_format``.
+    """
     subject = StrictCharField(max_length=broadcast_content.SUBJECT_MAX_LENGTH,
                               help_text='Single line, at most 200 characters.')
-    body = StrictCharField(trim_whitespace=False, max_length=broadcast_content.BODY_MAX_LENGTH,
-                           help_text='Plain message text (line breaks kept).')
-    body_format = StrictCharField(required=False, help_text='"plain" (default). Rich content arrives with COMM-04.')
+    body = StrictCharField(required=False, trim_whitespace=False, max_length=broadcast_content.BODY_MAX_LENGTH,
+                           help_text='Plain drafts only: message text (line breaks kept). Required to create a '
+                                     'plain draft; never sent for rich drafts (server-generated fallback).')
+    body_format = StrictCharField(required=False, help_text='"plain" (default) or "rich".')
+    body_html = StrictCharField(
+        required=False, trim_whitespace=False, max_length=broadcast_content.RICH_HTML_MAX_LENGTH,
+        error_messages={'max_length': broadcast_content.TOO_LONG_MESSAGE, 'blank': 'Enter the message.'},
+        help_text='Rich drafts only: HTML using p, br, strong, em, h2, h3, ul, ol, li, blockquote and '
+                  'a[href=http(s)://...]. Anything else is removed; empty results are rejected. At most '
+                  f'{broadcast_content.RICH_HTML_MAX_LENGTH:,} characters.')
     audience = AudienceField()
     version = StrictIntegerField(required=False, write_only=True, min_value=1,
                                  help_text='PATCH only: the version you loaded (optimistic concurrency).')
 
     class Meta:
         model = Broadcast
-        fields = ['subject', 'body', 'body_format', 'audience', 'version']
+        fields = ['subject', 'body', 'body_format', 'body_html', 'audience', 'version']
+
+    def to_internal_value(self, data):
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as error:
+            # Report the missing message field with the other field errors on create
+            # (cross-field checks in validate() only run once fields are valid).
+            if self.instance is None and isinstance(error.detail, dict) and hasattr(data, 'keys'):
+                rich = data.get('body_format') == BodyFormat.RICH
+                name = 'body_html' if rich else 'body'
+                if name not in data:
+                    error.detail.setdefault(name, [ErrorDetail(
+                        'Enter the message.' if rich else 'This field is required.', code='required')])
+            raise
 
     def validate_subject(self, value):
         error = broadcast_content.subject_error(value)
@@ -145,10 +179,8 @@ class BroadcastWriteSerializer(StrictWriteMixin, serializers.ModelSerializer):
         return value
 
     def validate_body_format(self, value):
-        if value == BodyFormat.RICH:
-            raise serializers.ValidationError('Rich content is not available yet; send plain text.')
-        if value != BodyFormat.PLAIN:
-            raise serializers.ValidationError('Choose "plain".')
+        if value not in BodyFormat.values:
+            raise serializers.ValidationError('Choose "plain" or "rich".')
         return value
 
     def validate_version(self, value):
@@ -158,7 +190,36 @@ class BroadcastWriteSerializer(StrictWriteMixin, serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs.pop('version', None)  # checked under the row lock by broadcasts.update_draft
+        current = self.instance.body_format if self.instance is not None else None
+        body_format = attrs.get('body_format') or current or BodyFormat.PLAIN
+        if body_format == BodyFormat.RICH:
+            self._validate_rich(attrs, current)
+        else:
+            self._validate_plain(attrs, current)
         return attrs
+
+    def _validate_rich(self, attrs, current):
+        if 'body' in self.initial_data:
+            raise serializers.ValidationError({'body': [RICH_BODY_SENT]})
+        if 'body_html' not in attrs:
+            if current != BodyFormat.RICH:
+                raise serializers.ValidationError({'body_html': ['Enter the message.']})
+            return  # subject/audience edit of a rich draft
+        try:
+            sanitized = broadcast_content.sanitize_rich_html(attrs['body_html'])
+        except broadcast_content.ContentError as error:
+            raise serializers.ValidationError({'body_html': [str(error)]}) from None
+        if len(sanitized.text) > broadcast_content.BODY_MAX_LENGTH:
+            raise serializers.ValidationError({'body_html': [
+                f'The message text must be {broadcast_content.BODY_MAX_LENGTH:,} characters or fewer.']})
+        attrs.update(body_format=BodyFormat.RICH, body_html=sanitized.html, body=sanitized.text)
+
+    def _validate_plain(self, attrs, current):
+        if 'body_html' in self.initial_data:
+            raise serializers.ValidationError({'body_html': [HTML_FOR_PLAIN]})
+        if 'body' not in attrs and current is None:
+            raise serializers.ValidationError({'body': ['This field is required.']})
+        attrs.update(body_format=BodyFormat.PLAIN, body_html=None)  # rich -> plain keeps the fallback as body
 
 
 class VersionSerializer(StrictWriteMixin, serializers.Serializer):
@@ -214,8 +275,10 @@ class BroadcastSerializer(serializers.ModelSerializer):
     creator_id = serializers.IntegerField(source='created_by_id', read_only=True, allow_null=True)
     state = serializers.ChoiceField(choices=BroadcastState.choices, read_only=True)
     body_format = serializers.ChoiceField(choices=BodyFormat.choices, read_only=True)
+    body = serializers.CharField(read_only=True, help_text='Plain text; for rich drafts the server-generated '
+                                                           'text fallback (what the text part of the email shows).')
     body_html = serializers.CharField(read_only=True, allow_null=True,
-                                      help_text='Canonical sanitized HTML (rich drafts, COMM-04); null for plain.')
+                                      help_text='Canonical sanitized HTML of rich drafts; null for plain.')
     created_at = UTCDateTimeField(read_only=True)
     updated_at = UTCDateTimeField(read_only=True)
     queued_at = UTCDateTimeField(read_only=True, allow_null=True)
@@ -248,7 +311,10 @@ class PreviewSerializer(serializers.Serializer):
     body_format = serializers.ChoiceField(choices=BodyFormat.choices)
     body_html = serializers.CharField(allow_null=True)
     rendered_text = serializers.CharField(help_text='Exact text alternative that queue would freeze.')
-    rendered_html = serializers.CharField(help_text='Escaped HTML (plain drafts: paragraphs/line breaks only).')
+    rendered_html = serializers.CharField(
+        help_text='The complete HTML email document that queue would freeze and the worker sends: the shared '
+                  'template around sanitized rich content or escaped plain paragraphs. Render it only in a '
+                  'sandboxed frame.')
     audience_count = serializers.IntegerField(help_text='Current matching active students (advisory until queue).')
 
 
