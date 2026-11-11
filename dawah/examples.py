@@ -196,3 +196,62 @@ DELIVERY_DETAIL = {
 
 VERSION_REQUEST = {'version': 3}
 RETRY_REQUEST = {'delivery_ids': [12, 13]}
+
+# ---------------------------------------------------------------- automations (COMM-06)
+
+AUTOMATION_WEEKLY_CREATE = {
+    'kind': 'weekly_digest', 'audience': {'type': 'all'}, 'timezone': 'Africa/Lagos', 'weekday': 0,
+    'local_time': '08:00', 'enabled': False,
+    'template': {'subject': 'Weekly Da’wah summary', 'body_format': 'plain',
+                 'body': 'This week ({{week_start}} to {{week_end}}):\n\n{{summaries}}'},
+}
+
+AUTOMATION_REMINDER_CREATE = {
+    'kind': 'event_reminder', 'audience': {'type': 'all'}, 'offset_minutes': 1440, 'categories': ['jumuah'],
+    'enabled': False,
+    'template': {'subject': 'Reminder: {{event_title}}', 'body_format': 'rich',
+                 'body_html': '<p><strong>{{event_title}}</strong> starts {{event_start}}.</p>'},
+}
+
+AUTOMATION_WEEKLY = {
+    'id': 3, 'kind': 'weekly_digest', 'enabled': False, 'audience': {'type': 'all'}, 'categories': [],
+    'timezone': 'Africa/Lagos', 'weekday': 0, 'local_time': '08:00', 'offset_minutes': None,
+    'template': {'subject': 'Weekly Da’wah summary', 'body_format': 'plain',
+                 'body': 'This week ({{week_start}} to {{week_end}}):\n\n{{summaries}}', 'body_html': None},
+    'owner_id': 1, 'owner_active': True, 'blocked_reason': None, 'version': 1,
+    'created_at': '2026-11-10T09:00:00Z', 'updated_at': '2026-11-10T09:00:00Z',
+}
+
+AUTOMATION_REMINDER = {
+    **AUTOMATION_WEEKLY, 'id': 4, 'kind': 'event_reminder', 'categories': ['jumuah'], 'weekday': None,
+    'local_time': None, 'offset_minutes': 1440,
+    'template': {'subject': 'Reminder: {{event_title}}', 'body_format': 'rich',
+                 'body': '{{event_title}} starts {{event_start}}.',
+                 'body_html': '<p><strong>{{event_title}}</strong> starts {{event_start}}.</p>'},
+}
+
+AUTOMATION_PATCH = {
+    'audience': {'type': 'level', 'level': '300'}, 'categories': ['jumuah', 'usroh'], 'offset_minutes': 120,
+    'template': {'subject': 'Reminder: {{event_title}}', 'body_format': 'plain', 'body': 'Starts {{event_start}}.'},
+    'version': 2,
+}
+
+AUTOMATION_PREVIEW = {
+    'subject': 'Weekly Da’wah summary', 'body': AUTOMATION_WEEKLY['template']['body'], 'body_format': 'plain',
+    'body_html': None, 'rendered_text': 'This week (Monday 2 November 2026, 08:00 (Africa/Lagos) to ...',
+    'rendered_html': '<!DOCTYPE html><html lang="en">...</html>', 'audience_count': 42, 'skip_reason_code': None,
+    'source': {'window_start': '2026-11-02T07:00:00Z', 'window_end': '2026-11-09T07:00:00Z',
+               'scheduled_at': '2026-11-09T07:00:00Z',
+               'events': [{'id': 5, 'title': 'Friday khutbah', 'category': 'jumuah',
+                           'start_time': '2026-11-06T12:00:00Z'}]},
+}
+
+AUTOMATION_RUN = {
+    'id': 1, 'occurrence_key': 'rule-3:2026-11-09T07:00:00Z', 'scheduled_at': '2026-11-09T07:00:00Z',
+    'state': 'queued', 'reason_code': None, 'broadcast_id': 7, 'recipient_count': 4,
+    'counts': {'queued': 4, 'sent': 0, 'failed': 0, 'uncertain': 0, 'skipped': 0, 'cancelled': 0},
+    'source': {'window_start': '2026-11-02T07:00:00Z', 'window_end': '2026-11-09T07:00:00Z',
+               'events': [{'id': 5, 'title': 'Friday khutbah', 'category': 'jumuah',
+                           'start_time': '2026-11-06T12:00:00Z'}]},
+    'created_at': '2026-11-09T07:00:05Z', 'updated_at': '2026-11-09T07:00:05Z',
+}

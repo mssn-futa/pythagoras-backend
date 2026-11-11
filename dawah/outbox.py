@@ -42,7 +42,7 @@ from django.utils import timezone
 from pythagoras.mail import InvalidMessage, OutboundEmail, SendResult, SendStatus, get_transport, idempotency_key
 
 from . import broadcasts
-from .models import OUTSTANDING_DELIVERY_STATES, Broadcast, Delivery, DeliveryAttempt, DeliveryState
+from .models import OUTSTANDING_DELIVERY_STATES, Broadcast, Delivery, DeliveryAttempt, DeliveryState, Event
 
 logger = logging.getLogger('dawah.outbox')
 # The command attaches a stderr handler; library use relies on the project's logging config.
@@ -61,6 +61,8 @@ TRANSPORT_EXCEPTION = 'TRANSPORT_EXCEPTION'
 CONCURRENT_REQUEST = 'CONCURRENT_IDEMPOTENT_REQUESTS'
 # Pause after a 429/quota response without Retry-After.
 RATE_LIMIT_DEFAULT_SECONDS = 60
+# A long drain re-runs the scheduler tick between batches at least this often.
+TICK_INTERVAL_SECONDS = 60
 
 # Attempt outcomes that prove the provider did not accept that attempt:
 # ``retryable`` is recorded only for explicit 429/quota rejections (a
@@ -176,11 +178,13 @@ def account_limiter():
 # ---------------------------------------------------------------- scheduler hook
 
 def scheduler_tick(now):
-    """Materialize due automation occurrences into queued broadcasts.
+    """Materialize due automation occurrences into queued broadcasts (COMM-06,
+    ``dawah.automations.tick``): unique rule/occurrence runs under row locks,
+    so repeated or concurrent passes create nothing twice. Returns the number
+    of broadcasts created."""
+    from . import automations  # automations imports this module lazily as well
 
-    COMM-06 implements this (rules/runs, unique occurrence keys, DB locks).
-    Until then it is a no-op returning the number materialized (0)."""
-    return 0
+    return automations.tick(now)
 
 
 # ---------------------------------------------------------------- request identity
@@ -301,6 +305,7 @@ class OutboxWorker:
         self.stop_event = stop_event or threading.Event()
         self.clock = clock
         self.worker_id = worker_id or uuid.uuid4().hex[:8]
+        self._last_tick = None
 
     # ------------------------------------------------------------ helpers
 
@@ -455,7 +460,14 @@ class OutboxWorker:
         broadcast_id = Delivery.objects.filter(pk=claim.delivery_id).values_list('broadcast_id', flat=True).first()
         if broadcast_id is None:
             return 'lost'
+        from . import automations
+
+        reminder = automations.reminder_run_for_broadcast(broadcast_id)
         with transaction.atomic():
+            # Automated reminders: lock order event -> broadcast -> delivery, so a
+            # reschedule/unpublish either commits first (and is seen below) or waits.
+            event = (Event.objects.select_for_update().filter(pk=reminder.event_id).first()
+                     if reminder is not None else None)
             broadcast, delivery = _lock_pair(broadcast_id, claim.delivery_id)
             if delivery.state != DeliveryState.CLAIMED or delivery.lease_token != claim.token:
                 return 'lost'
@@ -467,6 +479,17 @@ class OutboxWorker:
                 self._log(logging.WARNING, 'outbox_claim_expired', delivery)
                 return 'expired'
             next_attempt = delivery.attempt_count + 1
+            stale = automations.stale_reminder_code(reminder, event, now) if reminder is not None else None
+            if stale:
+                # Never hand off an obsolete reminder, not even a same-key replay;
+                # keep possible earlier acceptance visible as uncertain.
+                code = automations.DELIVERY_CODES[stale]
+                state = DeliveryState.UNCERTAIN if _ambiguous_history(delivery) else DeliveryState.CANCELLED
+                self._attempt_row(delivery, next_attempt, now, DeliveryAttempt.Outcome.SKIPPED, code)
+                self._finish(broadcast, delivery, state, error_code=code)
+                automations.mark_run_cancelled(reminder.pk, stale, cancelled=state == DeliveryState.CANCELLED)
+                self._log(logging.INFO, 'outbox_result', delivery, outcome=str(state), code=code)
+                return str(state)
             active = get_user_model().objects.filter(pk=delivery.student_id, is_active=True).exists()
             if not active:
                 # If an earlier same-key attempt may have been accepted, keep that
@@ -674,6 +697,15 @@ class OutboxWorker:
 
     # ------------------------------------------------------------ loops
 
+    def tick(self, summary):
+        """Run the scheduler tick and remember when (worker clock)."""
+        self._last_tick = self.clock()
+        summary.materialized += scheduler_tick(timezone.now()) or 0
+
+    def _tick_if_due(self, summary):
+        if self._last_tick is None or self.clock() - self._last_tick >= TICK_INTERVAL_SECONDS:
+            self.tick(summary)
+
     def _wait(self, seconds, dispatch_deadline):
         """Wait for a pacing slot or rate-limit pause; returns a stop reason or ''."""
         if seconds <= 0:
@@ -687,6 +719,10 @@ class OutboxWorker:
         or a stop is requested. Returns the stop reason ('' when drained)."""
         while True:
             reason = self._stop_reason(summary, dispatch_deadline, max_sends)
+            if not reason:
+                # Between batches (no claims held): keep automation occurrences on time
+                # during a long drain.
+                self._tick_if_due(summary)
             if not reason and self.limiter:
                 # A 429/quota pause is waited out before claiming, never while holding claims.
                 reason = self._wait(self.limiter.pending(), dispatch_deadline)
@@ -751,7 +787,7 @@ class OutboxWorker:
         reserve = self.config.timeout + self.config.shutdown_margin
         dispatch_deadline = start + max(0.0, budget_seconds - reserve)
         try:
-            summary.materialized = scheduler_tick(timezone.now()) or 0
+            self.tick(summary)
             summary.recovered = self.recover_expired()
             summary.stop_reason = self._drain(summary, dispatch_deadline, max_sends) or 'drained'
         finally:
@@ -765,7 +801,7 @@ class OutboxWorker:
         summary = RunSummary(mode='continuous')
         try:
             while not self.stop_event.is_set():
-                summary.materialized += scheduler_tick(timezone.now()) or 0
+                self.tick(summary)
                 summary.recovered += self.recover_expired()
                 reason = self._drain(summary, None, max_sends)
                 if reason in ('signal', 'max_sends'):

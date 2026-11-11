@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import broadcast_views, views
+from . import automation_views, broadcast_views, views
 
 
 def legacy_alias(view_class):
@@ -44,6 +44,17 @@ urlpatterns = [
          broadcast_views.BroadcastDeliveryDetailView.as_view(), name='broadcast-delivery-detail'),
     path('broadcasts/<int:broadcast_id>/retry/', broadcast_views.BroadcastRetryView.as_view(),
          name='broadcast-retry'),
+
+    # Automations (D4, admin only; COMM-06).
+    path('automations/', automation_views.AutomationListView.as_view(), name='automations-list'),
+    path('automations/<int:rule_id>/', automation_views.AutomationDetailView.as_view(), name='automation-detail'),
+    path('automations/<int:rule_id>/enable/', automation_views.AutomationEnableView.as_view(),
+         name='automation-enable'),
+    path('automations/<int:rule_id>/disable/', automation_views.AutomationDisableView.as_view(),
+         name='automation-disable'),
+    path('automations/<int:rule_id>/preview/', automation_views.AutomationPreviewView.as_view(),
+         name='automation-preview'),
+    path('automations/<int:rule_id>/runs/', automation_views.AutomationRunsView.as_view(), name='automation-runs'),
 
     # Legacy aliases (no trailing slash).
     path('events/<int:event_id>', legacy_alias(views.EventDetailView), name='event-detail-legacy'),

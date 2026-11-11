@@ -5,7 +5,9 @@ product API's publication rules and protected deletion cannot be bypassed.
 """
 from django import forms
 from django.contrib import admin
+from django.db import transaction
 
+from . import automations
 from .models import Event, EventResource, StorageCleanup, UploadIntent
 
 STATE_FIELDS = ('status', 'published_at', 'created_by', 'created_at', 'updated_at')
@@ -41,7 +43,8 @@ HIDDEN_IMAGE_FIELDS = ('featured_image_object_key', 'featured_image_etag', 'feat
 class EventAdminForm(forms.ModelForm):
     class Meta:
         model = Event
-        exclude = ('status', 'published_at', 'created_by', 'featured_image', *IMAGE_FIELDS, *HIDDEN_IMAGE_FIELDS)
+        exclude = ('status', 'published_at', 'created_by', 'featured_image', 'schedule_revision', *IMAGE_FIELDS,
+                   *HIDDEN_IMAGE_FIELDS)
 
     def clean(self):
         cleaned = super().clean()
@@ -58,8 +61,27 @@ class EventAdmin(ReadOnlyStateAdmin):
     list_filter = ('status', 'category')
     search_fields = ('title', 'speakers', 'tags')
     ordering = ('-start_time', '-id')
-    readonly_fields = (*STATE_FIELDS, 'featured_image', *IMAGE_FIELDS)
+    readonly_fields = (*STATE_FIELDS, 'schedule_revision', 'featured_image', *IMAGE_FIELDS)
     inlines = [EventResourceInline]
+
+    def save_model(self, request, obj, form, change):
+        """Edits write only the form's changed fields under the event lock, so
+        state columns and ``schedule_revision`` are never written from a stale
+        copy. A start/end change is a reschedule (COMM-06): the revision is
+        incremented from the locked row and obsolete unsent reminders are
+        cancelled, as ``services.update_event`` does."""
+        if not change:
+            return super().save_model(request, obj, form, change)
+        with transaction.atomic():
+            locked = Event.objects.select_for_update().get(pk=obj.pk)
+            fields = [name for name in form.changed_data if name in {f.name for f in Event._meta.concrete_fields}]
+            rescheduled = (locked.start_time, locked.end_time) != (obj.start_time, obj.end_time)
+            obj.schedule_revision = locked.schedule_revision + (1 if rescheduled else 0)
+            if rescheduled:
+                fields.append('schedule_revision')
+            obj.save(update_fields=[*dict.fromkeys(fields), 'updated_at'])
+            if rescheduled:
+                automations.cancel_event_reminders(obj, automations.SOURCE_RESCHEDULED)
 
 
 @admin.register(EventResource)
