@@ -123,10 +123,33 @@ def body_error(value):
     return None
 
 
+_PLAIN_URL = re.compile(r'https?://[^\s<>"\'`]+', re.IGNORECASE)
+_URL_TRAILING = '.,;:)!?'
+
+
+def _autolink_line(line):
+    """Escape one plain-text line, wrapping http(s) URLs (per ``normalize_link``)
+    in anchors; trailing punctuation stays outside the link. Escape first:
+    only the matched, normalized URL becomes an attribute value."""
+    parts, last = [], 0
+    for match in _PLAIN_URL.finditer(line):
+        url = match.group().rstrip(_URL_TRAILING)
+        href = normalize_link(url) if url else None
+        if href is None:
+            continue
+        end = match.start() + len(url)
+        parts.append(html.escape(line[last:match.start()]))
+        parts.append(f'<a href="{_attr(href)}">{html.escape(url)}</a>')
+        last = end
+    parts.append(html.escape(line[last:]))
+    return ''.join(parts)
+
+
 def plain_to_html(text):
-    """Escaped paragraphs: blank lines separate paragraphs, single newlines are <br>."""
+    """Escaped paragraphs: blank lines separate paragraphs, single newlines are
+    <br>. http(s) URLs become links (the rel/style come from serialization)."""
     paragraphs = [p.strip('\n') for p in _BLANK_LINES.split(text) if p.strip()]
-    return ''.join('<p>' + '<br>'.join(html.escape(line) for line in p.split('\n')) + '</p>'
+    return ''.join('<p>' + '<br>'.join(_autolink_line(line) for line in p.split('\n')) + '</p>'
                    for p in paragraphs)
 
 

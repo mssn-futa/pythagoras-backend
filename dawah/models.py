@@ -359,6 +359,7 @@ class BroadcastState(models.TextChoices):
     COMPLETED = 'completed', 'Completed'
     COMPLETED_WITH_ERRORS = 'completed_with_errors', 'Completed with errors'
     UNCERTAIN = 'uncertain', 'Uncertain'
+    CANCELLED = 'cancelled', 'Cancelled'
 
 
 class BodyFormat(models.TextChoices):

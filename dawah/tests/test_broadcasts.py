@@ -611,6 +611,20 @@ class DerivedStateTests(TestCase):
         self.assertEqual(derive(self.counts(failed=1, sent=3), True), 'completed_with_errors')
         self.assertEqual(derive(self.counts(sent=3, skipped=1, cancelled=1), True), 'completed')
 
+    def test_all_cancelled_is_cancelled(self):
+        derive = broadcasts.derive_state
+        self.assertEqual(derive(self.counts(cancelled=3), True), 'cancelled')
+        self.assertEqual(derive(self.counts(cancelled=1, skipped=2), True), 'cancelled')
+        self.assertEqual(derive(self.counts(cancelled=2, sent=1), True), 'completed')
+        self.assertEqual(derive(self.counts(cancelled=2, failed=1), True), 'completed_with_errors')
+        self.assertEqual(derive(self.counts(cancelled=2, uncertain=1), True), 'uncertain')
+        self.assertEqual(derive(self.counts(cancelled=2, queued=1), True), 'processing')
+        self.assertEqual(derive(self.counts(), True), 'completed')
+
+    def test_state_enum_in_serializer_and_history_filter(self):
+        from dawah.models import BroadcastState
+        self.assertIn('cancelled', BroadcastState.values)
+
 
 class PermissionTests(BroadcastTestCase):
     def routes(self, pk, delivery_id):

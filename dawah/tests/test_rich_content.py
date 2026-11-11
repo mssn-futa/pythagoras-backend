@@ -741,3 +741,32 @@ class QueueServiceTests(TestCase):
         self.assertFalse(replayed)
         self.assertEqual((broadcast.snapshot_subject, broadcast.snapshot_text, broadcast.snapshot_html),
                          (rendered.subject, 'Hello you', rendered.html))
+
+
+class PlainAutolinkTests(SimpleTestCase):
+    def html(self, body):
+        return bc.render_content('S', 'plain', body).html
+
+    def test_urls_are_linked_with_rich_policy(self):
+        out = self.html('Join: https://example.com/e/1?a=1&b=2.\nSee (http://example.org/x), ok!')
+        self.assertIn('<a href="https://example.com/e/1?a=1&amp;b=2" rel="noopener noreferrer nofollow" '
+                      'style="color:#2c5530;text-decoration:underline;">https://example.com/e/1?a=1&amp;b=2</a>.',
+                      out)
+        self.assertIn('>http://example.org/x</a>), ok!', out)
+
+    def test_text_fallback_unchanged_and_preview_equals_send(self):
+        body = 'Go https://example.com/a.'
+        rendered = bc.render_content('S', 'plain', body)
+        self.assertEqual(rendered.text, body)
+        self.assertEqual(rendered, bc.render_content('S', 'plain', body))
+
+    def test_unsafe_text_is_escaped_and_not_linked(self):
+        out = self.html('javascript:alert(1) <script>x</script> "onmouseover=1" '
+                        'https://ex.com/"><img src=x onerror=1> http://u:p@host.com/')
+        self.assertNotIn('href="javascript', out)
+        self.assertNotIn('<script>', out)
+        self.assertNotIn('<img', out)
+        self.assertIn('&lt;script&gt;', out)
+        self.assertIn('<a href="https://ex.com/"', out)
+        self.assertNotIn('u:p@', out.replace('http://u:p@host.com/', ''))
+        self.assertNotIn('href="http://u', out)

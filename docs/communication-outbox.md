@@ -165,7 +165,9 @@ never raw provider errors, credentials, bodies or addresses).
 `counts.queued` covers every unresolved delivery (queued/claimed/sending).
 `broadcasts.derive_state`: uncertain wins, then outstanding work
 (`processing` once anything was dispatched, else `queued`), then
-`completed_with_errors` when any failed, else `completed`.
+`completed_with_errors` when any failed, then `cancelled` when nothing was
+sent and at least one delivery was cancelled (no sent/failed/uncertain), else
+`completed` (so mixed sent + cancelled stays `completed`).
 
 ## Worker (COMM-02)
 

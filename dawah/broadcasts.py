@@ -97,13 +97,16 @@ def retryable_count(broadcast):
 
 def derive_state(counts, any_dispatched):
     """Aggregate broadcast state from its deliveries (D4): uncertain wins, then
-    outstanding work, then terminal errors/completed."""
+    outstanding work, then terminal errors, then ``cancelled`` (nothing sent,
+    at least one cancelled), else completed."""
     if counts['uncertain']:
         return BroadcastState.UNCERTAIN
     if counts['queued']:
         return BroadcastState.PROCESSING if any_dispatched else BroadcastState.QUEUED
     if counts['failed']:
         return BroadcastState.COMPLETED_WITH_ERRORS
+    if counts['cancelled'] and not counts['sent']:
+        return BroadcastState.CANCELLED  # nothing went out: every delivery was cancelled
     return BroadcastState.COMPLETED
 
 
