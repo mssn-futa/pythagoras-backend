@@ -32,10 +32,16 @@ class EventResourceInline(admin.TabularInline):
         return False  # resources are created through the API (type is fixed there)
 
 
+# Featured-image metadata (DAWAH-07) is written only by finalize/publish.
+IMAGE_FIELDS = ('featured_image_storage_status', 'featured_image_content_type', 'featured_image_size_bytes',
+                'featured_image_file_name', 'featured_image_uploaded_at', 'featured_image_public_url')
+HIDDEN_IMAGE_FIELDS = ('featured_image_object_key', 'featured_image_etag', 'featured_image_public_key')
+
+
 class EventAdminForm(forms.ModelForm):
     class Meta:
         model = Event
-        exclude = ('status', 'published_at', 'created_by', 'featured_image')
+        exclude = ('status', 'published_at', 'created_by', 'featured_image', *IMAGE_FIELDS, *HIDDEN_IMAGE_FIELDS)
 
     def clean(self):
         cleaned = super().clean()
@@ -52,7 +58,7 @@ class EventAdmin(ReadOnlyStateAdmin):
     list_filter = ('status', 'category')
     search_fields = ('title', 'speakers', 'tags')
     ordering = ('-start_time', '-id')
-    readonly_fields = (*STATE_FIELDS, 'featured_image')
+    readonly_fields = (*STATE_FIELDS, 'featured_image', *IMAGE_FIELDS)
     inlines = [EventResourceInline]
 
 
