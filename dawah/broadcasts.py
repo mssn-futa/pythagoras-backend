@@ -7,7 +7,7 @@ it never sends mail or calls a provider; the COMM-02 worker drains
 """
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Value
 from django.db.models.functions import Lower, Trim
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -16,7 +16,8 @@ from pythagoras.utils import APIError
 
 from . import broadcast_content
 from .models import (
-    OUTSTANDING_DELIVERY_STATES, AudienceType, Broadcast, BroadcastState, Delivery, DeliveryState,
+    OUTSTANDING_DELIVERY_STATES, AudienceType, Broadcast, BroadcastState, Delivery,
+    DeliveryGeneration, DeliveryState,
 )
 
 COUNT_KEYS = ('queued', 'sent', 'failed', 'uncertain', 'skipped', 'cancelled')
@@ -45,7 +46,7 @@ def audience_recipients(audience_type, department='', level=''):
     users = get_user_model().objects.filter(role='student', is_active=True).exclude(email='')
     if audience_type == AudienceType.DEPARTMENT:
         users = users.annotate(_department=Lower(Trim('department'))).filter(
-            _department=department.strip().lower())
+            _department=Lower(Value(department.strip())))
     elif audience_type == AudienceType.LEVEL:
         users = users.filter(level=level)
     elif audience_type != AudienceType.ALL:
@@ -73,7 +74,9 @@ def with_counts(queryset):
         count_uncertain=_count([DeliveryState.UNCERTAIN]),
         count_skipped=_count([DeliveryState.SKIPPED]),
         count_cancelled=_count([DeliveryState.CANCELLED]),
+        # Same rule as Delivery.is_retry_eligible / RETRY_ELIGIBLE.
         count_retryable=Count('deliveries', filter=Q(deliveries__state=DeliveryState.FAILED,
+                                                     deliveries__nonacceptance_known=True,
                                                      deliveries__provider_email_id='',
                                                      deliveries__sent_at__isnull=True)),
     )
@@ -235,9 +238,11 @@ def retry(broadcast_id, delivery_ids, user):
     """Manual retry of explicitly selected, known-failed deliveries.
 
     All or nothing: IDs outside this broadcast are a 400, any ineligible
-    delivery (sent/uncertain/skipped/in-flight/...) a 409, and nothing changes.
-    Eligible rows start a new retry generation (fresh attempt budget, provider
-    request identity cleared because nonacceptance is known) and go back to
+    delivery (sent/uncertain/skipped/in-flight, or failed without positive
+    evidence of nonacceptance) a 409, and nothing changes. Each eligible row's
+    closing generation is first copied to an append-only ``DeliveryGeneration``
+    row; then it starts a new generation (fresh attempt budget and provider
+    request identity, safe because nonacceptance is known) and goes back to
     ``queued`` for the COMM-02 worker."""
     with transaction.atomic():
         broadcast = _lock(broadcast_id)
@@ -258,7 +263,16 @@ def retry(broadcast_id, delivery_ids, user):
                            status_code=409,
                            fields={'delivery_ids': [f'Not retryable: {", ".join(map(str, ineligible))}.']})
         now = timezone.now()
+        DeliveryGeneration.objects.bulk_create([DeliveryGeneration(
+            delivery=row, generation=row.retry_generation, state=row.state, attempt_count=row.attempt_count,
+            error_code=row.error_code, nonacceptance_known=row.nonacceptance_known,
+            provider_email_id=row.provider_email_id, idempotency_key=row.idempotency_key,
+            request_snapshot=row.request_snapshot, request_hash=row.request_hash,
+            first_dispatch_at=row.first_dispatch_at, idempotency_deadline_at=row.idempotency_deadline_at,
+            requested_at=row.retry_requested_at, requested_by_id=row.retry_requested_by_id,
+            closed_at=now, closed_by=user) for row in rows])
         for row in rows:
+            row.nonacceptance_known = False
             row.state = DeliveryState.QUEUED
             row.retry_generation += 1
             row.attempt_count = 0
@@ -270,7 +284,7 @@ def retry(broadcast_id, delivery_ids, user):
             row.retry_requested_at, row.retry_requested_by = now, user
             row.updated_at = now  # bulk_update does not apply auto_now
         Delivery.objects.bulk_update(rows, [
-            'state', 'retry_generation', 'attempt_count', 'next_attempt_at', 'error_code', 'lease_token',
+            'state', 'nonacceptance_known', 'retry_generation', 'attempt_count', 'next_attempt_at', 'error_code', 'lease_token',
             'lease_expires_at', 'idempotency_key', 'request_hash', 'request_snapshot', 'first_dispatch_at',
             'idempotency_deadline_at', 'retry_requested_at', 'retry_requested_by', 'updated_at'])
         refresh_state(broadcast)

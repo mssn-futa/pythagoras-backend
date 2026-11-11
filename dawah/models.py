@@ -453,6 +453,10 @@ class Delivery(models.Model):
     lease_expires_at = models.DateTimeField(blank=True, null=True)
     error_code = models.CharField(max_length=64, blank=True, default='', help_text='Safe code, never raw errors.')
     sent_at = models.DateTimeField(blank=True, null=True)
+    nonacceptance_known = models.BooleanField(
+        default=False,
+        help_text='Set only by the worker on positive evidence the provider did not accept this generation '
+                  '(definitive rejection, or failure before any provider handoff). Required for manual retry.')
 
     # Provider request identity for the current generation (stable across replays).
     provider_email_id = models.CharField(max_length=128, blank=True, default='')
@@ -482,8 +486,39 @@ class Delivery(models.Model):
 
     @property
     def is_retry_eligible(self):
-        """Known nonacceptance only: never sent/uncertain/skipped/in-flight work."""
-        return (self.state == DeliveryState.FAILED and not self.provider_email_id and self.sent_at is None)
+        """Positive evidence of nonacceptance only (docs/communication-outbox.md):
+        a failure without ``nonacceptance_known`` (payload conflict, expired
+        safety deadline, ambiguity) is never retryable."""
+        return (self.state == DeliveryState.FAILED and self.nonacceptance_known
+                and not self.provider_email_id and self.sent_at is None)
+
+
+class DeliveryGeneration(models.Model):
+    """Append-only evidence of a closed retry generation: the provider request
+    identity and outcome, copied before manual retry resets the live fields."""
+    delivery = models.ForeignKey(Delivery, on_delete=models.PROTECT, related_name='generations')
+    generation = models.PositiveSmallIntegerField()
+    state = models.CharField(max_length=12, choices=DeliveryState.choices)
+    attempt_count = models.PositiveSmallIntegerField()
+    error_code = models.CharField(max_length=64, blank=True, default='')
+    nonacceptance_known = models.BooleanField()
+    provider_email_id = models.CharField(max_length=128, blank=True, default='')
+    idempotency_key = models.CharField(max_length=256, blank=True, default='')
+    request_snapshot = models.JSONField(blank=True, null=True)
+    request_hash = models.CharField(max_length=64, blank=True, default='')
+    first_dispatch_at = models.DateTimeField(blank=True, null=True)
+    idempotency_deadline_at = models.DateTimeField(blank=True, null=True)
+    requested_at = models.DateTimeField(blank=True, null=True,
+                                                help_text='When this generation was requested (null: original).')
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True,
+                                             null=True, related_name='+')
+    closed_at = models.DateTimeField(help_text='When a manual retry closed this generation.')
+    closed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, blank=True, null=True,
+                                  related_name='+', help_text='Admin whose retry closed this generation.')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['delivery', 'generation'],
+                                               name='dawah_delivery_generation_unique')]
 
 
 class DeliveryAttempt(models.Model):
